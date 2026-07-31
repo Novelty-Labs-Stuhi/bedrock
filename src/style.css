@@ -1,0 +1,807 @@
+:root {
+  --bg: #1e1e1e;
+  --bg-side: #252526;
+  --bg-hover: #2f3033;
+  --line: #37383b;
+  --text: #dcddde;
+  --muted: #8b8d90;
+  --accent: #f92411; /* the cola compound demo's colour */
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  font-size: 14px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  height: 100vh;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+}
+
+#app {
+  display: flex;
+  height: 100vh;
+  --side-w: 250px;
+}
+
+button {
+  background: #303134;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 3px 8px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #3c3d41;
+}
+
+.hidden {
+  display: none !important;
+}
+
+/* ------------------------------------------------------------- sidebar --- */
+
+#sidebar {
+  width: var(--side-w);
+  flex: 0 0 auto;
+  /* Above the panes, so nothing the graph draws can ever sit on top of the tree. */
+  position: relative;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-side);
+  border-right: 1px solid var(--line);
+  overflow: hidden;
+}
+
+/* Folded away: a rail wide enough for the button that brings it back. */
+#sidebar.collapsed {
+  width: 38px;
+}
+
+#sidebar.collapsed .toolbar,
+#sidebar.collapsed #crumb,
+#sidebar.collapsed #tree,
+#sidebar.collapsed #vault-name,
+#sidebar.collapsed #open-folder {
+  display: none;
+}
+
+#sidebar.collapsed .vault {
+  padding: 8px 0;
+  justify-content: center;
+}
+
+.rail-btn {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1;
+}
+
+.rail-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+/* Grab strip between the sidebar and the editor. */
+#side-resize {
+  flex: 0 0 4px;
+  margin-left: -2px;
+  z-index: 2;
+  cursor: col-resize;
+  background: transparent;
+}
+
+#side-resize:hover {
+  background: rgba(249, 36, 17, 0.4);
+}
+
+body.resizing {
+  cursor: col-resize;
+  user-select: none;
+}
+
+.vault,
+.toolbar {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding: 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+#vault-name {
+  flex: 1;
+  font-weight: 600;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#crumb {
+  padding: 6px 10px;
+  font-size: 11px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+#tree {
+  flex: 1;
+  overflow: auto;
+  padding: 0 6px 16px;
+  user-select: none;
+}
+
+#tree ul {
+  list-style: none;
+  margin: 0;
+  /* Indent guide: the vertical line that makes nesting depth readable. */
+  padding-left: 10px;
+  margin-left: 8px;
+  border-left: 1px solid var(--line);
+}
+
+#tree > ul {
+  padding-left: 0;
+  margin-left: 0;
+  border-left: 0;
+}
+
+.item {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 3px 4px;
+  border-radius: 4px;
+  cursor: pointer;
+  line-height: 1.6;
+}
+
+.item:hover {
+  background: var(--bg-hover);
+}
+
+.item.active {
+  background: #35363a;
+  color: #fff;
+}
+
+.item.selected {
+  background: #2c2d30;
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.file-item .name {
+  padding-left: 18px; /* aligns note names under their folder's name */
+}
+
+button.twisty {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  border-radius: 3px;
+}
+
+button.twisty:hover {
+  background: #45464a;
+  color: #fff;
+}
+
+/* Points right when shut, down when open — a glyph this small read as a dot. */
+.twisty .chev {
+  width: 12px;
+  height: 12px;
+  transition: transform 0.12s ease;
+}
+
+.twisty.open .chev {
+  transform: rotate(90deg);
+}
+
+/* Drag a note or a folder onto another folder to move it there. */
+.item.drop-into {
+  background: rgba(249, 36, 17, 0.16);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+#tree.drop-root {
+  box-shadow: inset 0 0 0 1px var(--accent);
+  border-radius: 4px;
+}
+
+.folder-icon {
+  font-size: 11px;
+  flex: 0 0 auto;
+  line-height: 1;
+}
+
+.item .name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dir-item .name {
+  font-weight: 600;
+}
+
+.count {
+  font-size: 10px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.item:hover .count {
+  display: none;
+}
+
+.actions {
+  display: none;
+  gap: 2px;
+}
+
+.item:hover .actions {
+  display: flex;
+}
+
+.actions button {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  padding: 0 3px;
+  font-size: 11px;
+}
+
+.actions button:hover {
+  color: #fff;
+  background: transparent;
+}
+
+.empty {
+  padding: 10px 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* ---------------------------------------------------------------- main --- */
+
+#main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+#panes {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  --pane-w: 50%;
+}
+
+.pane {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Split: the left pane's width is what the divider drags, the right takes the rest. */
+#panes.split > #pane-0 {
+  flex: 0 0 var(--pane-w);
+}
+
+#splitter {
+  flex: 0 0 5px;
+  cursor: col-resize;
+  background: var(--line);
+}
+
+#splitter:hover {
+  background: var(--accent);
+}
+
+/* Which side takes the next opened note — only worth saying when there are two. */
+.pane.focused .tabbar {
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+
+.tabbar {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  padding: 6px 8px 0;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg);
+  position: relative;
+  z-index: 3;
+}
+
+/* The tab strip scrolls; .tab-actions is its sibling, so the Read/Edit and graph
+   controls stay put however many tabs are open. */
+.tabs {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}
+
+.tabs::-webkit-scrollbar {
+  height: 4px;
+}
+
+.tabs::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: 2px;
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 5px 5px 0 0;
+  color: var(--muted);
+  cursor: pointer;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+.tab:hover {
+  background: var(--bg-hover);
+}
+
+.tab.active {
+  background: var(--bg);
+  border-color: var(--line);
+  color: var(--text);
+}
+
+.tab button {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  padding: 0 2px;
+  font-size: 10px;
+}
+
+.tab.pinned {
+  color: var(--accent);
+}
+
+.tab-actions {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  padding-bottom: 4px;
+}
+
+.view {
+  flex: 1;
+  position: relative;
+  min-height: 0;
+  /* Everything the graph paints — canvas, stickies, grips — is clipped to its own
+     pane. Without this a sticky dragged far enough left is drawn over the sidebar. */
+  overflow: hidden;
+}
+
+.page,
+.pane-empty,
+#cy {
+  position: absolute;
+  inset: 0;
+}
+
+.pane-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.editor {
+  width: 100%;
+  height: 100%;
+  padding: 28px max(28px, calc(50% - 380px));
+  border: 0;
+  outline: none;
+  resize: none;
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.preview {
+  height: 100%;
+  overflow: auto;
+  padding: 28px max(28px, calc(50% - 380px));
+  line-height: 1.7;
+}
+
+.preview h1,
+.preview h2,
+.preview h3 {
+  line-height: 1.3;
+}
+
+.preview code {
+  background: #2b2c2f;
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 12.5px;
+}
+
+.preview pre {
+  background: #2b2c2f;
+  padding: 10px 12px;
+  border-radius: 5px;
+  overflow-x: auto;
+}
+
+.preview pre code {
+  background: none;
+  padding: 0;
+}
+
+.preview blockquote {
+  margin: 0;
+  padding-left: 12px;
+  border-left: 3px solid var(--line);
+  color: var(--muted);
+}
+
+.preview a {
+  color: #7cb0ff;
+}
+
+/* The name of a connection, as written before the link: `built with:: [[Target]]`. */
+.preview .rel {
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.preview .rel::after {
+  content: " →";
+  opacity: 0.6;
+}
+
+/* Attachments: an embed never overflows the column, and a broken one says so. */
+.preview img.embed {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 12px 0;
+  border-radius: 5px;
+  background: #2b2c2f;
+}
+
+.preview .embed-missing {
+  display: inline-block;
+  padding: 6px 10px;
+  border: 1px dashed var(--line);
+  border-radius: 5px;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+/* Drop an image anywhere on the note to attach it. */
+.editor.drop-target,
+.preview.drop-target {
+  outline: 2px dashed var(--accent);
+  outline-offset: -6px;
+}
+
+.preview a.wikilink {
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: none;
+  border-bottom: 1px solid rgba(249, 36, 17, 0.4);
+}
+
+.preview a.wikilink:hover {
+  border-bottom-color: var(--accent);
+}
+
+#status {
+  border-top: 1px solid var(--line);
+  padding: 4px 10px;
+  font-size: 11px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ------------------------------------------------------------- dialogs --- */
+/* Electron has no window.prompt(), so naming/confirming happens in here. */
+
+#dialog {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.5);
+}
+
+#dialog.open {
+  display: flex;
+}
+
+.dialog-card {
+  min-width: 300px;
+  max-width: min(440px, 90vw);
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-side);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+}
+
+.dialog-title {
+  margin-bottom: 10px;
+  font-size: 13px;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.dialog-input {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  outline: none;
+}
+
+.dialog-input:focus {
+  border-color: var(--accent);
+}
+
+.dialog-row {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 12px;
+}
+
+.dialog-ok {
+  border-color: var(--accent);
+  background: rgba(249, 36, 17, 0.18);
+}
+
+.dialog-ok:hover {
+  background: rgba(249, 36, 17, 0.3);
+}
+
+.dialog-ok.danger {
+  border-color: #b3392b;
+}
+
+/* ---------------------------------------------------------- context menu --- */
+
+#menu {
+  position: fixed;
+  z-index: 60;
+  display: none;
+  flex-direction: column;
+  min-width: 180px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg-side);
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.5);
+}
+
+#menu.open {
+  display: flex;
+}
+
+.menu-item {
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  padding: 6px 10px;
+  border-radius: 4px;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.menu-item:hover {
+  background: var(--bg-hover);
+}
+
+/* ------------------------------------------- graph overlay (handles, names) --- */
+/* Sibling of #cy, because cytoscape empties its own container on destroy(). */
+
+.graph-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  pointer-events: none;
+}
+
+#cy.hidden ~ .graph-overlay {
+  display: none;
+}
+
+/* Group tool: the sheet takes the drag off cytoscape, the rect is what you draw. */
+.lasso-sheet {
+  position: absolute;
+  inset: 0;
+  pointer-events: auto;
+  cursor: crosshair;
+}
+
+.lasso-rect {
+  position: absolute;
+  border: 1px dashed var(--accent);
+  border-radius: 3px;
+  background: rgba(249, 36, 17, 0.12);
+  pointer-events: none;
+}
+
+/* Loose text pinned to the canvas. Scaled by the graph's zoom (font-size is set in
+   JS), so paddings are in em and the whole card scales as one. */
+.sticky {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  padding: 0.4em;
+  border: 1px solid #6b5a2a;
+  border-radius: 0.35em;
+  background: #3a331d;
+  box-shadow: 0 0.15em 0.5em rgba(0, 0, 0, 0.45);
+  pointer-events: auto;
+  cursor: move;
+  overflow: hidden;
+}
+
+/* The one part that is unambiguously "grab here" — the text takes the rest. */
+.sticky-bar {
+  flex: 0 0 auto;
+  height: 0.5em;
+  margin: -0.1em -0.1em 0.25em;
+  border-radius: 0.2em;
+  background: rgba(240, 226, 182, 0.16);
+  cursor: move;
+}
+
+.sticky:hover .sticky-bar {
+  background: rgba(240, 226, 182, 0.32);
+}
+
+.sticky-text {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  border: 0;
+  padding: 0;
+  outline: none;
+  resize: none;
+  overflow: hidden;
+  background: transparent;
+  color: #f0e2b6;
+  font: inherit;
+  font-family: inherit;
+  line-height: 1.35;
+  cursor: text;
+}
+
+.sticky-text::placeholder {
+  color: #8d7f57;
+}
+
+/* Bottom-right corner: drag to rescale. Invisible, like the folder box grips. */
+.sticky-grip {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 1.1em;
+  height: 1.1em;
+  cursor: nwse-resize;
+}
+
+/* Corner grips: nothing is drawn, the cursor is the only sign they are there. */
+.frame-handle {
+  position: absolute;
+  width: 18px;
+  height: 18px;
+  margin: -9px 0 0 -9px;
+  background: transparent;
+  pointer-events: auto;
+}
+
+.inline-edit {
+  position: absolute;
+  width: 150px;
+  transform: translate(-50%, -50%);
+  padding: 3px 6px;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  outline: none;
+  pointer-events: auto;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
+}
+
+.inline-name {
+  flex: 1;
+  min-width: 0;
+  padding: 0 4px;
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 14px;
+  outline: none;
+}
+
+.tab-actions .ico {
+  width: 12px;
+  height: 12px;
+  vertical-align: -2px;
+}
+
+.tab-actions .toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.tab-actions .toggle:hover {
+  color: var(--text);
+}
+
+.tab-actions .toggle input {
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}

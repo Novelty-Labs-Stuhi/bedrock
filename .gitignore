@@ -1,0 +1,16 @@
+node_modules
+dist
+*.local
+*.log
+
+# tsc used to emit next to the sources; it is noEmit now, but stragglers happen
+src/*.js
+
+# vault state, if a vault ever lives inside the checkout
+.notes
+
+# editors / OS
+.DS_Store
+.vscode
+.idea
+.claude/settings.local.json

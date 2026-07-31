@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>obsidian-lite</title>
+  </head>
+  <body>
+    <div id="app">
+      <aside id="sidebar">
+        <div class="vault">
+          <button id="fold-side" class="rail-btn" title="Collapse sidebar">⟨</button>
+          <span id="vault-name">local vault</span>
+          <button id="open-folder" title="Open a folder from disk">Open folder…</button>
+        </div>
+        <div class="toolbar">
+          <button id="new-note" title="New note in the selected folder">＋ Note</button>
+          <button id="new-folder" title="New folder in the selected folder">＋ Folder</button>
+          <button id="graph" title="Open graph view">Graph</button>
+        </div>
+        <div id="crumb">/</div>
+        <nav id="tree"></nav>
+      </aside>
+      <div id="side-resize" title="Drag to resize the sidebar"></div>
+
+      <main id="main">
+        <div id="panes">
+          <section class="pane" id="pane-0">
+            <div class="tabbar">
+              <div class="tabs" id="tabs-0"></div>
+              <div class="tab-actions" id="actions-0"></div>
+            </div>
+            <div class="view">
+              <div class="page" id="page-0">
+                <textarea class="editor" id="editor-0" spellcheck="false" placeholder="# Title&#10;&#10;Link notes with [[wikilinks]]."></textarea>
+                <div class="preview hidden" id="preview-0"></div>
+              </div>
+              <div class="pane-empty hidden" id="empty-0">Open a note</div>
+              <div id="cy" class="hidden"></div>
+            </div>
+          </section>
+
+          <div id="splitter" class="hidden" title="Drag to resize the panes"></div>
+
+          <section class="pane hidden" id="pane-1">
+            <div class="tabbar">
+              <div class="tabs" id="tabs-1"></div>
+              <div class="tab-actions" id="actions-1"></div>
+            </div>
+            <div class="view">
+              <div class="page" id="page-1">
+                <textarea class="editor" id="editor-1" spellcheck="false" placeholder="# Title&#10;&#10;Link notes with [[wikilinks]]."></textarea>
+                <div class="preview hidden" id="preview-1"></div>
+              </div>
+              <div class="pane-empty hidden" id="empty-1">Open a note</div>
+            </div>
+          </section>
+        </div>
+        <div id="status"></div>
+      </main>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,63 @@
+#!/bin/zsh
+# bedrock launcher — usage: bedrock [start|stop|restart|status|build|dev]
+# Rebuilds only when sources changed, then opens the Electron window detached
+# so the terminal is free and closing it does not kill the app.
+set -e
+
+# The checkout this script lives in, so a fresh clone needs no configuration.
+# BEDROCK_DIR (or the older MYOBSIDIAN_DIR) still wins if the app is kept elsewhere.
+APP_DIR="${BEDROCK_DIR:-${MYOBSIDIAN_DIR:-${0:A:h:h}}}"
+ELECTRON="$APP_DIR/node_modules/electron/dist/Electron.app"
+MATCH="MacOS/Electron $APP_DIR"
+
+die() { print -u2 "notes: $1"; exit 1 }
+running() { pgrep -f "$MATCH" >/dev/null 2>&1 }
+
+build_if_stale() {
+  [[ -d $APP_DIR ]] || die "app not found at $APP_DIR (set MYOBSIDIAN_DIR)"
+  [[ -d $ELECTRON ]] || die "electron missing — run: npm install --prefix '$APP_DIR'"
+  local stamp="$APP_DIR/dist/index.html"
+  local -a watch=("$APP_DIR/src" "$APP_DIR/index.html" "$APP_DIR/vite.config.ts" "$APP_DIR/tsconfig.json")
+  if [[ ! -f $stamp ]] || [[ -n $(find "${watch[@]}" -newer "$stamp" -print -quit 2>/dev/null) ]]; then
+    print "notes: building…"
+    ( cd "$APP_DIR" && npm run build --silent >/dev/null ) || die "build failed — run 'notes build' to see why"
+  fi
+}
+
+case "${1:-start}" in
+  start)
+    if running; then
+      print "notes: already running"
+      exit 0
+    fi
+    build_if_stale
+    open -na "$ELECTRON" --args "$APP_DIR"
+    print "notes: running — press ⌘Q in the window, or 'notes stop', to quit"
+    ;;
+  stop)
+    if running; then
+      pkill -f "$MATCH"
+      print "notes: stopped"
+    else
+      print "notes: not running"
+    fi
+    ;;
+  restart)
+    "$0" stop
+    sleep 1
+    "$0" start
+    ;;
+  status)
+    running && print "notes: running" || print "notes: stopped"
+    ;;
+  build)
+    ( cd "$APP_DIR" && npm run build )
+    ;;
+  dev)
+    print "notes: dev server on http://localhost:5183 (ctrl-c to stop)"
+    ( cd "$APP_DIR" && npm run dev -- --port 5183 )
+    ;;
+  *)
+    print "usage: notes [start|stop|restart|status|build|dev]"
+    ;;
+esac

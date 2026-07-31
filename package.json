@@ -1,0 +1,25 @@
+{
+  "name": "bedrock",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "A markdown vault whose graph is the place you work \u2014 spatial, durable, plain files.",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "start": "npm run build && electron .",
+    "app": "electron ."
+  },
+  "dependencies": {
+    "cytoscape": "^3.30.2",
+    "cytoscape-cola": "^2.5.1"
+  },
+  "devDependencies": {
+    "@types/cytoscape": "^3.21.9",
+    "electron": "^43.2.0",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10"
+  }
+}
