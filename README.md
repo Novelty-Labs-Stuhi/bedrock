@@ -28,14 +28,25 @@ echo 'alias bedrock="'"$PWD"'/bin/notes"' >> ~/.zshrc && source ~/.zshrc
 ```
 
 Then `bedrock` from any directory. It rebuilds only when sources changed and detaches, so
-closing the terminal does not close the app.
+closing the terminal does not close the app. Name the alias whatever you like — the
+launcher reports itself by the name you invoke it with, and finds its own checkout, so no
+configuration is needed.
 
 | command | |
 | --- | --- |
 | `bedrock` | start it (or focus it if already running) |
 | `bedrock stop` | quit |
+| `bedrock restart` | stop, then start |
 | `bedrock status` | is it running |
+| `bedrock build` | build once, showing errors |
 | `bedrock dev` | vite dev server on `:5183`, with hot reload |
+
+An alias is interactive-shell only. To use it from scripts or a Makefile, symlink it onto
+your `PATH` instead:
+
+```bash
+ln -s "$PWD/bin/notes" ~/.local/bin/bedrock
+```
 
 ---
 
