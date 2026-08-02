@@ -4,7 +4,7 @@ A markdown vault whose graph is the place you actually work, not a picture of it
 
 ## Demo
 
-[▶ Watch the demo](bedrock_demo.mp4)
+![Demo](bedrock_demo.gif)
 
 ## Installation
 
