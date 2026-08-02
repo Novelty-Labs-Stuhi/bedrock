@@ -27,6 +27,12 @@ type Snapshot = {
 
 export const NOTES_DIR = ".notes";
 export const LAYOUT_FILE = `${NOTES_DIR}/layout.json`;
+/**
+ * The arrangement exactly as it was when this vault was opened, written once, just
+ * before the first overwrite of the session. An arrangement can represent months of
+ * work; one bad write should never be the end of it.
+ */
+export const LAYOUT_BACKUP = `${NOTES_DIR}/layout.backup.json`;
 
 /** How long to sit on changes before writing. A drag fires hundreds of them. */
 const WRITE_DELAY = 700;
@@ -47,6 +53,11 @@ export class SpatialStore {
   private frames = new Map<string, StoredFrame>();
   private timer: number | undefined;
   private dirty = false;
+  /** What was on disk when this vault was opened, and whether it has been backed up. */
+  private opened = "";
+  private backedUp = false;
+  /** Bumped on every attach, so the graph can tell it is looking at a different vault. */
+  private gen = 0;
 
   /**
    * Points the store at a vault and reads back whatever arrangement it holds. Any
@@ -56,8 +67,11 @@ export class SpatialStore {
   async attach(vault: Vault): Promise<void> {
     await this.flush();
     this.vault = vault;
+    this.gen++;
     this.nodes.clear();
     this.frames.clear();
+    this.opened = "";
+    this.backedUp = false;
 
     let raw = "";
     try {
@@ -66,6 +80,7 @@ export class SpatialStore {
       return; // nothing cached yet — the first solve will write one
     }
     if (!raw.trim()) return;
+    this.opened = raw;
 
     try {
       const snap = JSON.parse(raw) as Partial<Snapshot>;
@@ -90,6 +105,17 @@ export class SpatialStore {
   /** True once there is an arrangement worth restoring instead of re-solving. */
   hasLayout(): boolean {
     return this.nodes.size > 0;
+  }
+
+  /**
+   * Which vault this store is holding, as a number that changes on every attach. The
+   * graph compares it against the one it was built for: a mismatch means the canvas
+   * belongs to a different vault and must be rebuilt, not patched. Making the graph
+   * notice for itself is the point — it used to rely on the caller remembering, and the
+   * one time it did not, a vault's whole arrangement was overwritten with a scatter.
+   */
+  generation(): number {
+    return this.gen;
   }
 
   node(path: string): Point | undefined {
@@ -155,6 +181,11 @@ export class SpatialStore {
       frames: Object.fromEntries(this.frames),
     };
     try {
+      // Keep the arrangement this vault was opened with, once, before touching it.
+      if (!this.backedUp && this.opened) {
+        this.backedUp = true;
+        await this.vault.write(LAYOUT_BACKUP, this.opened);
+      }
       await this.vault.write(LAYOUT_FILE, JSON.stringify(snap, null, 1) + "\n");
     } catch {
       // A read-only vault still works; it just will not remember the arrangement.
