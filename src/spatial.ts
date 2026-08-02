@@ -56,6 +56,8 @@ export class SpatialStore {
   /** What was on disk when this vault was opened, and whether it has been backed up. */
   private opened = "";
   private backedUp = false;
+  /** Bumped on every attach, so the graph can tell it is looking at a different vault. */
+  private gen = 0;
 
   /**
    * Points the store at a vault and reads back whatever arrangement it holds. Any
@@ -65,6 +67,7 @@ export class SpatialStore {
   async attach(vault: Vault): Promise<void> {
     await this.flush();
     this.vault = vault;
+    this.gen++;
     this.nodes.clear();
     this.frames.clear();
     this.opened = "";
@@ -102,6 +105,17 @@ export class SpatialStore {
   /** True once there is an arrangement worth restoring instead of re-solving. */
   hasLayout(): boolean {
     return this.nodes.size > 0;
+  }
+
+  /**
+   * Which vault this store is holding, as a number that changes on every attach. The
+   * graph compares it against the one it was built for: a mismatch means the canvas
+   * belongs to a different vault and must be rebuilt, not patched. Making the graph
+   * notice for itself is the point — it used to rely on the caller remembering, and the
+   * one time it did not, a vault's whole arrangement was overwritten with a scatter.
+   */
+  generation(): number {
+    return this.gen;
   }
 
   node(path: string): Point | undefined {

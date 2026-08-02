@@ -415,6 +415,8 @@ export class GraphView {
    * overwrite a perfectly good cache with whatever happened to be on screen.
    */
   private ready = false;
+  /** The vault generation this canvas was built for; -1 until it has been built. */
+  private builtFor = -1;
   /** Container size the view was last framed at, and whether the user has moved it since. */
   private fittedSize: { w: number; h: number } | null = null;
   private userMoved = false;
@@ -461,6 +463,7 @@ export class GraphView {
    */
   reset(): void {
     this.ready = false;
+    this.builtFor = -1;
     this.cy?.destroy();
     this.cy = null;
     this.pending = null;
@@ -489,6 +492,11 @@ export class GraphView {
       this.watchForSize();
       return;
     }
+    // A live canvas from a DIFFERENT vault must never be patched into this one: `sync`
+    // would treat every note here as newly added, scatter them, and then save that over
+    // this vault's arrangement. The graph checks for itself rather than trusting every
+    // caller to remember — the one time a caller did not, a whole vault was lost.
+    if (this.cy && this.spatial.generation() !== this.builtFor) this.reset();
     // The solver only runs on the first build and on explicit Re-layout —
     // re-solving on every edit would throw the whole graph around.
     if (this.cy) this.sync(docs, active, described);
@@ -616,6 +624,7 @@ export class GraphView {
       boxSelectionEnabled: false,
     });
     this.wire(this.cy);
+    this.builtFor = this.spatial.generation(); // this canvas belongs to this vault
     // A cached arrangement is restored as-is. Re-solving on every start is what made
     // the graph feel like it forgot everything the moment the app closed.
     if (this.spatial.hasLayout()) this.restore(this.cy);
