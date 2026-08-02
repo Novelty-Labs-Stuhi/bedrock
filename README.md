@@ -80,6 +80,11 @@ it, so hubs are obvious without reading a word. Its colour is its `#tags` — tw
 the circle in half, three into thirds. Connections can be named (`built with:: [[X]]`) and
 the name is written into the markdown, not into app state.
 
+**Edges are notes too.** A note says what a thing is and how it works; that leaves nowhere
+to put how two things are wired together and what flows between them. So a connection has
+its own markdown file — click the line to write in it. The `[[link]]` is still what makes
+the edge, so a connection note can never claim a link the vault does not have.
+
 **Nothing is modal.** Naming happens in a field on the node. Linking is a right-drag from
 one note to another. Stickies are loose text pinned to the canvas for the thoughts that
 are not notes yet.
@@ -92,6 +97,9 @@ are not notes yet.
   preview that drops into edit mode when you click the text.
 - **Graph** — folders as boxes, notes sized by backlinks and coloured by tags, named
   edges, drag to refile, right-drag to link.
+- **Connection notes** — click any edge to open the markdown for that connection, written
+  on the first click. A described connection is drawn as a thicker line, so the flows you
+  have explained stand out from the links you have only drawn.
 - **Folders by rectangle** — right-click → *New folder*, then drag a box around the notes.
   Shift+drag does the same thing without the menu.
 - **Links that survive** — renaming or moving a note rewrites every `[[link]]` pointing at
@@ -99,7 +107,15 @@ are not notes yet.
 - **Stickies** — right-click → *New sticky*. Grows as you type, rescalable, pinned to the
   canvas.
 - **Tree** — drag files between folders, right-click for paths, foldable sidebar.
+- **Format bar** — select text and a strip of buttons appears over it: bold, italic,
+  strikethrough, highlight, code, headings, lists, quotes, `[[links]]`, tags, and
+  UPPER/lower/Title case. ⌘B ⌘I ⌘E ⌘K do the same without it.
+- **Editing that keeps up** — Enter carries a bullet down and numbers it (Enter on an empty
+  one ends the list), Tab indents an item, and typing `*` or `[` around a selection wraps it
+  instead of replacing it. Every change is one step on the normal ⌘Z stack.
 - **Durable layout** — positions and box sizes cached in `.notes/layout.json`.
+- **`?`** — a floating panel in the bottom-right corner listing every gesture and the
+  markdown a note understands. Nothing else has to be learned from a manual.
 
 ## Vault layout
 
@@ -112,9 +128,19 @@ your-vault/
   .notes/
     layout.json      graph positions and folder box sizes  (derived — safe to delete)
     stickies.json    sticky text, position and size        (content — not derived)
+    edges/
+      Home → Graphs.md    what connects those two notes    (content — not derived)
 ```
 
-Anything under a dot-prefixed folder is app state and never appears as a note.
+Anything under a dot-prefixed folder is app state and never appears as a note. That is
+where connection notes live too: they are yours, and they are plain markdown, but a note
+*about a link* is not a note about a thing — it would otherwise show up in the tree and as
+a node on the graph it describes.
+
+A connection note is named after the notes at its two ends, so renaming either of them
+carries the file along and filing one into a folder does not move it at all. Two notes of
+the same name in different folders share one connection note — the same trade Obsidian
+makes when it resolves a bare `[[link]]` to the shallowest match.
 
 ## Development
 
@@ -136,6 +162,9 @@ same vault always lands the same way.
 | `frames.ts` | fixed-size folder boxes |
 | `vault.ts` | localStorage and File System Access backends |
 | `links.ts` | `[[wikilink]]` and `#tag` parsing, link rewriting |
+| `edges.ts` | where a connection's own markdown lives, and what it is called |
+| `help.ts` | the `?` panel: every gesture, and the markdown a note understands |
+| `format.ts` `toolbar.ts` | the selection bar, its shortcuts, and Enter/Tab in a list |
 | `spatial.ts` `sticky.ts` | what gets cached in `.notes/` |
 
 [cytoscape.js]: https://js.cytoscape.org

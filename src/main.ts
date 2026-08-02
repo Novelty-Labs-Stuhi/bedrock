@@ -2,10 +2,13 @@ import "./style.css";
 import { GraphView, type Doc } from "./graph";
 import { LinkResolver, labelledLink, relinkText } from "./links";
 import { askConfirm, askText } from "./dialog";
+import { EDGE_DIR, edgeNotePath, edgeNoteTemplate, edgeTitle, isEdgeNote, renamedEdgeNote } from "./edges";
 import { showMenu } from "./menu";
+import { mountHelp } from "./help";
 import { hydrateImages, imageFiles, insertAtCaret, saveImage } from "./images";
 import { linkTargets, renderMarkdown } from "./markdown";
 import { Sidebar } from "./sidebar";
+import { mountToolbar } from "./toolbar";
 import { SpatialStore } from "./spatial";
 import { StickyStore } from "./sticky";
 import {
@@ -54,7 +57,11 @@ const ui = {
   splitter: el("splitter"),
   cy: el("cy"),
   status: el("status"),
+  help: el("help"),
+  helpPanel: el("help-panel"),
 };
+
+mountHelp(ui.help, ui.helpPanel);
 
 type PaneUI = {
   root: HTMLElement;
@@ -76,6 +83,10 @@ const view: PaneUI[] = [0, 1].map((i) => ({
   editor: el<HTMLTextAreaElement>(`editor-${i}`),
   preview: el(`preview-${i}`),
 }));
+
+// Selection toolbar, markdown shortcuts and the list/indent/wrap typing behaviour, for
+// both editors. It reads and writes the textareas directly — no state of the app's own.
+mountToolbar(view.map((v) => v.editor));
 
 const MAX_PANES = 2;
 const SIDE_KEY = "obsidian-lite:sidebar";
@@ -120,6 +131,7 @@ const sidebar = new Sidebar(ui.tree, {
 
 const graphView = new GraphView(ui.cy, {
   onOpen: (path) => void openFile(path),
+  onOpenEdge: (source, target, label) => void openEdgeNote(source, target, label),
   onLinkExisting: (source, target) => linkNotes(source, target),
   onLinkNew: (source, at, folder) => void linkToNewNote(source, at, folder),
   onReparent: (path, folder) => void moveEntry(path, "file", folder, true),
@@ -151,6 +163,12 @@ async function readDocs(): Promise<Doc[]> {
   return Promise.all(filePaths().map(async (path) => ({ path, text: await vault.read(path) })));
 }
 
+/**
+ * Which connections have been written about. Only the file names are needed — the graph
+ * draws a described edge thicker, it does not read what the description says.
+ */
+const describedEdges = async (): Promise<Set<string>> => new Set(await vault.listFiles(EDGE_DIR));
+
 async function refresh(): Promise<void> {
   entries = await vault.entries();
   pruneTabs();
@@ -163,7 +181,10 @@ async function refresh(): Promise<void> {
 function pruneTabs(): void {
   const live = new Set(filePaths());
   for (const p of panes) {
-    p.tabs = p.tabs.filter((tab) => tab.kind === "graph" || live.has(tab.path));
+    // A connection note is never in `entries()` — it is not a note about a thing, it is a
+    // note about a link between two — so `live` would close its tab the moment anything
+    // else in the vault changed.
+    p.tabs = p.tabs.filter((tab) => tab.kind === "graph" || isEdgeNote(tab.path) || live.has(tab.path));
     p.active = Math.max(0, Math.min(p.active, p.tabs.length - 1));
   }
   pinGraph();
@@ -194,7 +215,12 @@ function pinGraph(): void {
 function statusText(): string {
   const tab = tabOf(pane());
   if (!tab) return "Open or create a note";
-  if (tab.kind === "graph") return `${filePaths().length} notes — right-click a note to draw a link`;
+  if (tab.kind === "graph") {
+    return `${filePaths().length} notes — right-drag to link, click a connection to describe it`;
+  }
+  // A connection note's path is `.notes/edges/…`, which says nothing useful; what it is
+  // FOR does. Said here rather than at the moment it opens, so a later repaint keeps it.
+  if (isEdgeNote(tab.path)) return `${noteName(tab.path)} — how they connect, and what flows`;
   return tab.path;
 }
 
@@ -291,7 +317,7 @@ async function paint(index: number, path: string, text: string): Promise<void> {
 /** Only call with the graph tab already rendered — the layout needs a sized container. */
 async function drawGraph(): Promise<void> {
   graphStale = false;
-  graphView.render(await readDocs(), lastFile);
+  graphView.render(await readDocs(), lastFile, await describedEdges());
 }
 
 /** Brings one pane's visible content back in line with its active tab. */
@@ -438,6 +464,7 @@ function movesFor(from: string, to: string, kind: "file" | "dir"): Map<string, s
  */
 async function relinkVault(moves: Map<string, string>): Promise<number> {
   if (!moves.size) return 0;
+  await carryEdgeNotes(moves);
   entries = await vault.entries();
   const wasAt = new Map([...moves].map(([from, to]) => [to, from]));
   const resolver = new LinkResolver(filePaths().map((path) => wasAt.get(path) ?? path));
@@ -450,6 +477,30 @@ async function relinkVault(moves: Map<string, string>): Promise<number> {
     touched++;
   }
   return touched;
+}
+
+/**
+ * A connection note is named after the notes at its two ends, so renaming either of them
+ * has to carry the file along — otherwise the description of how two notes are wired
+ * together is orphaned by renaming one of them. Filing a note into a folder changes no
+ * name and so moves nothing here, which is exactly the point of naming these by note name.
+ */
+async function carryEdgeNotes(moves: Map<string, string>): Promise<void> {
+  const renames = new Map<string, string>();
+  for (const [from, to] of moves) {
+    if (noteName(from) !== noteName(to)) renames.set(noteName(from), noteName(to));
+  }
+  if (!renames.size) return;
+  for (const path of await vault.listFiles(EDGE_DIR)) {
+    const next = renamedEdgeNote(path, renames);
+    // A note renamed onto a connection that is already described: leave both files alone
+    // rather than overwrite somebody's prose with somebody else's.
+    if (!next || (await vault.exists(next))) continue;
+    if (!(await tryVault(`could not rename ${basename(path)}`, () => vault.rename(path, next, "file")))) {
+      return;
+    }
+    retargetTabs(path, next);
+  }
 }
 
 /** " — relinked 3 notes", or nothing when no reference had to change. */
@@ -760,6 +811,30 @@ async function insertCitation(source: string, target: string, label: string | nu
   if (linkTargets(text).some((t) => resolver.resolve(t) === target)) return;
   const gap = text === "" || text.endsWith("\n\n") ? "" : text.endsWith("\n") ? "\n" : "\n\n";
   await vault.write(source, `${text}${gap}${labelledLink(label, target.replace(/\.md$/i, ""))}\n`);
+}
+
+/**
+ * Click on an edge: open the markdown that describes that connection. A note says what a
+ * thing is and how it works; its edges say how the things are wired together and what
+ * flows between them. The file is written on first click, so the connection is described
+ * by writing in it rather than by creating anything first.
+ */
+async function openEdgeNote(source: string, target: string, label: string | null): Promise<void> {
+  const path = edgeNotePath(source, target);
+  const fresh = !(await vault.exists(path));
+  if (fresh) {
+    if (!(await tryVault(`could not describe ${edgeTitle(source, target)}`, () =>
+      vault.createFile(path, edgeNoteTemplate(source, target, label)),
+    ))) {
+      return;
+    }
+    graphView.setEdgeDescribed(source, target); // thicken the line now, not at the next rebuild
+    graphStale = true;
+  }
+  await openFile(path);
+  // A brand-new connection note is empty apart from its heading — open it ready to write in.
+  if (fresh) panes[focused].mode = "edit";
+  render();
 }
 
 /** Sidebar-only refresh — avoids render()'s graph fit, which would jump the viewport. */

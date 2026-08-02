@@ -7,6 +7,12 @@ export interface Vault {
   readonly name: string;
   /** Every folder and every .md file in the vault. */
   entries(): Promise<Entry[]>;
+  /**
+   * The .md files directly inside one folder, hidden folders included — the one way to
+   * reach markdown that `entries()` deliberately keeps out of the tree and the graph
+   * (`.notes/edges/`). Empty when the folder is not there.
+   */
+  listFiles(dir: string): Promise<string[]>;
   /** Whether a file is actually there — `write` creates, so callers that must not. */
   exists(path: string): Promise<boolean>;
   read(path: string): Promise<string>;
@@ -122,6 +128,13 @@ export class LocalVault implements Vault {
       ...[...dirs].map((path) => ({ path, kind: "dir" as const })),
       ...files.map((path) => ({ path, kind: "file" as const })),
     ];
+  }
+
+  async listFiles(dir: string): Promise<string[]> {
+    const prefix = dir ? dir + "/" : "";
+    return Object.keys(this.snap.files).filter(
+      (path) => path.startsWith(prefix) && !path.slice(prefix.length).includes("/") && isMarkdown(path),
+    );
   }
 
   async exists(path: string): Promise<boolean> {
@@ -271,6 +284,20 @@ export class FolderVault implements Vault {
 
   async assets(): Promise<string[]> {
     return (await this.scan()).assets;
+  }
+
+  async listFiles(dir: string): Promise<string[]> {
+    let handle: FileSystemDirectoryHandle;
+    try {
+      handle = await this.dir(dir);
+    } catch {
+      return []; // nothing has been written there yet
+    }
+    const out: string[] = [];
+    for await (const entry of handle.values()) {
+      if (entry.kind === "file" && isMarkdown(entry.name)) out.push(join(dir, entry.name));
+    }
+    return out;
   }
 
   async readBinary(path: string): Promise<Blob | null> {

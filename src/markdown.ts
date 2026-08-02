@@ -47,6 +47,10 @@ function inline(text: string): string {
       `${start}${marker}<span class="rel">${name}</span> `,
   );
   html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+  // Obsidian's two extras. Both run before `**bold**` — neither uses `*`, so the order
+  // only matters in that a marker inside one of these is left for bold to find.
+  html = html.replace(/~~([^~]+)~~/g, "<del>$1</del>");
+  html = html.replace(/==([^=]+)==/g, "<mark>$1</mark>");
   html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
   html = html.replace(/(^|[^*])\*([^*]+)\*/g, "$1<em>$2</em>");
   html = html.replace(

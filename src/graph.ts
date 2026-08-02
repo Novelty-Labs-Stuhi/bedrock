@@ -3,7 +3,7 @@
 // (`layout.ts` + `apply-layout.ts`) — no force simulation runs at any point.
 
 import cytoscape from "cytoscape";
-import type { Core, ElementDefinition, NodeSingular } from "cytoscape";
+import type { Core, EdgeSingular, ElementDefinition, NodeSingular } from "cytoscape";
 import {
   FrameStore,
   centreOf,
@@ -16,6 +16,7 @@ import {
   setFrame,
   type Frame,
 } from "./frames";
+import { edgeNotePath, edgeTitle, isEdgeNote } from "./edges";
 import { inlineEdit, type InlineEditor } from "./inline";
 import { layoutGraph } from "./apply-layout";
 import { LinkResolver, parseLinks, parseTags } from "./links";
@@ -130,6 +131,9 @@ const STYLE: cytoscape.StylesheetJson = [
     },
   },
   { selector: "edge", style: { "line-color": "#f92411", width: 1, "curve-style": "bezier" } },
+  // A connection that owns a note is drawn as a thicker line: the vault's documented
+  // flows are then legible as a shape, the same way `nodeSize` makes its hubs one.
+  { selector: "edge[described]", style: { width: 3 } },
   // A named connection writes its relation along the line, rotated with it and backed by the
   // canvas colour so it stays readable where it crosses other edges.
   {
@@ -148,6 +152,8 @@ const STYLE: cytoscape.StylesheetJson = [
   { selector: "node.active", style: { "border-width": 3, "border-color": "#dcddde" } },
   { selector: ".faded", style: { opacity: 0.25 } },
   { selector: ".highlight", style: { "line-color": "#ffffff", width: 2 } },
+  // The connection whose note is the open tab — the edge's answer to the node's ring.
+  { selector: "edge.active", style: { "line-color": "#dcddde", width: 3 } },
   // The link being drawn: an invisible cursor-following node plus an arrow to it.
   {
     selector: "node.draft",
@@ -230,8 +236,13 @@ const edgeId = (source: string, target: string): string => `${source}\u0000${tar
  */
 const LAYOUT = { name: "preset" } as unknown as cytoscape.LayoutOptions;
 
-/** Builds compound elements: one node per note, one parent box per folder. */
-export function buildElements(docs: Doc[]): ElementDefinition[] {
+/**
+ * Builds compound elements: one node per note, one parent box per folder.
+ *
+ * `described` is the set of connection-note paths that exist on disk (see `edges.ts`); an
+ * edge whose note is among them is marked so the stylesheet can draw it as documented.
+ */
+export function buildElements(docs: Doc[], described: ReadonlySet<string> = new Set()): ElementDefinition[] {
   const resolver = new LinkResolver(docs.map((d) => d.path));
   const elements: ElementDefinition[] = [];
   const folders = new Set<string>();
@@ -276,7 +287,15 @@ export function buildElements(docs: Doc[]): ElementDefinition[] {
 
   for (const [id, edge] of byEdge) {
     const label = edge.labels.join(", ");
-    elements.push({ data: { id, source: edge.source, target: edge.target, ...(label ? { label } : {}) } });
+    elements.push({
+      data: {
+        id,
+        source: edge.source,
+        target: edge.target,
+        ...(label ? { label } : {}),
+        ...(described.has(edgeNotePath(edge.source, edge.target)) ? { described: 1 } : {}),
+      },
+    });
   }
   return elements;
 }
@@ -285,6 +304,12 @@ export type Client = { x: number; y: number };
 
 export type GraphHandlers = {
   onOpen: (path: string) => void;
+  /**
+   * Click on a connection: open the markdown file that describes it, creating it on the
+   * spot if this is the first time anybody has had something to say about that link.
+   * `label` is the relation named in the note, so a new file can open with it already in.
+   */
+  onOpenEdge: (source: string, target: string, label: string | null) => void;
   /** Right-click on a note: offer "link" / "delete". */
   onNodeMenu: (path: string, client: Client) => void;
   /** Right-click on empty canvas, or inside a folder box: offer "new note/folder". */
@@ -337,7 +362,7 @@ const CORNERS: readonly Corner[] = [
 
 export class GraphView {
   private cy: Core | null = null;
-  private pending: { docs: Doc[]; active: string | null } | null = null;
+  private pending: { docs: Doc[]; active: string | null; described: ReadonlySet<string> } | null = null;
   private sizeWatcher: ResizeObserver | null = null;
   private draftSource: string | null = null;
   private drag: DragState | null = null;
@@ -399,29 +424,29 @@ export class GraphView {
    * A first draw builds the instance and solves it; later draws patch the live graph
    * (`sync`) so an edit never re-solves and moves everything the user has arranged.
    */
-  render(docs: Doc[], active: string | null): void {
+  render(docs: Doc[], active: string | null, described: ReadonlySet<string> = new Set()): void {
     // Every layout derives its bounding box from the container, so a build while
     // the container is unsized collapses the whole graph onto one point. Wait for
     // real dimensions instead.
     if (!this.hasSize()) {
-      this.pending = { docs, active };
+      this.pending = { docs, active, described };
       this.watchForSize();
       return;
     }
     // The solver only runs on the first build and on explicit Re-layout —
     // re-solving on every edit would throw the whole graph around.
-    if (this.cy) this.sync(docs, active);
-    else this.build(docs, active);
+    if (this.cy) this.sync(docs, active, described);
+    else this.build(docs, active, described);
   }
 
   /**
    * Brings the live graph in line with the files: drops what's gone, adds what's
    * new, leaves every existing node exactly where the user left it.
    */
-  private sync(docs: Doc[], active: string | null): void {
+  private sync(docs: Doc[], active: string | null, described: ReadonlySet<string>): void {
     const cy = this.cy;
     if (!cy) return;
-    const defs = buildElements(docs);
+    const defs = buildElements(docs, described);
     const nodeDefs = defs.filter((def) => !def.data.source);
     const edgeDefs = defs.filter((def) => def.data.source);
     const wantNodes = new Set(nodeDefs.map((def) => def.data.id as string));
@@ -468,10 +493,12 @@ export class GraphView {
         }
         // An edge that is already drawn still has to track its relation name: editing
         // `built with:: [[X]]` in the markdown must move the label on the line, not wait
-        // for a full rebuild.
+        // for a full rebuild. Its note appearing (or being deleted) counts the same way.
         const label = def.data.label as string | undefined;
         if (label) existing.data("label", label);
         else existing.removeData("label");
+        if (def.data.described) existing.data("described", 1);
+        else existing.removeData("described");
       }
     });
 
@@ -511,20 +538,20 @@ export class GraphView {
     if (this.sizeWatcher) return;
     this.sizeWatcher = new ResizeObserver(() => {
       if (!this.pending || !this.hasSize()) return;
-      const { docs, active } = this.pending;
+      const { docs, active, described } = this.pending;
       this.pending = null;
       this.sizeWatcher?.disconnect();
       this.sizeWatcher = null;
-      this.build(docs, active);
+      this.build(docs, active, described);
     });
     this.sizeWatcher.observe(this.container);
   }
 
-  private build(docs: Doc[], active: string | null): void {
+  private build(docs: Doc[], active: string | null, described: ReadonlySet<string>): void {
     this.cy?.destroy();
     this.cy = cytoscape({
       container: this.container,
-      elements: buildElements(docs),
+      elements: buildElements(docs, described),
       style: STYLE,
       layout: LAYOUT,
       wheelSensitivity: 0.2,
@@ -633,10 +660,37 @@ export class GraphView {
       .toggleClass("box-hidden", !this.boxesVisible);
   }
 
+  /**
+   * Marks whatever the open tab is showing. That is usually a note, and so a node — but a
+   * connection note belongs to an edge, and edges are keyed by their endpoints rather than
+   * by the file's path, so the match is made by asking each edge what its note is called.
+   */
   markActive(active: string | null): void {
     if (!this.cy) return;
-    this.cy.nodes(".active").removeClass("active");
-    if (active) this.cy.getElementById(active).addClass("active");
+    this.cy.elements(".active").removeClass("active");
+    if (!active) return;
+    if (isEdgeNote(active)) {
+      this.edgeFor(active)?.addClass("active");
+      return;
+    }
+    this.cy.getElementById(active).addClass("active");
+  }
+
+  /** The edge a connection note describes, if both its ends are still on the graph. */
+  private edgeFor(notePath: string): EdgeSingular | null {
+    const found = this.cy
+      ?.edges()
+      .filter((edge) => edgeNotePath(edge.source().id(), edge.target().id()) === notePath);
+    return found?.nonempty() ? (found.first() as EdgeSingular) : null;
+  }
+
+  /**
+   * Thickens an edge the moment its note is written, so drawing a connection and describing
+   * it reads as one gesture instead of waiting for the next rebuild to catch up.
+   */
+  setEdgeDescribed(source: string, target: string): void {
+    const edge = this.cy?.getElementById(edgeId(source, target));
+    if (edge && edge.nonempty()) edge.data("described", 1);
   }
 
   /**
@@ -686,6 +740,15 @@ export class GraphView {
       if (node.data("kind") === "file") this.handlers.onOpen(node.id());
     });
 
+    // A note says what the thing is; the line between two notes says how they are wired
+    // together. Clicking it opens that file — and writes it first if there isn't one yet.
+    cy.on("tap", "edge", (event) => {
+      if (this.draftSource) return; // a link is being drawn; the release belongs to that
+      const edge = event.target as EdgeSingular;
+      const label = (edge.data("label") as string | undefined) ?? null;
+      this.handlers.onOpenEdge(edge.source().id(), edge.target().id(), label);
+    });
+
     cy.on("tap", (event) => {
       if (event.target !== cy) return; // background only
       if (this.draftSource) {
@@ -731,6 +794,20 @@ export class GraphView {
     cy.on("mouseout", "node", () => {
       if (this.draftSource) return;
       cy.elements().removeClass("faded").removeClass("highlight");
+    });
+
+    // Nothing on the line itself says it can be opened, so the status bar says it.
+    cy.on("mouseover", "edge", (event) => {
+      if (this.draftSource || this.drag) return;
+      const edge = event.target as EdgeSingular;
+      const title = edgeTitle(edge.source().id(), edge.target().id());
+      this.handlers.onHint(
+        edge.data("described") ? `Open "${title}"` : `Click to describe the flow: ${title}`,
+      );
+    });
+    cy.on("mouseout", "edge", () => {
+      if (this.draftSource || this.drag) return;
+      this.handlers.onHint(null);
     });
 
     /* --- dragging notes between folders, with resistance at every border --- */
