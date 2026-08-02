@@ -130,10 +130,31 @@ const STYLE: cytoscape.StylesheetJson = [
       "compound-sizing-wrt-labels": "exclude",
     },
   },
-  { selector: "edge", style: { "line-color": "#f92411", width: 1, "curve-style": "bezier" } },
+  /*
+   * A link has a direction — the note that points and the note pointed at — and a bare line
+   * says nothing about which is which. So every edge carries a head at its target end.
+   *
+   * Cytoscape scales an arrow with the line it sits on, so a 1px edge draws an arrowhead too
+   * small to read a direction from; the line is a shade thicker and the arrow is scaled up
+   * past it. `target-distance-from-node` holds the point clear of the circle instead of
+   * letting it disappear into the fill.
+   */
+  {
+    selector: "edge",
+    style: {
+      "line-color": "#f92411",
+      width: 1.4,
+      "curve-style": "bezier",
+      "target-arrow-shape": "triangle",
+      "target-arrow-color": "#f92411",
+      "arrow-scale": 1.3,
+      "target-distance-from-node": 2,
+    },
+  },
   // A connection that owns a note is drawn as a thicker line: the vault's documented
-  // flows are then legible as a shape, the same way `nodeSize` makes its hubs one.
-  { selector: "edge[described]", style: { width: 3 } },
+  // flows are then legible as a shape, the same way `nodeSize` makes its hubs one. The
+  // arrow already grows with the line, so it is scaled back to stay in proportion.
+  { selector: "edge[described]", style: { width: 3, "arrow-scale": 1.1 } },
   // A named connection writes its relation along the line, rotated with it and backed by the
   // canvas colour so it stays readable where it crosses other edges.
   {
@@ -151,9 +172,17 @@ const STYLE: cytoscape.StylesheetJson = [
   },
   { selector: "node.active", style: { "border-width": 3, "border-color": "#dcddde" } },
   { selector: ".faded", style: { opacity: 0.25 } },
-  { selector: ".highlight", style: { "line-color": "#ffffff", width: 2 } },
+  // The arrow is recoloured with the line everywhere, or a highlighted edge keeps a red
+  // head that reads as a different edge crossing it.
+  {
+    selector: ".highlight",
+    style: { "line-color": "#ffffff", "target-arrow-color": "#ffffff", width: 2, "arrow-scale": 1.3 },
+  },
   // The connection whose note is the open tab — the edge's answer to the node's ring.
-  { selector: "edge.active", style: { "line-color": "#dcddde", width: 3 } },
+  {
+    selector: "edge.active",
+    style: { "line-color": "#dcddde", "target-arrow-color": "#dcddde", width: 3, "arrow-scale": 1.1 },
+  },
   // The link being drawn: an invisible cursor-following node plus an arrow to it.
   {
     selector: "node.draft",
