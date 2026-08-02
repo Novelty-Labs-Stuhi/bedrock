@@ -71,7 +71,9 @@ button:hover {
 #sidebar.collapsed #crumb,
 #sidebar.collapsed #tree,
 #sidebar.collapsed #vault-name,
-#sidebar.collapsed #open-folder {
+#sidebar.collapsed #open-folder,
+#sidebar.collapsed .side-foot,
+#sidebar.collapsed #settings-panel {
   display: none;
 }
 
@@ -187,8 +189,17 @@ body.resizing {
   box-shadow: inset 2px 0 0 var(--accent);
 }
 
-.file-item .name {
-  padding-left: 18px; /* aligns note names under their folder's name */
+/* The default-issue folder/file icons (inline SVG in sidebar.ts). */
+.tree-ico {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  display: block;
+}
+
+/* Files have no twisty, so the icon takes its width — names then line up. */
+.file-item .tree-ico {
+  margin-left: 19px;
 }
 
 button.twisty {
@@ -232,11 +243,6 @@ button.twisty:hover {
   border-radius: 4px;
 }
 
-.folder-icon {
-  font-size: 11px;
-  flex: 0 0 auto;
-  line-height: 1;
-}
 
 .item .name {
   flex: 1;
@@ -285,6 +291,74 @@ button.twisty:hover {
   padding: 10px 8px;
   color: var(--muted);
   font-size: 12px;
+}
+
+/* ------------------------------------------------------------- settings --- */
+/* The sidebar's foot: the ⚙ that opens the toggles, and the git button when it is on. */
+
+.side-foot {
+  display: flex;
+  gap: 6px;
+  padding: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.side-foot button {
+  flex: 1;
+  white-space: nowrap;
+}
+
+#settings.on {
+  border-color: var(--accent);
+  color: #fff;
+}
+
+/* Floats over the tree, anchored to the foot it opened from. */
+#settings-panel {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 44px;
+  z-index: 4;
+  padding: 10px 12px 6px;
+  background: var(--bg-side);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  box-shadow: 0 8px 28px rgb(0 0 0 / 45%);
+  font-size: 12px;
+}
+
+#settings-panel h4 {
+  margin: 0 0 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.setting {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 2px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.setting input {
+  margin: 2px 0 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.setting b {
+  display: block;
+  font-size: 12px;
+}
+
+.setting small {
+  color: var(--muted);
 }
 
 /* ---------------------------------------------------------------- main --- */
@@ -837,10 +911,12 @@ button.twisty:hover {
   pointer-events: none;
 }
 
-/* Loose text pinned to the canvas. Scaled by the graph's zoom (font-size is set in
-   JS), so paddings are in em and the whole card scales as one. */
+/* Loose text pinned to the canvas. Cards are part of the graph and scale with it
+   1:1 — font-size is set in JS from the zoom, and everything inside is in em, so
+   the whole card (rows, checkboxes, grips) rides that one number. */
 .sticky {
   position: absolute;
+  font-size: 13px;
   display: flex;
   flex-direction: column;
   padding: 0.4em;
@@ -896,6 +972,162 @@ button.twisty:hover {
   width: 1.1em;
   height: 1.1em;
   cursor: nwse-resize;
+}
+
+/* The ✕ in a card's corner — stickies and todos both delete this way. */
+.sticky-x {
+  position: absolute;
+  top: 0.08em;
+  right: 0.12em;
+  padding: 0 0.15em;
+  border: 0;
+  background: transparent;
+  color: #8d7f57;
+  font-size: 0.85em;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.sticky-x:hover {
+  background: transparent;
+  color: #f0e2b6;
+}
+
+/* ---------------------------------------------------------------- todos --- */
+/* A todo is a sticky rendered as a checklist. The `- [ ]` prefixes and the
+   `[[link]]` line stay in the stored markdown; none of that syntax is shown. */
+
+.sticky.todo {
+  cursor: default; /* the rows take clicks; the bar and padding still move it */
+}
+
+.todo-rows {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15em;
+  overflow: hidden;
+}
+
+.todo-row {
+  display: flex;
+  align-items: center;
+  gap: 0.35em;
+}
+
+.todo-row input[type="checkbox"] {
+  flex: 0 0 auto;
+  /* Form controls do not inherit font-size; without this the box stays at the
+     browser's default size while everything around it scales with the zoom. */
+  font: inherit;
+  width: 1em;
+  height: 1em;
+  margin: 0;
+  accent-color: #e6c34a;
+  cursor: pointer;
+}
+
+.todo-row .todo-text {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  padding: 0;
+  outline: none;
+  background: transparent;
+  color: #f0e2b6;
+  font: inherit;
+  line-height: 1.35;
+}
+
+.todo-row .todo-text::placeholder {
+  color: #8d7f57;
+}
+
+/* A ticked line reads as behind you. */
+.todo-row input[type="checkbox"]:checked + .todo-text {
+  color: #8d7f57;
+  text-decoration: line-through;
+}
+
+/* Creation date, worn on the drag bar. The file is named after it too. */
+.todo .sticky-bar {
+  height: auto;
+  min-height: 0.5em;
+  display: flex;
+  align-items: center;
+}
+
+.todo-date {
+  font-size: 0.68em;
+  color: #8d7f57;
+  padding: 0 0.3em;
+  pointer-events: none;
+  user-select: none;
+}
+
+.todo-fold {
+  position: absolute;
+  top: 0.1em;
+  right: 1.3em; /* the ✕ has the corner */
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #f0e2b6;
+  opacity: 0.55;
+  font-size: 0.8em;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.todo-fold:hover {
+  background: transparent;
+  opacity: 1;
+}
+
+/* Folded: the little yellow square. The number is how many tasks are still open. */
+.sticky.todo.folded {
+  padding: 0;
+  border-color: #b3922f;
+  background: #e6c34a;
+  cursor: pointer;
+}
+
+.todo-face {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #3a331d;
+  font-weight: 700;
+  font-size: 0.85em;
+  user-select: none;
+}
+
+/* The arrows todos point at notes with. Under the cards (first child of the
+   overlay), so a line always starts from beneath its own sticky. */
+.todo-arrows {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.todo-arrow {
+  stroke: #e6c34a;
+  stroke-width: 1.6;
+}
+
+.todo-arrow.done {
+  stroke: #3fb950;
+}
+
+.todo-arrow.proposal {
+  stroke-dasharray: 5 4;
+  opacity: 0.8;
 }
 
 /* Corner grips: nothing is drawn, the cursor is the only sign they are there. */

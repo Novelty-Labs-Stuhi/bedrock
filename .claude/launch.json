@@ -2,10 +2,10 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "obsidian-lite",
+      "name": "bedrock-dev",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev", "--", "--port", "5183"],
-      "port": 5183
+      "runtimeArgs": ["run", "dev"],
+      "port": 5173
     }
   ]
 }

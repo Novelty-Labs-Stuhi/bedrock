@@ -19,10 +19,19 @@ import {
 import { edgeNotePath, edgeTitle, isEdgeNote } from "./edges";
 import { inlineEdit, type InlineEditor } from "./inline";
 import { layoutGraph } from "./apply-layout";
-import { LinkResolver, parseLinks, parseTags } from "./links";
+import { LinkResolver, parseLinks, parseTags, parseType } from "./links";
 import { ancestors, basename, dirname, noteName } from "./vault";
+import type { SettingsStore } from "./settings";
 import type { SpatialStore } from "./spatial";
-import type { Sticky, StickyStore } from "./sticky";
+import {
+  allDone,
+  createdLabel,
+  parseTodo,
+  serializeTodo,
+  type Sticky,
+  type StickyStore,
+  type TodoDoc,
+} from "./sticky";
 
 export type Doc = { path: string; text: string };
 
@@ -83,6 +92,22 @@ const NODE_MAX = 68;
 export const nodeSize = (incoming: number): number =>
   Math.min(NODE_MAX, Math.round(NODE_MIN + 16 * Math.sqrt(incoming)));
 
+/**
+ * Shapes by note TYPE — the `type:: …` line a file ends with. Untyped notes are
+ * circles; a typed one wears its type as a shape, so what a node IS reads at a
+ * glance. New types slot in here and get their selector generated below.
+ */
+const TYPE_SHAPES = { gemini: "round-rectangle" } as const;
+
+const typeShapeStyles = (): cytoscape.StylesheetJson =>
+  Object.entries(TYPE_SHAPES).map(([type, shape]) => ({
+    selector: `node[ntype = "${type}"]`,
+    style: { shape },
+  })) as unknown as cytoscape.StylesheetJson;
+
+/** First web link in a conversation note — what a click on its node opens. */
+const URL_RE = /https?:\/\/[^\s)\]>]+/;
+
 /** demo-compound.html's style, plus labels (a note graph is unusable without them). */
 const STYLE: cytoscape.StylesheetJson = [
   {
@@ -105,6 +130,8 @@ const STYLE: cytoscape.StylesheetJson = [
     selector: 'node[kind = "file"]',
     style: { width: "data(size)", height: "data(size)", ...pieStyle() },
   },
+  // Typed notes wear their type as a shape — a Gemini conversation is a rectangle.
+  ...typeShapeStyles(),
   {
     selector: "node:parent",
     style: {
@@ -234,6 +261,30 @@ const BOXES_KEY = "obsidian-lite:boxes";
 const DRAFT_NODE = "__draft_target__";
 const DRAFT_EDGE = "__draft_edge__";
 
+/* ------------------------------------------------------------------- todos --- */
+
+/** Side of the little square a todo folds into, in model units. */
+const FOLDED_SIZE = 26;
+
+/** Sticky yellow for an open todo's arrow, green once every task is ticked. */
+const TODO_OPEN = "#e6c34a";
+const TODO_DONE = "#3fb950";
+
+const arrowHead = (id: string, colour: string): string =>
+  `<marker id="${id}" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" ` +
+  `orient="auto-start-reverse"><path d="M0 0 L8 4 L0 8 Z" fill="${colour}" /></marker>`;
+
+const ARROW_DEFS = `<defs>${arrowHead("todo-head", TODO_OPEN)}${arrowHead("todo-head-done", TODO_DONE)}</defs>`;
+
+const arrowLine = (
+  from: { x: number; y: number },
+  to: { x: number; y: number },
+  cls: string,
+  marker: string,
+): string =>
+  `<line x1="${from.x}" y1="${from.y}" x2="${to.x}" y2="${to.y}" class="${cls}" ` +
+  `marker-end="url(#${marker})" />`;
+
 const clientPoint = (event: cytoscape.EventObject): { x: number; y: number } => {
   const original = event.originalEvent as MouseEvent | undefined;
   return { x: original?.clientX ?? 0, y: original?.clientY ?? 0 };
@@ -343,6 +394,7 @@ export function buildElements(docs: Doc[], described: ReadonlySet<string> = new 
 
   for (const doc of docs) {
     for (const folder of ancestors(doc.path)) folders.add(folder);
+    const type = parseType(doc.text);
     elements.push({
       data: {
         id: doc.path,
@@ -350,6 +402,11 @@ export function buildElements(docs: Doc[], described: ReadonlySet<string> = new 
         parent: dirname(doc.path) || undefined,
         kind: "file",
         size: nodeSize(incoming.get(doc.path) ?? 0),
+        // Always present (empty for untyped), so a removed type line clears on sync.
+        ntype: type ?? "",
+        // A conversation node opens its link directly, so the URL rides on the node —
+        // a click must not wait on a file read (popup blockers honour only the click).
+        ...(type === "gemini" ? { gurl: URL_RE.exec(doc.text)?.[0] ?? "" } : {}),
         ...pieData(parseTags(doc.text)),
       },
     });
@@ -380,6 +437,11 @@ export type Client = { x: number; y: number };
 export type GraphHandlers = {
   onOpen: (path: string) => void;
   /**
+   * Click on a Gemini conversation node: it is a link, not a page — hand over the
+   * chat URL stored on the node (null when the note carries none yet).
+   */
+  onOpenGemini: (path: string, url: string | null) => void;
+  /**
    * Click on a connection: open the markdown file that describes it, creating it on the
    * spot if this is the first time anybody has had something to say about that link.
    * `label` is the relation named in the note, so a new file can open with it already in.
@@ -394,9 +456,10 @@ export type GraphHandlers = {
   /**
    * Link draft finished on empty canvas: create a note THERE and link to it. `folder` is the box
    * the release landed in (null at the root) — the note belongs where the user dropped it, not
-   * wherever the source note happens to live.
+   * wherever the source note happens to live. `kind` is what the draft was aimed at making:
+   * an ordinary note, or a Gemini conversation.
    */
-  onLinkNew: (source: string, at: cytoscape.Position, folder: string | null) => void;
+  onLinkNew: (source: string, at: cytoscape.Position, folder: string | null, kind: "note" | "gemini") => void;
   /** A note was dragged deep enough into a folder box to move it there. */
   onReparent: (path: string, folder: string) => void;
   /**
@@ -440,6 +503,8 @@ export class GraphView {
   private pending: { docs: Doc[]; active: string | null; described: ReadonlySet<string> } | null = null;
   private sizeWatcher: ResizeObserver | null = null;
   private draftSource: string | null = null;
+  /** What the open draft will create if it lands on empty space. */
+  private draftKind: "note" | "gemini" = "note";
   private drag: DragState | null = null;
   private frames: FrameStore;
   private boxesVisible = localStorage.getItem(BOXES_KEY) !== "off";
@@ -455,6 +520,12 @@ export class GraphView {
   private lasso: HTMLElement | null = null;
   /** Sticky id -> its element in the overlay. */
   private stickyEls = new Map<string, HTMLElement>();
+  /** The SVG sheet the todo arrows are drawn on, under the sticky cards. */
+  private arrowLayer: SVGSVGElement;
+  /** Todo waiting for its arrow: click a note to connect it, typing skips. */
+  private pendingTodo: string | null = null;
+  /** Where the proposed arrow's tip currently is, in rendered coordinates. */
+  private proposalAt: { x: number; y: number } | null = null;
   /**
    * True once this vault's arrangement has been restored (or solved for the first time).
    * Nothing is written back before then — a capture from a half-built graph would
@@ -473,12 +544,18 @@ export class GraphView {
     private handlers: GraphHandlers,
     private spatial: SpatialStore,
     private stickies: StickyStore,
+    private settings: SettingsStore,
   ) {
     this.frames = new FrameStore(spatial);
     this.overlay = document.createElement("div");
     this.overlay.className = "graph-overlay";
     // A sibling of the canvas: cytoscape clears its own container on destroy().
     this.container.parentElement?.appendChild(this.overlay);
+    // First child of the overlay, so every sticky card is painted over its own arrow.
+    this.arrowLayer = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    this.arrowLayer.setAttribute("class", "todo-arrows");
+    this.arrowLayer.innerHTML = ARROW_DEFS;
+    this.overlay.appendChild(this.arrowLayer);
 
     // Right-click drives the context menu, so suppress the native one.
     this.container.addEventListener("contextmenu", (event) => event.preventDefault());
@@ -498,6 +575,7 @@ export class GraphView {
       if (event.key !== "Escape") return;
       if (this.draftSource) this.cancelDraft();
       if (this.lasso) this.cancelGroup();
+      if (this.pendingTodo) this.cancelProposal(true);
     });
   }
 
@@ -519,6 +597,9 @@ export class GraphView {
     this.handles.clear();
     for (const el of this.stickyEls.values()) el.remove();
     this.stickyEls.clear();
+    this.pendingTodo = null;
+    this.proposalAt = null;
+    this.arrowLayer.innerHTML = ARROW_DEFS;
     this.fittedSize = null;
     this.userMoved = false;
   }
@@ -887,11 +968,34 @@ export class GraphView {
   private wire(cy: Core): void {
     cy.on("tap", "node", (event) => {
       const node = event.target as NodeSingular;
+      // A todo is waiting for its arrow: this click is the other end of it.
+      if (this.pendingTodo) {
+        if (node.data("kind") === "file") this.connectTodo(node);
+        return;
+      }
       if (this.draftSource) {
+        // A release over a folder box is a release on the space INSIDE it: the tap
+        // lands on the compound node, but what the user meant is "put it here".
+        if (node.data("kind") === "dir") {
+          const source = this.draftSource;
+          const kind = this.draftKind;
+          const at = { ...event.position };
+          const folder = this.folderAt(cy, at, null)?.id() ?? node.id();
+          this.clearDraft();
+          this.handlers.onLinkNew(source, at, folder, kind);
+          return;
+        }
         this.finishDraftOnNode(node);
         return;
       }
-      if (node.data("kind") === "file") this.handlers.onOpen(node.id());
+      if (node.data("kind") !== "file") return;
+      // A conversation node is a link wearing a rectangle: clicking it goes to the
+      // chat. With the integration off it opens like any note, from here too.
+      if (node.data("ntype") === "gemini" && this.settings.enabled("gemini")) {
+        this.handlers.onOpenGemini(node.id(), (node.data("gurl") as string) || null);
+        return;
+      }
+      this.handlers.onOpen(node.id());
     });
 
     // A note says what the thing is; the line between two notes says how they are wired
@@ -905,12 +1009,17 @@ export class GraphView {
 
     cy.on("tap", (event) => {
       if (event.target !== cy) return; // background only
+      if (this.pendingTodo) {
+        this.cancelProposal(true); // clicked away — the todo stays, arrowless
+        return;
+      }
       if (this.draftSource) {
         const source = this.draftSource;
+        const kind = this.draftKind;
         const at = { ...event.position };
         const folder = this.enclosingFolder(cy, at);
         this.clearDraft();
-        this.handlers.onLinkNew(source, at, folder);
+        this.handlers.onLinkNew(source, at, folder, kind);
         return;
       }
       // Nothing else: a stray click on the canvas must not litter the vault.
@@ -932,10 +1041,15 @@ export class GraphView {
       }
     });
 
-    // Keep the arrow's tip under the cursor while a link is being drawn.
+    // Keep the arrow's tip under the cursor while a link (or todo arrow) is being drawn.
     cy.on("mousemove", (event) => {
-      if (!this.draftSource) return;
-      cy.getElementById(DRAFT_NODE).position(event.position);
+      if (this.draftSource) cy.getElementById(DRAFT_NODE).position(event.position);
+      if (this.pendingTodo) {
+        const zoom = cy.zoom();
+        const pan = cy.pan();
+        this.proposalAt = { x: event.position.x * zoom + pan.x, y: event.position.y * zoom + pan.y };
+        this.drawArrows();
+      }
     });
 
     cy.on("mouseover", "node", (event) => {
@@ -974,6 +1088,7 @@ export class GraphView {
     });
 
     cy.on("drag", "node", (event) => {
+      this.drawArrows(); // a todo may be pointing at the node being dragged
       if (!this.drag) return;
       const node = event.target as NodeSingular;
       if (node.id() !== this.drag.path) return;
@@ -1253,6 +1368,12 @@ export class GraphView {
   private drawOverlay(): void {
     this.drawHandles();
     this.placeStickies();
+    this.drawArrows();
+  }
+
+  /** Re-applies the feature toggles to everything drawn above the canvas. */
+  refreshOverlay(): void {
+    this.drawOverlay();
   }
 
   /* --------------------------------------------------------------- stickies --- */
@@ -1266,9 +1387,9 @@ export class GraphView {
   }
 
   /**
-   * Stickies live in model space, so they pan and zoom with the graph rather than
-   * floating over it. Everything — size, padding, type — is scaled by the zoom, which
-   * is what makes a sticky feel pinned to the canvas instead of to the window.
+   * Cards are PART of the graph: corner, size and type all live in model space and
+   * ride the zoom 1:1 with the nodes — a card keeps its proportions to the picture
+   * around it at every zoom level, exactly like everything else on the canvas.
    */
   private placeStickies(): void {
     const cy = this.cy;
@@ -1278,13 +1399,19 @@ export class GraphView {
     const alive = new Set<string>();
 
     for (const sticky of this.stickies.all()) {
+      // A switched-off integration leaves nothing on the canvas; the text is still
+      // in the store, so switching it back on brings everything back.
+      if (!this.settings.enabled(sticky.kind === "todo" ? "todos" : "stickies")) continue;
       alive.add(sticky.id);
       let el = this.stickyEls.get(sticky.id);
-      if (!el) el = this.buildSticky(sticky);
+      if (!el) el = sticky.kind === "todo" ? this.buildTodo(sticky) : this.buildSticky(sticky);
+      const folded = sticky.kind === "todo" && sticky.folded;
       el.style.left = `${sticky.x * zoom + pan.x}px`;
       el.style.top = `${sticky.y * zoom + pan.y}px`;
-      el.style.width = `${sticky.w * zoom}px`;
-      el.style.height = `${sticky.h * zoom}px`;
+      el.style.width = `${(folded ? FOLDED_SIZE : sticky.w) * zoom}px`;
+      el.style.height = `${(folded ? FOLDED_SIZE : sticky.h) * zoom}px`;
+      // Everything inside is sized in em, so one font-size scales the whole card —
+      // checkboxes, rows, grips — in lockstep with the graph.
       el.style.fontSize = `${13 * zoom}px`;
     }
     for (const [id, el] of this.stickyEls) {
@@ -1299,10 +1426,14 @@ export class GraphView {
     el.className = "sticky";
     el.innerHTML =
       `<div class="sticky-bar" title="Drag to move"></div>` +
+      `<button class="sticky-x" title="Delete this sticky">✕</button>` +
       `<textarea class="sticky-text" spellcheck="false" placeholder="note to self…"></textarea>` +
       `<div class="sticky-grip" title="Drag to resize"></div>`;
     const field = el.querySelector<HTMLTextAreaElement>(".sticky-text")!;
     field.value = sticky.text;
+    el.querySelector<HTMLButtonElement>(".sticky-x")?.addEventListener("click", () =>
+      this.deleteSticky(sticky.id),
+    );
 
     field.addEventListener("input", () => {
       this.stickies.update(sticky.id, { text: field.value });
@@ -1319,10 +1450,11 @@ export class GraphView {
 
     // The padding around the text is the drag area; the corner is the resize grip.
     el.addEventListener("mousedown", (event) => {
-      if (event.target === field) return;
+      const target = event.target as HTMLElement;
+      if (event.target === field || target.closest(".sticky-x")) return;
       event.preventDefault();
       event.stopPropagation();
-      const grip = (event.target as HTMLElement).classList.contains("sticky-grip");
+      const grip = target.classList.contains("sticky-grip");
       this.dragSticky(sticky.id, event, grip ? "size" : "move");
     });
 
@@ -1333,12 +1465,10 @@ export class GraphView {
 
   /** Grows a sticky's height so typed lines are never hidden behind its own edge. */
   private growToFit(id: string, field: HTMLTextAreaElement): void {
-    const cy = this.cy;
-    if (!cy) return;
-    const zoom = cy.zoom();
     const el = this.stickyEls.get(id);
     if (!el) return;
     // scrollHeight is screen pixels at the current zoom; the model needs it unscaled.
+    const zoom = this.cy?.zoom() ?? 1;
     const chrome = (el.clientHeight - field.clientHeight) / zoom;
     const needed = field.scrollHeight / zoom + chrome;
     const held = this.stickies.all().find((s) => s.id === id);
@@ -1356,11 +1486,13 @@ export class GraphView {
     if (!from) return;
 
     const onMove = (move: MouseEvent): void => {
+      // Corner and size both live in model units, so every delta divides by the zoom.
       const dx = (move.clientX - start.x) / zoom;
       const dy = (move.clientY - start.y) / zoom;
       if (mode === "move") this.stickies.update(id, { x: from.x + dx, y: from.y + dy });
       else this.stickies.update(id, { w: Math.max(90, from.w + dx), h: Math.max(44, from.h + dy) });
       this.placeStickies();
+      this.drawArrows(); // a todo's arrow rides along with its card
     };
     const onUp = (): void => {
       document.removeEventListener("mousemove", onMove);
@@ -1368,6 +1500,329 @@ export class GraphView {
     };
     document.addEventListener("mousemove", onMove);
     document.addEventListener("mouseup", onUp);
+  }
+
+  /* ------------------------------------------------------------------ todos --- */
+
+  /**
+   * Right-click → "New todo": a checklist sticky. It opens already proposing an arrow —
+   * click a note to point the todo at it; starting to type instead keeps it loose.
+   */
+  addTodo(at: cytoscape.Position): void {
+    const sticky = this.stickies.add(at, "todo");
+    this.placeStickies();
+    this.proposeTodoLink(sticky.id);
+    this.focusRow(this.stickyEls.get(sticky.id), 0);
+  }
+
+  private heldSticky(id: string): Sticky | undefined {
+    return this.stickies.all().find((sticky) => sticky.id === id);
+  }
+
+  private buildTodo(sticky: Sticky): HTMLElement {
+    const el = document.createElement("div");
+    el.className = "sticky todo";
+    this.overlay.appendChild(el);
+    this.stickyEls.set(sticky.id, el);
+    this.renderTodo(el, sticky.id);
+
+    el.addEventListener("mousedown", (event) => {
+      const held = this.heldSticky(sticky.id);
+      if (!held) return;
+      if (held.folded) {
+        event.preventDefault();
+        event.stopPropagation();
+        this.dragOrUnfold(sticky.id, event);
+        return;
+      }
+      const target = event.target as HTMLElement;
+      if (target.closest("input") || target.closest(".todo-fold") || target.closest(".sticky-x")) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const grip = target.classList.contains("sticky-grip");
+      this.dragSticky(sticky.id, event, grip ? "size" : "move");
+    });
+
+    // A todo left with nothing in it (and no arrow) clears itself away, like a sticky.
+    el.addEventListener("focusout", () => {
+      window.setTimeout(() => {
+        if (el.contains(document.activeElement)) return;
+        if (this.pendingTodo === sticky.id) return; // still choosing its arrow
+        const held = this.heldSticky(sticky.id);
+        if (!held || held.folded) return;
+        const doc = parseTodo(held.text);
+        if (doc.targets.length || doc.items.some((item) => item.text.trim())) return;
+        this.stickies.remove(sticky.id);
+        this.placeStickies();
+        this.drawArrows();
+      }, 0);
+    });
+    return el;
+  }
+
+  /**
+   * (Re)builds a todo card's rows from its markdown. Runs on structural changes only —
+   * new line, removed line, fold, connect — never per keystroke, which would eat focus.
+   * The `- [ ]` prefixes and the `[[link]]` line are the storage, not the rendering:
+   * what shows is a checkbox per task, and the link line shows as nothing at all.
+   */
+  private renderTodo(el: HTMLElement, id: string): void {
+    const held = this.heldSticky(id);
+    if (!held) return;
+    const doc = parseTodo(held.text);
+    el.classList.toggle("folded", !!held.folded);
+    el.classList.toggle("done", allDone(doc));
+
+    if (held.folded) {
+      const open = doc.items.filter((item) => !item.done).length;
+      el.innerHTML = `<div class="todo-face" title="Open this todo">${open || "✓"}</div>`;
+      return;
+    }
+
+    const created = createdLabel(held.id);
+    el.innerHTML =
+      `<div class="sticky-bar" title="Drag to move">` +
+      (created ? `<span class="todo-date">${created}</span>` : "") +
+      `</div>` +
+      `<button class="sticky-x" title="Delete this todo">✕</button>` +
+      `<button class="todo-fold" title="Fold into a little square">▣</button>` +
+      `<div class="todo-rows">` +
+      doc.items
+        .map(
+          (item) =>
+            `<div class="todo-row">` +
+            `<input type="checkbox"${item.done ? " checked" : ""} title="Done" />` +
+            `<input class="todo-text" type="text" spellcheck="false" value="${escapeAttr(item.text)}" placeholder="to do…" />` +
+            `</div>`,
+        )
+        .join("") +
+      `</div><div class="sticky-grip" title="Drag to resize"></div>`;
+
+    el.querySelector<HTMLButtonElement>(".sticky-x")?.addEventListener("click", () =>
+      this.deleteSticky(id),
+    );
+    el.querySelector<HTMLButtonElement>(".todo-fold")?.addEventListener("click", () => {
+      this.stickies.update(id, { folded: true });
+      this.placeStickies();
+      this.renderTodo(el, id);
+      this.drawArrows();
+    });
+
+    el.querySelectorAll<HTMLElement>(".todo-row").forEach((row, index) => {
+      const check = row.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
+      const text = row.querySelector<HTMLInputElement>(".todo-text")!;
+
+      check.addEventListener("change", () => {
+        const next = this.readTodo(el, id);
+        this.stickies.update(id, { text: serializeTodo(next) });
+        el.classList.toggle("done", allDone(next));
+        this.drawArrows(); // ticking the last box is what turns the arrow green
+      });
+
+      text.addEventListener("input", () => {
+        this.stickies.update(id, { text: serializeTodo(this.readTodo(el, id)) });
+        // They typed instead of picking a node: that was the "no arrow" answer.
+        if (this.pendingTodo === id) this.cancelProposal();
+      });
+
+      text.addEventListener("keydown", (event) => {
+        event.stopPropagation(); // never reach the graph's own Escape / delete handling
+        if (event.key === "Enter") {
+          event.preventDefault();
+          const next = this.readTodo(el, id);
+          next.items.splice(index + 1, 0, { done: false, text: "" });
+          this.stickies.update(id, { text: serializeTodo(next) });
+          this.renderTodo(el, id);
+          this.focusRow(el, index + 1);
+          // Every fresh line re-opens the offer: click a note to add another arrow,
+          // keep typing to skip — the same bargain as when the todo was created.
+          this.proposeTodoLink(id);
+        } else if (event.key === "Backspace" && text.value === "") {
+          const next = this.readTodo(el, id);
+          if (next.items.length <= 1) return; // the last line stays; blur clears the card
+          event.preventDefault();
+          next.items.splice(index, 1);
+          this.stickies.update(id, { text: serializeTodo(next) });
+          this.renderTodo(el, id);
+          this.focusRow(el, Math.max(0, index - 1));
+        } else if (event.key === "Escape" && this.pendingTodo === id) {
+          this.cancelProposal();
+        }
+      });
+    });
+  }
+
+  /** The card as it stands in the DOM, plus the arrow targets only the model knows. */
+  private readTodo(el: HTMLElement, id: string): TodoDoc {
+    const held = this.heldSticky(id);
+    const targets = held ? parseTodo(held.text).targets : [];
+    const items = [...el.querySelectorAll<HTMLElement>(".todo-row")].map((row) => ({
+      done: row.querySelector<HTMLInputElement>('input[type="checkbox"]')!.checked,
+      text: row.querySelector<HTMLInputElement>(".todo-text")!.value,
+    }));
+    return { items, targets };
+  }
+
+  private focusRow(el: HTMLElement | undefined, index: number): void {
+    const field = el?.querySelectorAll<HTMLInputElement>(".todo-text")[index];
+    if (!field) return;
+    field.focus();
+    field.setSelectionRange(field.value.length, field.value.length);
+  }
+
+  /** On a folded square, a still click opens it back up and a real drag moves it. */
+  private dragOrUnfold(id: string, event: MouseEvent): void {
+    const cy = this.cy;
+    const from = this.heldSticky(id);
+    if (!cy || !from) return;
+    const zoom = cy.zoom();
+    const start = { x: event.clientX, y: event.clientY };
+    let moved = false;
+
+    const onMove = (move: MouseEvent): void => {
+      if (!moved && Math.hypot(move.clientX - start.x, move.clientY - start.y) < 4) return;
+      moved = true;
+      this.stickies.update(id, {
+        x: from.x + (move.clientX - start.x) / zoom,
+        y: from.y + (move.clientY - start.y) / zoom,
+      });
+      this.placeStickies();
+      this.drawArrows();
+    };
+    const onUp = (): void => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      if (moved) return;
+      this.stickies.update(id, { folded: false });
+      this.placeStickies();
+      const el = this.stickyEls.get(id);
+      if (el) this.renderTodo(el, id);
+      this.drawArrows();
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  }
+
+  /** The ✕ in a card's corner: the card goes, and with it its file. */
+  private deleteSticky(id: string): void {
+    if (this.pendingTodo === id) {
+      this.pendingTodo = null;
+      this.proposalAt = null;
+      this.handlers.onHint(null);
+    }
+    this.stickies.remove(id);
+    this.placeStickies();
+    this.drawArrows();
+  }
+
+  /* ------------------------------------------------------------ todo arrows --- */
+
+  private proposeTodoLink(id: string): void {
+    this.pendingTodo = id;
+    this.proposalAt = null;
+    this.handlers.onHint("Click a note to point this todo at it — typing (or Esc) skips the arrow");
+    this.drawArrows();
+  }
+
+  /**
+   * Drops the proposal. `removeEmpty` is for the explicit dismissals (Esc, a click on
+   * the background): a todo nothing was ever typed into goes with its proposal.
+   */
+  private cancelProposal(removeEmpty = false): void {
+    const id = this.pendingTodo;
+    this.pendingTodo = null;
+    this.proposalAt = null;
+    this.handlers.onHint(null);
+    if (removeEmpty && id) {
+      const held = this.heldSticky(id);
+      if (held) {
+        const doc = parseTodo(held.text);
+        if (!doc.targets.length && !doc.items.some((item) => item.text.trim())) {
+          this.stickies.remove(id);
+          this.placeStickies();
+        }
+      }
+    }
+    this.drawArrows();
+  }
+
+  /**
+   * The proposed arrow landed on a note. The connection is written INTO the todo's
+   * markdown — one more `[[link]]` line, exactly what a note would hold — and hidden
+   * from the card; the arrows on the canvas are those lines' rendering.
+   */
+  private connectTodo(node: NodeSingular): void {
+    const id = this.pendingTodo;
+    this.pendingTodo = null;
+    this.proposalAt = null;
+    this.handlers.onHint(null);
+    const held = id ? this.heldSticky(id) : undefined;
+    if (!id || !held) return;
+    const doc = parseTodo(held.text);
+    const name = noteName(node.id());
+    if (!doc.targets.some((t) => t.toLowerCase() === name.toLowerCase())) doc.targets.push(name);
+    this.stickies.update(id, { text: serializeTodo(doc) });
+    this.drawArrows();
+    // Back to typing where they were: the freshest line, not the top of the card.
+    this.focusRow(this.stickyEls.get(id), Math.max(0, doc.items.length - 1));
+  }
+
+  /** The node a todo's `[[link]]` points at — shallowest name match, as links resolve. */
+  private nodeByName(name: string): NodeSingular | null {
+    const cy = this.cy;
+    if (!cy) return null;
+    const wanted = name.replace(/^\/+/, "").toLowerCase();
+    const matches: NodeSingular[] = [];
+    cy.nodes().forEach((node) => {
+      if (node.data("kind") !== "file") return;
+      const path = node.id();
+      if (
+        path.toLowerCase() === wanted ||
+        path.replace(/\.md$/i, "").toLowerCase() === wanted ||
+        noteName(path).toLowerCase() === wanted
+      ) {
+        matches.push(node as NodeSingular);
+      }
+    });
+    matches.sort((a, b) => a.id().split("/").length - b.id().split("/").length || a.id().localeCompare(b.id()));
+    return matches[0] ?? null;
+  }
+
+  /** Every todo's arrow, plus the dashed proposal while one is being aimed. */
+  private drawArrows(): void {
+    const cy = this.cy;
+    let lines = "";
+    if (cy && this.settings.enabled("todos")) {
+      const zoom = cy.zoom();
+      const pan = cy.pan();
+      for (const sticky of this.stickies.all()) {
+        if (sticky.kind !== "todo") continue;
+        const w = sticky.folded ? FOLDED_SIZE : sticky.w;
+        const h = sticky.folded ? FOLDED_SIZE : sticky.h;
+        // From the card's centre, all in model units. The card itself covers the tail,
+        // so the line reads as starting at its edge without any rectangle geometry.
+        const from = { x: (sticky.x + w / 2) * zoom + pan.x, y: (sticky.y + h / 2) * zoom + pan.y };
+        const doc = parseTodo(sticky.text);
+        const done = allDone(doc);
+        for (const target of doc.targets) {
+          const node = this.nodeByName(target);
+          if (!node) continue; // the note went away; the line in the text remains
+          const at = node.renderedPosition();
+          const clear = (node.width() / 2) * zoom + 5; // hold the head off the circle
+          const dx = at.x - from.x;
+          const dy = at.y - from.y;
+          const span = Math.hypot(dx, dy);
+          if (span <= clear + 8) continue; // sitting on the node — nothing legible to draw
+          const to = { x: at.x - (dx / span) * clear, y: at.y - (dy / span) * clear };
+          lines += arrowLine(from, to, done ? "todo-arrow done" : "todo-arrow", done ? "todo-head-done" : "todo-head");
+        }
+        // The arrow being aimed rides on top of the ones already there.
+        if (this.pendingTodo === sticky.id && this.proposalAt) {
+          lines += arrowLine(from, this.proposalAt, "todo-arrow proposal", "todo-head");
+        }
+      }
+    }
+    this.arrowLayer.innerHTML = ARROW_DEFS + lines;
   }
 
   /**
@@ -1508,18 +1963,19 @@ export class GraphView {
     this.rename.editor.move(at.x, at.y);
   }
 
-  /** Public entry for the context menu's "link to another note" action. */
-  startLink(path: string): void {
+  /** Public entry for the context menu's link actions — to a note, or to a Gemini chat. */
+  startLink(path: string, kind: "note" | "gemini" = "note"): void {
     const node = this.cy?.getElementById(path);
-    if (node && node.nonempty()) this.startDraft(node as NodeSingular);
+    if (node && node.nonempty()) this.startDraft(node as NodeSingular, kind);
   }
 
   /* ------------------------------------------------------------ link draft --- */
 
-  private startDraft(source: NodeSingular): void {
+  private startDraft(source: NodeSingular, kind: "note" | "gemini" = "note"): void {
     if (!this.cy) return;
     this.cy.elements().removeClass("faded").removeClass("highlight");
     this.draftSource = source.id();
+    this.draftKind = kind;
     source.addClass("draft-source");
     this.cy.add([
       {
@@ -1536,10 +1992,25 @@ export class GraphView {
         classes: "draft",
       },
     ]);
-    this.handlers.onHint("Click a note to link to it, or empty space to create one — Esc cancels");
+    this.handlers.onHint(
+      kind === "gemini"
+        ? "Click empty space to put the Gemini conversation there — Esc cancels"
+        : "Click a note to link to it, or empty space to create one — Esc cancels",
+    );
   }
 
   private finishDraftOnNode(node: NodeSingular): void {
+    // A chat draft has no business landing on a note: silently turning it into a
+    // note-to-note link is exactly where phantom connections came from. The draft
+    // stays armed — empty space is the only thing that finishes it. The hint waits
+    // a tick, or the click's own grab/free cycle wipes it before it is ever seen.
+    if (this.draftKind === "gemini") {
+      window.setTimeout(
+        () => this.handlers.onHint("A Gemini chat wants empty space — click beside the notes (Esc cancels)"),
+        0,
+      );
+      return;
+    }
     const source = this.draftSource;
     this.clearDraft();
     if (!source) return;
@@ -1559,6 +2030,7 @@ export class GraphView {
     this.cy.getElementById(DRAFT_EDGE).remove();
     this.cy.getElementById(DRAFT_NODE).remove();
     this.draftSource = null;
+    this.draftKind = "note";
   }
 
   /**
@@ -1605,6 +2077,12 @@ export class GraphView {
     this.handlers.onHint("Name this connection — Enter to keep it, Esc to leave the link unnamed");
   }
 
+  /** Writes a freshly caught conversation URL onto the live node — no rebuild needed. */
+  setGeminiUrl(path: string, url: string): void {
+    const node = this.cy?.getElementById(path);
+    if (node && node.nonempty()) node.data("gurl", url);
+  }
+
   /** Writes a relation name onto the live edge, so it shows without a rebuild. */
   setEdgeLabel(source: string, target: string, label: string | null): void {
     const edge = this.cy?.getElementById(edgeId(source, target));
@@ -1623,12 +2101,27 @@ export class GraphView {
   }
 
   /** Adds a standalone note's node where it was spawned, without a relayout. */
-  commitNode(path: string, label: string, parent: string | undefined, at: cytoscape.Position): void {
+  commitNode(
+    path: string,
+    label: string,
+    parent: string | undefined,
+    at: cytoscape.Position,
+    type?: string,
+    url?: string,
+  ): void {
     if (!this.cy || this.cy.getElementById(path).nonempty()) return;
     this.cy.add({
       group: "nodes",
       // Nothing links to it yet; the next rebuild sizes it from its real backlinks.
-      data: { id: path, label, parent, kind: "file", size: nodeSize(0) },
+      data: {
+        id: path,
+        label,
+        parent,
+        kind: "file",
+        size: nodeSize(0),
+        ntype: type ?? "",
+        ...(url ? { gurl: url } : {}),
+      },
       position: this.freeSpot(parent, at),
     });
     this.handlers.onHint(null);
@@ -1682,12 +2175,24 @@ export class GraphView {
    * Adds a link (and, for a brand-new note, its node at `at`) to the live graph
    * without re-running the layout, so drawing a link doesn't reshuffle everything.
    */
-  commitLink(source: string, target: string, newNode?: { label: string; parent?: string; at: cytoscape.Position }): void {
+  commitLink(
+    source: string,
+    target: string,
+    newNode?: { label: string; parent?: string; at: cytoscape.Position; type?: string; url?: string },
+  ): void {
     if (!this.cy) return;
     if (newNode && this.cy.getElementById(target).empty()) {
       this.cy.add({
         group: "nodes",
-        data: { id: target, label: newNode.label, parent: newNode.parent, kind: "file", size: nodeSize(1) },
+        data: {
+          id: target,
+          label: newNode.label,
+          parent: newNode.parent,
+          kind: "file",
+          size: nodeSize(1),
+          ntype: newNode.type ?? "",
+          ...(newNode.url ? { gurl: newNode.url } : {}),
+        },
         position: this.freeSpot(newNode.parent, newNode.at),
       });
     }
@@ -1698,3 +2203,6 @@ export class GraphView {
     this.handlers.onHint(null);
   }
 }
+
+const escapeAttr = (s: string): string =>
+  s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");

@@ -60,6 +60,25 @@ const CHEVRON =
   `<path d="M4.5 2.5 L8.5 6 L4.5 9.5" fill="none" stroke="currentColor" ` +
   `stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" /></svg>`;
 
+/* The default-issue icons, as every file manager has drawn them forever: a yellow
+   folder with its darker tab, a blue page with a folded corner. Inline SVG rather
+   than emoji — 📁 renders differently on every platform, these render as themselves.
+   The gradient id repeats once per row; every copy is identical, so whichever def
+   the browser resolves to, the fill is the same. */
+const FOLDER_ICON =
+  `<svg class="tree-ico" viewBox="0 0 20 20" aria-hidden="true">` +
+  `<path d="M2 5.2C2 4.26 2.76 3.5 3.7 3.5h3.9c.45 0 .88.18 1.2.5l1.5 1.5H2z" fill="#c78e10"/>` +
+  `<rect x="2" y="5.6" width="16" height="10.9" rx="1.7" fill="url(#fold-shine)"/>` +
+  `<defs><linearGradient id="fold-shine" x1="0" y1="0" x2="0" y2="1">` +
+  `<stop offset="0" stop-color="#ffdd75"/><stop offset="1" stop-color="#f6b81f"/>` +
+  `</linearGradient></defs></svg>`;
+
+const FILE_ICON =
+  `<svg class="tree-ico" viewBox="0 0 20 20" aria-hidden="true">` +
+  `<path d="M4.5 4a2 2 0 0 1 2-2h5.4L16 6.1v9.9a2 2 0 0 1-2 2H6.5a2 2 0 0 1-2-2z" fill="#55d0f7"/>` +
+  `<path d="M11.9 2 16 6.1h-3.1a1 1 0 0 1-1-1z" fill="#2f7fd6"/>` +
+  `</svg>`;
+
 export class Sidebar {
   private collapsed = new Set<string>();
   private entries: Entry[] = [];
@@ -162,7 +181,7 @@ export class Sidebar {
         `<div class="item dir-item${selected}" ${attrs}>` +
         `<button class="twisty${open ? " open" : ""}" data-act="toggle" ` +
         `aria-expanded="${open}" title="${open ? "Collapse" : "Expand"}">${CHEVRON}</button>` +
-        `<span class="folder-icon">${open ? "📂" : "📁"}</span>` +
+        FOLDER_ICON +
         (nameCell ?? `<span class="name" data-act="selectdir">${escapeHtml(node.name)}</span>`) +
         `<span class="count">${count || ""}</span>` +
         `<span class="actions">` +
@@ -178,6 +197,7 @@ export class Sidebar {
     const active = this.activePath === node.path ? " active" : "";
     return (
       `<li class="file"><div class="item file-item${active}" ${attrs}${naming ? "" : ' data-act="open"'}>` +
+      FILE_ICON +
       (nameCell ?? `<span class="name">${escapeHtml(node.name)}</span>`) +
       `<span class="actions">` +
       `<button data-act="rename" title="Rename">✎</button>` +

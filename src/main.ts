@@ -3,14 +3,15 @@ import { GraphView, type Doc } from "./graph";
 import { LinkResolver, labelledLink, relinkText } from "./links";
 import { askConfirm, askText } from "./dialog";
 import { EDGE_DIR, edgeNotePath, edgeNoteTemplate, edgeTitle, isEdgeNote, renamedEdgeNote } from "./edges";
-import { showMenu } from "./menu";
+import { showMenu, type MenuItem } from "./menu";
 import { mountHelp } from "./help";
+import { SettingsStore, mountSettings } from "./settings";
 import { hydrateImages, imageFiles, insertAtCaret, saveImage } from "./images";
 import { linkTargets, renderMarkdown } from "./markdown";
 import { Sidebar } from "./sidebar";
 import { mountToolbar } from "./toolbar";
 import { SpatialStore } from "./spatial";
-import { StickyStore } from "./sticky";
+import { STICKY_DIR, TODO_DIR, StickyStore, isCardPath } from "./sticky";
 import {
   FolderVault,
   LocalVault,
@@ -59,6 +60,9 @@ const ui = {
   status: el("status"),
   help: el("help"),
   helpPanel: el("help-panel"),
+  settings: el<HTMLButtonElement>("settings"),
+  settingsPanel: el("settings-panel"),
+  gitCommit: el<HTMLButtonElement>("git-commit"),
 };
 
 mountHelp(ui.help, ui.helpPanel);
@@ -97,6 +101,8 @@ let vault: Vault = new LocalVault();
 const spatial = new SpatialStore();
 /** Loose text pinned to the canvas — kept apart from the layout cache, it is not derived. */
 const stickies = new StickyStore();
+/** Which integrations this vault runs with — `.notes/config.json`. */
+const settings = new SettingsStore();
 let entries: Entry[] = [];
 /** The graph is pinned as the first tab of the left pane and is never closed. */
 let panes: Pane[] = [{ tabs: [{ kind: "graph" }], active: 0, mode: "read" }];
@@ -131,37 +137,58 @@ const sidebar = new Sidebar(ui.tree, {
 
 const graphView = new GraphView(ui.cy, {
   onOpen: (path) => void openFile(path),
+  onOpenGemini: (path, url) => openGeminiNode(path, url),
   onOpenEdge: (source, target, label) => void openEdgeNote(source, target, label),
   onLinkExisting: (source, target) => linkNotes(source, target),
-  onLinkNew: (source, at, folder) => void linkToNewNote(source, at, folder),
+  onLinkNew: (source, at, folder, kind) =>
+    kind === "gemini" ? void createGeminiAt(at, folder, source) : void linkToNewNote(source, at, folder),
   onReparent: (path, folder) => void moveEntry(path, "file", folder, true),
   onGroup: (paths, frame) => void groupIntoFolder(paths, frame),
-  onNodeMenu: (path, client) =>
-    showMenu(client, [
-      { label: "Link to a note…", run: () => graphView.startLink(path) },
+  onNodeMenu: (path, client) => {
+    const items: MenuItem[] = [{ label: "Link to a note…", run: () => graphView.startLink(path) }];
+    if (settings.enabled("gemini")) {
+      items.push({ label: "Link to a Gemini chat…", run: () => graphView.startLink(path, "gemini") });
+    }
+    items.push(
       { label: `Rename "${noteName(path)}"`, run: () => renameOnGraph(path) },
       { label: `Delete "${noteName(path)}"`, run: () => void deleteEntry(path, "file") },
-    ]),
-  onCanvasMenu: (at, client, folder) =>
-    showMenu(client, [
+    );
+    showMenu(client, items);
+  },
+  onCanvasMenu: (at, client, folder) => {
+    const items: MenuItem[] = [
       { label: folder ? `New note in "${folder}"` : "New note", run: () => void createNoteAt(at, folder) },
       // A folder with nothing in it has no box, so "new folder" IS the rectangle:
       // pick the notes and the folder is made around them.
       { label: "New folder", run: () => graphView.startGroup() },
-      { label: "New sticky", run: () => graphView.addSticky(at) },
       { label: "Unstack notes", run: () => unstackNotes() },
-    ]),
+    ];
+    // Switched-off integrations do not appear anywhere, the menu included.
+    if (settings.enabled("stickies")) items.push({ label: "New sticky", run: () => graphView.addSticky(at) });
+    if (settings.enabled("todos")) items.push({ label: "New todo", run: () => graphView.addTodo(at) });
+    if (settings.enabled("gemini")) {
+      items.push({ label: "New Gemini conversation", run: () => void createGeminiAt(at, folder) });
+    }
+    showMenu(client, items);
+  },
   onHint: (hint) => {
     ui.status.textContent = hint ?? statusText();
   },
-}, spatial, stickies);
+}, spatial, stickies, settings);
 
 /* -------------------------------------------------------------- reading --- */
 
 const filePaths = (): string[] => entries.filter((e) => e.kind === "file").map((e) => e.path);
 
+/**
+ * What the graph draws. Sticky and todo files are real notes in real folders — the
+ * tree shows them — but on the canvas the CARD is their rendering, so they are never
+ * also nodes. That holds with the integrations off too: the folders' contents simply
+ * do not appear on the graph.
+ */
 async function readDocs(): Promise<Doc[]> {
-  return Promise.all(filePaths().map(async (path) => ({ path, text: await vault.read(path) })));
+  const drawn = filePaths().filter((path) => !isCardPath(path));
+  return Promise.all(drawn.map(async (path) => ({ path, text: await vault.read(path) })));
 }
 
 /**
@@ -172,6 +199,7 @@ const describedEdges = async (): Promise<Set<string>> => new Set(await vault.lis
 
 async function refresh(): Promise<void> {
   entries = await vault.entries();
+  await stickies.sync(filePaths()); // card files deleted or added in the tree
   pruneTabs();
   graphStale = true;
   render();
@@ -217,7 +245,8 @@ function statusText(): string {
   const tab = tabOf(pane());
   if (!tab) return "Open or create a note";
   if (tab.kind === "graph") {
-    return `${filePaths().length} notes — right-drag to link, click a connection to describe it`;
+    const drawn = filePaths().filter((path) => !isCardPath(path)).length;
+    return `${drawn} notes — right-drag to link, click a connection to describe it`;
   }
   // A connection note's path is `.notes/edges/…`, which says nothing useful; what it is
   // FOR does. Said here rather than at the moment it opens, so a later repaint keeps it.
@@ -477,6 +506,9 @@ async function relinkVault(moves: Map<string, string>): Promise<number> {
     await vault.write(path, next);
     touched++;
   }
+  // The loop above rewrote sticky and todo files on disk like any other note;
+  // the cards' cache has to hear about it or a later card edit writes the old link back.
+  stickies.rewriteTexts((text) => relinkText(text, moves, (target) => resolver.resolve(target)));
   return touched;
 }
 
@@ -667,6 +699,7 @@ async function groupIntoFolder(paths: string[], frame: { w: number; h: number })
  */
 async function syncAfterStructuralChange(): Promise<void> {
   entries = await vault.entries();
+  await stickies.sync(filePaths());
   pruneTabs();
   render();
   if (tabOf(panes[0])?.kind === "graph") await drawGraph();
@@ -697,6 +730,8 @@ async function pickFolder(): Promise<void> {
   graphView.reset();
   await spatial.attach(vault); // this folder's own arrangement, not the last one's
   await stickies.attach(vault);
+  await settings.attach(vault); // and its own set of switched-on integrations
+  applyFeatures();
   panes = [{ tabs: [{ kind: "graph" }], active: 0, mode: "read" }];
   focused = 0;
   lastFile = null;
@@ -750,6 +785,58 @@ async function copyPath(path: string, absolute: boolean): Promise<void> {
   }
   await copyText(text);
   ui.status.textContent = `copied ${text}`;
+}
+
+/* ------------------------------------------------------------------- git --- */
+
+/**
+ * The whole git integration: stage everything and commit, in the vault's folder on
+ * disk. The work happens in the desktop shell (see `electron/main.cjs`) because a
+ * renderer cannot run git; in a plain browser the button says so instead of failing.
+ */
+async function commitVault(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) {
+    ui.status.textContent = "git needs the desktop app — npm start";
+    return;
+  }
+  const root = await vaultRoot();
+  if (!root) return;
+  await flushAll();
+  ui.gitCommit.disabled = true;
+  ui.status.textContent = "git: committing…";
+  try {
+    ui.status.textContent = `git: ${await bridge.gitCommit(root)}`;
+  } catch (err) {
+    ui.status.textContent = `git: ${(err as Error).message}`;
+  } finally {
+    ui.gitCommit.disabled = false;
+  }
+}
+
+/** Follows the toggles: what is switched off appears nowhere. */
+function applyFeatures(): void {
+  ui.gitCommit.classList.toggle("hidden", !settings.enabled("git"));
+  graphView.refreshOverlay();
+  void ensureCardDirs();
+}
+
+/** A switched-on integration shows its folder in the tree from the start. */
+async function ensureCardDirs(): Promise<void> {
+  let made = false;
+  try {
+    if (settings.enabled("stickies") && !entries.some((e) => e.path === STICKY_DIR)) {
+      await vault.createDir(STICKY_DIR);
+      made = true;
+    }
+    if (settings.enabled("todos") && !entries.some((e) => e.path === TODO_DIR)) {
+      await vault.createDir(TODO_DIR);
+      made = true;
+    }
+  } catch {
+    return; // read-only vault — cards still work for the session
+  }
+  if (made) await refreshSidebar();
 }
 
 /* ------------------------------------------------------------- saving --- */
@@ -874,6 +961,176 @@ function renameOnGraph(path: string): void {
   });
 }
 
+/* ---------------------------------------------------------------- gemini --- */
+
+const GEMINI_URL = "https://gemini.google.com/app";
+
+/**
+ * What a conversation note holds: the link its node opens, and its type on the last
+ * line — `type:: gemini` is the whole notion of a typed note, written in markdown.
+ * Google mints the conversation's own URL once you start chatting; paste it over
+ * the generic one and the node points at that exact chat from then on.
+ */
+const geminiTemplate = (name: string): string => `# ${name}\n\n${GEMINI_URL}\n\ntype:: gemini\n`;
+
+/**
+ * Opens a chat and, when the note has no conversation of its own yet, arranges for
+ * the minted URL to come back on its own. The desktop shell opens the chat in a
+ * window it WATCHES: the moment Google assigns gemini.google.com/app/<id>, the link
+ * is handed back and saved — no gesture at all. A plain browser cannot watch another
+ * tab, so there the clipboard catch below stays the way home. Returns the status line.
+ */
+function openGeminiChat(path: string, target: string): string {
+  const generic = target === GEMINI_URL; // no conversation of its own yet
+  if (generic) armGeminiCapture(path); // follows renames; doubles as the fallback
+  if (window.bedrock?.geminiChat) {
+    void window.bedrock.geminiChat(target).then((convo) => {
+      if (convo && generic) void adoptGeminiLink(convo);
+    });
+    return generic
+      ? `${noteName(path)} — chat opened; the link saves itself once the conversation starts`
+      : `${noteName(path)} → ${target}`;
+  }
+  const opened = window.open(target, "_blank", "noopener");
+  if (!opened) return `the browser blocked the popup — ${target}`;
+  return generic
+    ? `${noteName(path)} — copy the conversation's URL in Gemini; it lands in the note when you come back`
+    : `${noteName(path)} → ${target}`;
+}
+
+/** Click on a Gemini node: it is a link, not a page. Editing stays in the tree. */
+function openGeminiNode(path: string, url: string | null): void {
+  const message = openGeminiChat(path, url || GEMINI_URL);
+  // One tick later: a click is also a grab+free to cytoscape, and the free handler
+  // clears the hint right after this — the message has to land after that reset.
+  window.setTimeout(() => {
+    ui.status.textContent = message;
+  }, 0);
+}
+
+/* ------------------------------------------------------- catching the link --- */
+/*
+ * Google mints a conversation's URL (gemini.google.com/app/<id>) only after the
+ * first message, and no API hands it out — so the app catches it instead. Opening
+ * a chat ARMS a capture for that note; the first gemini conversation URL copied
+ * AFTER that moment is written into the note the instant this window is focused
+ * again. One ⌘L ⌘C in the browser is the whole ceremony.
+ */
+
+const GEMINI_CONVO_RE = /^https:\/\/gemini\.google\.com\/(?:app|share)\/[\w-]+/;
+
+/** The gemini note waiting for its conversation link, if any. */
+let geminiCapture: string | null = null;
+/** What the clipboard held when the capture was armed — only NEW copies count. */
+let clipboardBefore = "";
+
+function armGeminiCapture(path: string): void {
+  geminiCapture = path;
+  navigator.clipboard.readText().then(
+    (text) => (clipboardBefore = text.trim()),
+    () => {}, // no clipboard permission — an old link may be matched, nothing worse
+  );
+}
+
+/**
+ * Writes a caught conversation URL into the note that is waiting for one — reading
+ * `geminiCapture` at write time rather than closing over a path, so a note renamed
+ * mid-chat still receives its link.
+ */
+async function adoptGeminiLink(url: string): Promise<void> {
+  const path = geminiCapture;
+  if (!path) return;
+  if (!(await vault.exists(path))) {
+    geminiCapture = null; // the note went away while they were chatting
+    return;
+  }
+  const text = await vault.read(path);
+  if (!text.includes(url)) {
+    // Swap the note's current link (the generic /app one) for the real conversation;
+    // a note somebody stripped the link from gets it appended instead.
+    const held = /https?:\/\/[^\s)\]>]+/.exec(text)?.[0];
+    const next = held ? text.replace(held, url) : `${text.replace(/\n*$/, "")}\n\n${url}\n`;
+    await vault.write(path, next);
+    graphView.setGeminiUrl(path, url);
+    graphStale = true;
+    for (let i = 0; i < panes.length; i++) if (pathOf(panes[i]) === path) await renderPage(i);
+    ui.status.textContent = `${noteName(path)} now opens its own conversation`;
+  }
+  geminiCapture = null;
+}
+
+async function catchGeminiLink(): Promise<void> {
+  if (!geminiCapture) return;
+  let copied = "";
+  try {
+    copied = (await navigator.clipboard.readText()).trim();
+  } catch {
+    return; // no clipboard permission — the feature just stays quiet
+  }
+  if (copied === clipboardBefore) return; // still whatever was there before the chat
+  const url = GEMINI_CONVO_RE.exec(copied)?.[0];
+  if (url) await adoptGeminiLink(url);
+}
+
+window.addEventListener("focus", () => void catchGeminiLink());
+
+/**
+ * "New Gemini conversation" — from the canvas menu, or from a link draft released on
+ * empty space (`source` is then the note the arrow came from). The chat is NOT opened
+ * yet: first the conversation gets its name, and committing the name is what sends
+ * you to Gemini.
+ */
+async function createGeminiAt(
+  at: { x: number; y: number },
+  folder: string | null,
+  source: string | null = null,
+): Promise<void> {
+  const dir = folder ?? "";
+  const path = uniquePath(filePaths(), dir, "Gemini chat", ".md");
+  await vault.createFile(path, geminiTemplate(noteName(path)));
+  entries = [...entries, { path, kind: "file" }]; // so the rename's collision check sees it
+  if (source) {
+    graphView.commitLink(source, path, {
+      label: noteName(path),
+      parent: dir || undefined,
+      at,
+      type: "gemini",
+      url: GEMINI_URL,
+    });
+  } else {
+    graphView.commitNode(path, noteName(path), dir || undefined, at, "gemini", GEMINI_URL);
+  }
+  graphStale = true;
+  ui.status.textContent = `created ${path} — name the conversation, and the chat opens`;
+  graphView.renameNode(path, (name) => {
+    // Standalone conversation: committing the name is the user gesture the popup
+    // blocker honours, so the chat opens HERE, synchronously; the rename's own
+    // async work follows behind and the capture follows the rename.
+    if (!source) {
+      const message = openGeminiChat(path, GEMINI_URL);
+      window.setTimeout(() => {
+        ui.status.textContent = message;
+      }, 0);
+    }
+    void (async () => {
+      const finalPath = name ? ((await applyRename(path, "file", name)) ?? path) : path;
+      if (geminiCapture === path) geminiCapture = finalPath;
+      if (!source) return;
+      // Linked conversation: the connection gets its name too, exactly like drawing
+      // any link — and only THEN does Gemini open. All the naming happens at home;
+      // committing the label is itself a gesture, so the popup ban stays satisfied.
+      graphView.promptConnection(source, finalPath, (label) => {
+        const message = openGeminiChat(finalPath, GEMINI_URL);
+        window.setTimeout(() => {
+          ui.status.textContent = message;
+        }, 0);
+        void finishLink(source, finalPath, label);
+      });
+    })();
+  });
+  await refreshSidebar();
+}
+
 /**
  * Right-drag landed on an existing note: draw the edge, then name the connection. The edge is on
  * screen while it is being named, and the file is written once — with the relation if one was typed.
@@ -948,6 +1205,12 @@ ui.openFolder.addEventListener("click", () => void pickFolder());
 ui.newNote.addEventListener("click", () => void newNote());
 ui.newFolder.addEventListener("click", () => void newFolder());
 ui.graph.addEventListener("click", () => openGraph());
+ui.gitCommit.addEventListener("click", () => void commitVault());
+
+mountSettings(ui.settings, ui.settingsPanel, settings);
+settings.onChange = applyFeatures;
+// A card is a file in a visible folder, so making or deleting one must show in the tree.
+stickies.onFilesChanged = () => void refreshSidebar();
 
 /* ------------------------------------------------------------ attachments --- */
 
@@ -1130,6 +1393,7 @@ window.addEventListener("beforeunload", () => {
   for (let i = 0; i < panes.length; i++) if (panes[i].timer !== undefined) void save(i);
   void spatial.flush(); // don't lose the last drag to a quick ⌘Q
   void stickies.flush();
+  void settings.flush();
 });
 
 const escapeHtml = (s: string): string => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -1140,6 +1404,8 @@ const escapeAttr = (s: string): string => escapeHtml(s).replace(/"/g, "&quot;");
 void (async () => {
   await spatial.attach(vault);
   await stickies.attach(vault);
+  await settings.attach(vault);
+  applyFeatures();
   entries = await vault.entries();
   const first = filePaths()[0];
   if (first) {

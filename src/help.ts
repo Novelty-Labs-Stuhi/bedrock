@@ -12,7 +12,7 @@ const GESTURES: Row[] = [
   ["click a line", "describe that connection"],
   ["right-drag a note", "link it — drop on a note, or on space"],
   ["right-click a note", "link, rename, delete"],
-  ["right-click space", "new note, folder or sticky"],
+  ["right-click space", "new note, folder, sticky or todo"],
   ["shift+drag", "draw a folder round some notes"],
   ["drag a note", "move it — push past a box edge to refile"],
   ["drag a box corner", "resize the folder"],
@@ -32,6 +32,7 @@ const MARKDOWN: Row[] = [
   ["[[Note|as this]]", "the same link, under another name"],
   ["made with:: [[Note]]", "a named link — the name rides the edge"],
   ["#tag", "tag — colours the note's circle"],
+  ["type:: gemini", "types the note — typed notes change shape (Gemini = rectangle)"],
   ["![[picture.png]]", "an image you dropped in"],
   ["[text](https://…)", "a web link"],
 ];

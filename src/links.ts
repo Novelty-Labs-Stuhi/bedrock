@@ -59,6 +59,16 @@ export function parseTags(text: string): string[] {
   return [...new Set([...prose.matchAll(TAG_RE)].map((match) => match[1]))];
 }
 
+/*
+ * A note's TYPE: `type:: gemini` on a line of its own — by convention the file's
+ * last. A type changes how the graph draws and answers the node (shape, what a
+ * click does); a note with no type line is just a note, drawn as a circle.
+ */
+const TYPE_RE = /^type::[ \t]*([\w-]+)[ \t]*$/im;
+
+export const parseType = (text: string): string | null =>
+  TYPE_RE.exec(text)?.[1].toLowerCase() ?? null;
+
 /** Same shape as LINK_RE, but keeping the `|alias` tail so a rewrite can put it back. */
 const REWRITE_RE = /(?<!!)\[\[([^\][|]+)(\|[^\][]*)?\]\]/g;
 
