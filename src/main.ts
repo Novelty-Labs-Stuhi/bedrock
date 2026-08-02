@@ -690,6 +690,10 @@ async function pickFolder(): Promise<void> {
   } catch {
     return; // user cancelled
   }
+  // Throw the old vault's graph away FIRST. A live instance makes the next render take
+  // the `sync` path, which would treat the whole new vault as newly-added notes, scatter
+  // them, and then save that over the arrangement this folder already had.
+  graphView.reset();
   await spatial.attach(vault); // this folder's own arrangement, not the last one's
   await stickies.attach(vault);
   panes = [{ tabs: [{ kind: "graph" }], active: 0, mode: "read" }];

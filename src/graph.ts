@@ -409,6 +409,12 @@ export class GraphView {
   private lasso: HTMLElement | null = null;
   /** Sticky id -> its element in the overlay. */
   private stickyEls = new Map<string, HTMLElement>();
+  /**
+   * True once this vault's arrangement has been restored (or solved for the first time).
+   * Nothing is written back before then — a capture from a half-built graph would
+   * overwrite a perfectly good cache with whatever happened to be on screen.
+   */
+  private ready = false;
   /** Container size the view was last framed at, and whether the user has moved it since. */
   private fittedSize: { w: number; h: number } | null = null;
   private userMoved = false;
@@ -445,6 +451,27 @@ export class GraphView {
       if (this.draftSource) this.cancelDraft();
       if (this.lasso) this.cancelGroup();
     });
+  }
+
+  /**
+   * Throws the whole graph away so the next render builds a fresh one. Call this when the
+   * vault changes: without it `render` sees a live instance and takes the `sync` path,
+   * which treats every note of the new vault as newly added and scatters them — and then
+   * saves that over the arrangement the vault already had.
+   */
+  reset(): void {
+    this.ready = false;
+    this.cy?.destroy();
+    this.cy = null;
+    this.pending = null;
+    this.carried.clear();
+    this.cancelGroup();
+    for (const el of this.handles.values()) el.remove();
+    this.handles.clear();
+    for (const el of this.stickyEls.values()) el.remove();
+    this.stickyEls.clear();
+    this.fittedSize = null;
+    this.userMoved = false;
   }
 
   /**
@@ -630,6 +657,7 @@ export class GraphView {
     this.applyBoxVisibility();
     this.fit();
     this.drawOverlay();
+    this.ready = true; // restored — from here on, changes are worth saving
   }
 
   /** Frames go on only once the layout has placed the notes. */
@@ -639,13 +667,14 @@ export class GraphView {
     this.applyBoxVisibility();
     this.fit();
     this.drawOverlay();
+    this.ready = true;
     this.capture(); // the solved arrangement is the one to remember
   }
 
   /** Hands the current positions to the cache; it decides whether that is a change. */
   private capture(): void {
     const cy = this.cy;
-    if (!cy) return;
+    if (!cy || !this.ready) return;
     const at: Array<[string, cytoscape.Position]> = [];
     cy.nodes().forEach((node) => {
       if (isAnchor(node.id()) || node.isParent()) return;
