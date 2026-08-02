@@ -250,6 +250,52 @@ function rimPoint(point: cytoscape.Position, bb: cytoscape.BoundingBox12 & cytos
   return gaps.reduce((best, gap) => (gap.d < best.d ? gap : best)).p;
 }
 
+/** Clear space between two notes' rims, below which they read as stacked. */
+const NODE_GAP = 10;
+
+/**
+ * Nearest point to `at` that keeps a note clear of every other one.
+ *
+ * Only the note being moved gives way. Shoving the others aside to make room would be the
+ * app rearranging an arrangement behind its author's back, which is the one thing the
+ * canvas promises never to do — so a note that cannot fit is held at the rim of whatever
+ * is in its way instead.
+ *
+ * Several passes, because stepping out of one neighbour can step into the next.
+ */
+function unstacked(
+  cy: Core,
+  moving: string,
+  at: cytoscape.Position,
+  radius: number,
+): cytoscape.Position {
+  let point = at;
+  for (let pass = 0; pass < 4; pass++) {
+    let hit = false;
+    cy.nodes().forEach((node) => {
+      const other = node as NodeSingular;
+      const id = other.id();
+      if (id === moving || id === DRAFT_NODE || other.isParent() || isAnchor(id)) return;
+      const centre = other.position();
+      const need = radius + other.width() / 2 + NODE_GAP;
+      let dx = point.x - centre.x;
+      let dy = point.y - centre.y;
+      let gap = Math.hypot(dx, dy);
+      if (gap >= need) return;
+      // Exactly on top of one another: there is no direction to push along, so pick one.
+      if (gap < 0.001) {
+        dx = 1;
+        dy = 0;
+        gap = 1;
+      }
+      point = { x: centre.x + (dx / gap) * need, y: centre.y + (dy / gap) * need };
+      hit = true;
+    });
+    if (!hit) break;
+  }
+  return point;
+}
+
 /**
  * Edge ids must be built identically by the file-derived rebuild and by the
  * right-click link gesture, or the "already linked?" check silently misses and
@@ -752,6 +798,47 @@ export class GraphView {
     this.userMoved = false;
   }
 
+  /**
+   * Nudges apart every note that is sitting on top of another and leaves everything else
+   * exactly where it is. Dragging cannot stack notes any more, but a layout cached before
+   * that was true can still hold a pile, and a full re-solve to fix one would throw away
+   * the whole arrangement. Returns how many notes had to move.
+   */
+  unstackAll(): number {
+    const cy = this.cy;
+    if (!cy) return 0;
+    let moved = 0;
+    cy.batch(() => {
+      // Rounds, not one pass: making room for one note can crowd the next.
+      for (let round = 0; round < 6; round++) {
+        let shifted = 0;
+        cy.nodes().forEach((node) => {
+          const note = node as NodeSingular;
+          if (note.data("kind") !== "file" || isAnchor(note.id())) return;
+          const at = note.position();
+          let next = unstacked(cy, note.id(), at, note.width() / 2);
+          const parent = note.parent().first();
+          if (parent.nonempty()) {
+            const centre = frameCentre(cy, parent.id());
+            if (centre) {
+              next = clampInto(next, interior(centre, this.frames.get(parent.id()), note.width() / 2));
+            }
+          }
+          if (Math.hypot(next.x - at.x, next.y - at.y) < 0.5) return;
+          note.position(next);
+          shifted++;
+        });
+        if (!shifted) break;
+        moved = Math.max(moved, shifted);
+      }
+    });
+    if (moved) {
+      this.capture();
+      this.drawOverlay();
+    }
+    return moved;
+  }
+
   /** Re-solves the whole arrangement from scratch — deterministic, so it lands the same way twice. */
   relayout(): void {
     if (!this.cy) return;
@@ -861,7 +948,13 @@ export class GraphView {
       const drag = this.drag;
       this.drag = null;
       this.clearDropMarks(cy);
-      this.capture(); // wherever it was let go of is where it should be next time
+      if (drag) {
+        // Before the capture, and before any refile: a reparent carries the node's current
+        // position over to its new id, and that has to be the settled one.
+        const node = cy.getElementById(drag.path) as NodeSingular;
+        if (node.nonempty()) this.settleAfterDrop(cy, node, drag);
+      }
+      this.capture(); // wherever it came to rest is where it should be next time
       if (!drag) return;
       if (drag.armed && drag.target !== null && drag.target !== drag.parent) {
         this.handlers.onReparent(drag.path, drag.target);
@@ -880,6 +973,29 @@ export class GraphView {
       this.followRename();
       this.followConnection();
     });
+  }
+
+  /**
+   * Where a note ends up once it is let go of.
+   *
+   * A drag itself is completely free — the note goes wherever the cursor does, straight
+   * over anything in its way — so the arrangement is only judged at the moment of release:
+   * a note resting on top of another slides to the nearest spot that clears it. Nothing
+   * else on the canvas moves, and a note that merely passed over its neighbours on the way
+   * is left exactly where it was dropped.
+   */
+  private settleAfterDrop(cy: Core, node: NodeSingular, drag: DragState): void {
+    const at = node.position();
+    let next = unstacked(cy, node.id(), at, node.width() / 2);
+    if (next.x === at.x && next.y === at.y) return;
+    // Whichever box it has landed in: the one it is being filed into when the drop is
+    // armed, the one it was already in otherwise. `""` is the vault root, which has none.
+    const folder = drag.armed && drag.target !== null ? drag.target : drag.parent;
+    if (folder) {
+      const centre = frameCentre(cy, folder);
+      if (centre) next = clampInto(next, interior(centre, this.frames.get(folder), node.width() / 2));
+    }
+    node.position(next);
   }
 
   /**

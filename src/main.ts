@@ -149,6 +149,7 @@ const graphView = new GraphView(ui.cy, {
       // pick the notes and the folder is made around them.
       { label: "New folder", run: () => graphView.startGroup() },
       { label: "New sticky", run: () => graphView.addSticky(at) },
+      { label: "Unstack notes", run: () => unstackNotes() },
     ]),
   onHint: (hint) => {
     ui.status.textContent = hint ?? statusText();
@@ -852,6 +853,14 @@ async function createNoteAt(at: { x: number; y: number }, folder: string | null)
   graphStale = true;
   ui.status.textContent = `created ${path}`;
   renameOnGraph(path);
+}
+
+/** Separates any notes left piled up by a layout cached before dragging refused to stack them. */
+function unstackNotes(): void {
+  const moved = graphView.unstackAll();
+  ui.status.textContent = moved
+    ? `moved ${moved} note${moved === 1 ? "" : "s"} off the ones underneath`
+    : "nothing was stacked";
 }
 
 /** Name field floating on the node itself, pre-selected. */
