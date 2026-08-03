@@ -70,36 +70,36 @@ export const parseType = (text: string): string | null =>
   TYPE_RE.exec(text)?.[1].toLowerCase() ?? null;
 
 /*
- * A note's ACTIVITY: `active:: true` on a line of its own, the same inline-field spelling
- * as `type::`. An active note radiates on the graph — it is the one being worked on, the
- * live end of the vault — and because the mark is a line in the file it travels with the
- * folder, shows up in the editor, and can be typed by hand like anything else.
+ * INLINE FIELDS in general: `name:: value` on a line of its own, the spelling `type::`
+ * already uses. Every fact the app keeps about a note that is not prose is written this
+ * way — active, linear, state — so it travels with the folder, shows up in the editor,
+ * and can be typed or deleted by hand like anything else in the file.
  */
-const ACTIVE_RE = /^[ \t]*active::[ \t]*(.*?)[ \t]*$/i;
+const fieldRe = (name: string): RegExp => new RegExp(`^[ \\t]*${name}::[ \\t]*(.*?)[ \\t]*$`, "i");
 
-/** Off spellings, so `active:: false` reads as a note that was active and no longer is. */
-const OFF = new Set(["", "false", "no", "off", "0"]);
+const fieldLineAt = (lines: string[], name: string): number => {
+  const re = fieldRe(name);
+  return lines.findIndex((line) => re.test(line));
+};
 
-const activeLineAt = (lines: string[]): number => lines.findIndex((line) => ACTIVE_RE.test(line));
-
-export function parseActive(text: string): boolean {
+/** A field's value, or null when the note does not carry the field at all. */
+export function parseField(text: string, name: string): string | null {
   const lines = text.split("\n");
-  const at = activeLineAt(lines);
-  if (at < 0) return false;
-  return !OFF.has((ACTIVE_RE.exec(lines[at])?.[1] ?? "").toLowerCase());
+  const at = fieldLineAt(lines, name);
+  return at < 0 ? null : (fieldRe(name).exec(lines[at])?.[1] ?? "");
 }
 
 /**
- * Writes the mark into (or out of) a note's markdown. Switching it off removes the line
- * rather than writing `active:: false`: a note that is not being worked on should read
+ * Writes a field into (or out of) a note's markdown. A null value removes the line
+ * rather than writing an empty one: a note the app has nothing to say about should read
  * like every other quiet note in the vault, with nothing said about it either way.
  */
-export function setActive(text: string, on: boolean): string {
+export function setField(text: string, name: string, value: string | null): string {
   const lines = text.split("\n");
-  const at = activeLineAt(lines);
+  const at = fieldLineAt(lines, name);
   if (at >= 0) {
-    if (on) {
-      lines[at] = "active:: true";
+    if (value !== null) {
+      lines[at] = `${name}:: ${value}`;
       return lines.join("\n");
     }
     lines.splice(at, 1);
@@ -107,10 +107,25 @@ export function setActive(text: string, on: boolean): string {
     if (at > 0 && lines[at - 1].trim() === "" && (lines[at] ?? "x").trim() === "") lines.splice(at, 1);
     return lines.join("\n");
   }
-  if (!on) return text;
+  if (value === null) return text;
   const gap = text === "" || text.endsWith("\n\n") ? "" : text.endsWith("\n") ? "\n" : "\n\n";
-  return `${text}${gap}active:: true\n`;
+  return `${text}${gap}${name}:: ${value}\n`;
 }
+
+/** Off spellings, so `active:: false` reads as a note that was active and no longer is. */
+const OFF = new Set(["", "false", "no", "off", "0"]);
+
+/**
+ * A note's ACTIVITY: `active:: true`. An active note radiates on the graph — it is the
+ * one being worked on, the live end of the vault.
+ */
+export function parseActive(text: string): boolean {
+  const value = parseField(text, "active");
+  return value !== null && !OFF.has(value.toLowerCase());
+}
+
+export const setActive = (text: string, on: boolean): string =>
+  setField(text, "active", on ? "true" : null);
 
 /** Same shape as LINK_RE, but keeping the `|alias` tail so a rewrite can put it back. */
 const REWRITE_RE = /(?<!!)\[\[([^\][|]+)(\|[^\][]*)?\]\]/g;

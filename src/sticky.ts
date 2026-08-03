@@ -1,21 +1,21 @@
 // Stickies: loose text pinned to the canvas, belonging to no note.
 //
-// Each one is a real markdown file in a folder you can see — `stickies/` for plain
-// text, `todos/` for checklists — named after the moment it was made. Only the
-// GEOMETRY stays in `.notes/stickies.json`: where a card sits and how big it is,
-// which is arrangement, not writing — the same trade `layout.json` already makes.
-// The graph never draws these files as nodes; the cards are their rendering.
+// Each one is a real markdown file in `stickies/`, a folder you can see, named after the
+// moment it was made. Only the GEOMETRY stays in `.notes/stickies.json`: where a card
+// sits and how big it is, which is arrangement, not writing — the same trade
+// `layout.json` already makes. The graph never draws these files as nodes; the cards are
+// their rendering. (Checklists used to live here too, as `todos/`; they are issue NOTES
+// now — see `linear.ts` — which is why they are nodes on the graph like everything else.)
 
 import { uniquePath, type Vault } from "./vault";
 
 export const STICKY_DIR = "stickies";
-export const TODO_DIR = "todos";
 
 /** Where the cards' positions and sizes live; the words live in the md files. */
 export const GEOMETRY_FILE = ".notes/stickies.json";
 
 export type Sticky = {
-  /** The md file's vault path — `todos/2026-08-02 14.32.md`. */
+  /** The md file's vault path — `stickies/2026-08-02 14.32.md`. */
   id: string;
   text: string;
   /** Model-space top-left corner and size, in model units — cards are part of the
@@ -24,13 +24,9 @@ export type Sticky = {
   y: number;
   w: number;
   h: number;
-  /** "todo" renders as a checklist that can point an arrow at a note; absent = plain text. */
-  kind?: "todo";
-  /** A todo collapsed to its little yellow square. */
-  folded?: boolean;
 };
 
-type Geometry = { x: number; y: number; w: number; h: number; folded?: boolean };
+type Geometry = { x: number; y: number; w: number; h: number };
 
 /** Big enough to type into, small enough not to cover the graph. */
 export const STICKY_W = 180;
@@ -54,11 +50,10 @@ export function createdLabel(id: string): string | null {
   return m ? `${m[1]} ${m[2]}:${m[3]}` : null;
 }
 
-export const isCardPath = (path: string): boolean =>
-  path.startsWith(STICKY_DIR + "/") || path.startsWith(TODO_DIR + "/");
+export const isCardPath = (path: string): boolean => path.startsWith(STICKY_DIR + "/");
 
 /* The shape stickies had when their text lived inside the json file itself. */
-type LegacySticky = Geometry & { id: string; text: string; kind?: "todo" };
+type LegacySticky = Geometry & { id: string; text: string };
 
 const isLegacy = (value: unknown): value is LegacySticky => {
   const s = value as LegacySticky | null;
@@ -101,47 +96,33 @@ export class StickyStore {
 
     const { geometry, legacy } = await readGeometryFile(vault);
 
-    for (const dir of [STICKY_DIR, TODO_DIR] as const) {
-      for (const path of await vault.listFiles(dir)) {
-        let text = "";
-        try {
-          text = (await vault.read(path)).replace(/\n$/, "");
-        } catch {
-          continue;
-        }
-        const at = geometry.get(path);
-        this.items.set(path, {
-          id: path,
-          text,
-          ...(dir === TODO_DIR ? { kind: "todo" as const } : {}),
-          x: at?.x ?? 40,
-          y: at?.y ?? 40,
-          w: at?.w ?? STICKY_W,
-          h: at?.h ?? STICKY_H,
-          ...(at?.folded ? { folded: true } : {}),
-        });
+    for (const path of await vault.listFiles(STICKY_DIR)) {
+      let text = "";
+      try {
+        text = (await vault.read(path)).replace(/\n$/, "");
+      } catch {
+        continue;
       }
+      const at = geometry.get(path);
+      this.items.set(path, {
+        id: path,
+        text,
+        x: at?.x ?? 40,
+        y: at?.y ?? 40,
+        w: at?.w ?? STICKY_W,
+        h: at?.h ?? STICKY_H,
+      });
     }
 
     // Cards from before they were files: give each its md file, keep its spot.
     for (const old of legacy) {
-      const dir = old.kind === "todo" ? TODO_DIR : STICKY_DIR;
-      const path = uniquePath(this.items.keys(), dir, stamp(), ".md");
+      const path = uniquePath(this.items.keys(), STICKY_DIR, stamp(), ".md");
       try {
         await vault.createFile(path, old.text + "\n");
       } catch {
         continue; // read-only vault — the card survives in memory for this session
       }
-      this.items.set(path, {
-        id: path,
-        text: old.text,
-        ...(old.kind ? { kind: old.kind } : {}),
-        x: old.x,
-        y: old.y,
-        w: old.w,
-        h: old.h,
-        ...(old.folded ? { folded: true } : {}),
-      });
+      this.items.set(path, { id: path, text: old.text, x: old.x, y: old.y, w: old.w, h: old.h });
       this.dirtyGeometry = true;
     }
     if (this.dirtyGeometry) await this.flush(); // the migrated shape, written once
@@ -151,16 +132,13 @@ export class StickyStore {
     return [...this.items.values()];
   }
 
-  add(at: { x: number; y: number }, kind?: "todo"): Sticky {
-    const dir = kind === "todo" ? TODO_DIR : STICKY_DIR;
-    const path = uniquePath([...this.items.keys(), ...this.creating], dir, stamp(), ".md");
+  add(at: { x: number; y: number }): Sticky {
+    const path = uniquePath([...this.items.keys(), ...this.creating], STICKY_DIR, stamp(), ".md");
     // Placed centred on the click, which is where the pointer already is — corner
     // and size are both model units, so no zoom enters into it.
     const sticky: Sticky = {
       id: path,
-      // A todo starts as one empty task line — every line of one is a task line.
-      text: kind === "todo" ? "- [ ] " : "",
-      ...(kind ? { kind } : {}),
+      text: "",
       x: at.x - STICKY_W / 2,
       y: at.y - STICKY_H / 2,
       w: STICKY_W,
@@ -186,13 +164,7 @@ export class StickyStore {
     const next = { ...held, ...patch };
     if ((Object.keys(next) as Array<keyof Sticky>).every((key) => next[key] === held[key])) return;
     if (next.text !== held.text) this.dirtyText.add(id);
-    if (
-      next.x !== held.x ||
-      next.y !== held.y ||
-      next.w !== held.w ||
-      next.h !== held.h ||
-      next.folded !== held.folded
-    ) {
+    if (next.x !== held.x || next.y !== held.y || next.w !== held.w || next.h !== held.h) {
       this.dirtyGeometry = true;
     }
     this.items.set(id, next);
@@ -212,8 +184,8 @@ export class StickyStore {
 
   /**
    * Brings the cache in line with the vault after a structural change: cards whose
-   * file was deleted (or renamed) in the tree go, files somebody put into the two
-   * folders by hand become cards. `paths` is every file the vault currently holds.
+   * file was deleted (or renamed) in the tree go, files somebody put into the folder
+   * by hand become cards. `paths` is every file the vault currently holds.
    */
   async sync(paths: Iterable<string>): Promise<void> {
     const vault = this.vault;
@@ -235,15 +207,7 @@ export class StickyStore {
       } catch {
         continue;
       }
-      this.items.set(path, {
-        id: path,
-        text,
-        ...(path.startsWith(TODO_DIR + "/") ? { kind: "todo" as const } : {}),
-        x: 40,
-        y: 40,
-        w: STICKY_W,
-        h: STICKY_H,
-      });
+      this.items.set(path, { id: path, text, x: 40, y: 40, w: STICKY_W, h: STICKY_H });
       changed = true;
     }
     if (changed) {
@@ -287,13 +251,7 @@ export class StickyStore {
     this.dirtyGeometry = false;
     const geometry: Record<string, Geometry> = {};
     for (const held of this.items.values()) {
-      geometry[held.id] = {
-        x: held.x,
-        y: held.y,
-        w: held.w,
-        h: held.h,
-        ...(held.folded ? { folded: true } : {}),
-      };
+      geometry[held.id] = { x: held.x, y: held.y, w: held.w, h: held.h };
     }
     try {
       await vault.write(GEOMETRY_FILE, JSON.stringify({ version: 2, geometry }, null, 1) + "\n");
@@ -327,56 +285,3 @@ async function readGeometryFile(
   }
   return { geometry, legacy };
 }
-
-/* -------------------------------------------------------------------- todos --- */
-// A todo is a sticky whose text is plain markdown tasks: every line is `- [ ] …`, and
-// the note it points at is an ordinary `[[wikilink]]` line. The link line is stored
-// like any other markdown but never shown — the arrow on the canvas is its rendering.
-
-/** A task line. Its arrow, if it has one, is a trailing `[[link]]` on the same line. */
-export type TodoItem = { done: boolean; text: string; target?: string };
-/** `targets` are the card-level `[[link]]` lines — the old shape, one arrow each. */
-export type TodoDoc = { items: TodoItem[]; targets: string[] };
-
-const ITEM_RE = /^- \[([ xX])\] ?(.*)$/;
-const TARGET_RE = /^\[\[([^\][|]+)\]\]$/;
-/** A task line's own arrow: the `[[link]]` it ends with. */
-const ITEM_TARGET_RE = /\s*\[\[([^\][|]+)\]\]\s*$/;
-
-/** Reads a todo sticky's markdown. A stray prose line counts as an unchecked task. */
-export function parseTodo(text: string): TodoDoc {
-  const items: TodoItem[] = [];
-  const targets: string[] = [];
-  for (const line of text.split("\n")) {
-    const item = ITEM_RE.exec(line);
-    if (item) {
-      let body = item[2];
-      const inline = ITEM_TARGET_RE.exec(body);
-      const target = inline?.[1].trim();
-      if (inline) body = body.slice(0, inline.index);
-      items.push({ done: item[1] !== " ", text: body, ...(target ? { target } : {}) });
-      continue;
-    }
-    const link = TARGET_RE.exec(line.trim());
-    if (link) {
-      const name = link[1].trim();
-      if (!targets.some((t) => t.toLowerCase() === name.toLowerCase())) targets.push(name);
-      continue;
-    }
-    if (line.trim()) items.push({ done: false, text: line.trim() });
-  }
-  return { items, targets };
-}
-
-/** Writes it back: the task lines (arrow links inline), then the card-level link lines. */
-export function serializeTodo(doc: TodoDoc): string {
-  const lines = doc.items.map(
-    (item) => `- [${item.done ? "x" : " "}] ${item.text}${item.target ? ` [[${item.target}]]` : ""}`,
-  );
-  for (const target of doc.targets) lines.push(`[[${target}]]`);
-  return lines.join("\n");
-}
-
-/** When every task is ticked, the todo's arrow turns green. */
-export const allDone = (doc: TodoDoc): boolean =>
-  doc.items.length > 0 && doc.items.every((item) => item.done);

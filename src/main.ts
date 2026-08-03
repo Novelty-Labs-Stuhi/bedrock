@@ -11,7 +11,18 @@ import { createEditor, type Editor } from "./editor";
 import { linkTargets } from "./markdown";
 import { Sidebar } from "./sidebar";
 import { SpatialStore } from "./spatial";
-import { STICKY_DIR, TODO_DIR, StickyStore, isCardPath } from "./sticky";
+import { STICKY_DIR, StickyStore, isCardPath, stamp } from "./sticky";
+import {
+  IdStore,
+  ISSUE_DIR,
+  LinearApi,
+  LocalIssues,
+  issueTemplate,
+  parseIssue,
+  writeIssue,
+  type IssueSource,
+} from "./linear";
+import type { IssueChange } from "./graph";
 import {
   FolderVault,
   LocalVault,
@@ -159,6 +170,10 @@ const sidebar = new Sidebar(ui.tree, {
 const graphView = new GraphView(ui.cy, {
   onOpen: (path) => void openFile(path),
   onOpenGemini: (path, url) => openGeminiNode(path, url),
+  onIssueEdit: (path, text, change) => editIssue(path, text, change),
+  onOpenIssue: (url) => {
+    if (!window.open(url, "_blank", "noopener")) ui.status.textContent = `the browser blocked ${url}`;
+  },
   onOpenEdge: (source, target, label) => void openEdgeNote(source, target, label),
   onLinkExisting: (source, target) => linkNotes(source, target),
   onLinkNew: (source, at, folder, kind) =>
@@ -193,7 +208,9 @@ const graphView = new GraphView(ui.cy, {
     ];
     // Switched-off integrations do not appear anywhere, the menu included.
     if (settings.enabled("stickies")) items.push({ label: "New sticky", run: () => graphView.addSticky(at) });
-    if (settings.enabled("todos")) items.push({ label: "New todo", run: () => graphView.addTodo(at) });
+    if (settings.enabled("linear")) {
+      items.push({ label: "New Linear issue", run: () => void createIssueAt(at, folder) });
+    }
     if (settings.enabled("gemini")) {
       items.push({ label: "New Gemini conversation", run: () => void createGeminiAt(at, folder) });
     }
@@ -209,7 +226,7 @@ const graphView = new GraphView(ui.cy, {
 const filePaths = (): string[] => entries.filter((e) => e.kind === "file").map((e) => e.path);
 
 /**
- * What the graph draws. Sticky and todo files are real notes in real folders — the
+ * What the graph draws. Sticky files are real notes in a real folder — the
  * tree shows them — but on the canvas the CARD is their rendering, so they are never
  * also nodes. That holds with the integrations off too: the folders' contents simply
  * do not appear on the graph.
@@ -529,7 +546,7 @@ async function relinkVault(moves: Map<string, string>): Promise<number> {
     await vault.write(path, next);
     touched++;
   }
-  // The loop above rewrote sticky and todo files on disk like any other note;
+  // The loop above rewrote sticky files on disk like any other note;
   // the cards' cache has to hear about it or a later card edit writes the old link back.
   stickies.rewriteTexts((text) => relinkText(text, moves, (target) => resolver.resolve(target)));
   return touched;
@@ -753,6 +770,7 @@ async function pickFolder(): Promise<void> {
   graphView.reset();
   await spatial.attach(vault); // this folder's own arrangement, not the last one's
   await stickies.attach(vault);
+  await issueIds.attach(vault); // and this folder's own issues
   await settings.attach(vault); // and its own set of switched-on integrations
   applyFeatures();
   panes = [{ tabs: [{ kind: "graph" }], active: 0 }];
@@ -852,8 +870,8 @@ async function ensureCardDirs(): Promise<void> {
       await vault.createDir(STICKY_DIR);
       made = true;
     }
-    if (settings.enabled("todos") && !entries.some((e) => e.path === TODO_DIR)) {
-      await vault.createDir(TODO_DIR);
+    if (settings.enabled("linear") && !entries.some((e) => e.path === ISSUE_DIR)) {
+      await vault.createDir(ISSUE_DIR);
       made = true;
     }
   } catch {
@@ -984,6 +1002,211 @@ function renameOnGraph(path: string): void {
   graphView.renameNode(path, (name) => {
     if (name) void applyRename(path, "file", name);
   });
+}
+
+/* ---------------------------------------------------------------- linear --- */
+
+/**
+ * Where a tick goes. `LocalIssues` until a key is stored, and it is not a stub: with no
+ * Linear at all the notes are the issues and the ticks are just ticks, which is a whole
+ * feature. Connecting swaps in the real API and nothing else in the app changes.
+ */
+let issues: IssueSource = new LocalIssues();
+/** Linear's uuids, kept out of the notes — see `linear.ts`. */
+const issueIds = new IdStore();
+/** Who the stored key belongs to, or null when there is no key. */
+let linearUser: string | null = null;
+
+/** Reads back whatever the shell has stored and points `issues` at the right source. */
+async function adoptLinearKey(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) {
+    issues = new LocalIssues(); // a browser tab has no keychain, and no way past CORS
+    linearUser = null;
+    return;
+  }
+  const status = await bridge.linearStatus().catch(() => ({ connected: false, user: "" }));
+  issues = status.connected ? new LinearApi((query, vars) => bridge.linearCall(query, vars)) : new LocalIssues();
+  linearUser = status.connected ? status.user || "connected" : null;
+}
+
+/**
+ * The whole setup: paste a personal API key once. It is proved against Linear before it
+ * is kept, and kept by the SHELL — encrypted in the OS keychain, deliberately not in the
+ * vault, which the commit button snapshots wholesale.
+ */
+async function setUpLinear(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) {
+    ui.status.textContent = "Linear needs the desktop app — npm start";
+    return;
+  }
+  if (linearUser) {
+    if (!(await askConfirm(`Disconnect Linear (${linearUser})? Ticks stay in the notes.`))) return;
+    await bridge.linearForget();
+    await adoptLinearKey();
+    ui.status.textContent = "Linear disconnected — the notes keep every tick";
+    redrawSettings();
+    return;
+  }
+  const key = await askText(
+    "Paste a Linear personal API key. It is kept in this machine's keychain — never in the vault.",
+    "lin_api_…",
+    "Connect",
+  );
+  if (!key) return;
+  try {
+    const { user } = await bridge.linearConnect(key.trim());
+    await adoptLinearKey();
+    ui.status.textContent = `Linear: connected as ${user || "you"}`;
+  } catch (err) {
+    ui.status.textContent = `Linear: ${(err as Error).message}`;
+  }
+  redrawSettings();
+}
+
+/** What the settings panel says under the Linear row. */
+function linearDetail(): { text: string; action?: string } | null {
+  if (!window.bedrock) return { text: "ticks stay in the notes — the API needs the desktop app" };
+  return linearUser
+    ? { text: `connected as ${escapeHtml(linearUser)}`, action: "Disconnect" }
+    : { text: "not connected — ticks stay in the notes", action: "Connect…" };
+}
+
+/* --------------------------------------------------------- issue writing --- */
+
+/** Per-note debounce, so typing in a card is not one write per keystroke. */
+const issueTimers = new Map<string, number>();
+
+/**
+ * An edit made in an issue card. A tick or a new row is a decision, so it is written and
+ * announced at once; typing is not, so it settles first. Either way the graph has already
+ * redrawn — this is only the part that touches the disk and the network.
+ */
+function editIssue(path: string, text: string, change: IssueChange): void {
+  clearTimeout(issueTimers.get(path));
+  const decided =
+    change.ticked !== undefined || change.created !== undefined || change.issueState !== undefined;
+  if (decided) {
+    void applyIssueEdit(path, text, change);
+    return;
+  }
+  issueTimers.set(
+    path,
+    window.setTimeout(() => {
+      issueTimers.delete(path);
+      void applyIssueEdit(path, text, {});
+    }, 400),
+  );
+}
+
+async function applyIssueEdit(path: string, text: string, change: IssueChange): Promise<void> {
+  // Same guard as an ordinary save: never resurrect a note that has since been deleted.
+  if (!(await vault.exists(path))) {
+    ui.status.textContent = `${path} is no longer in the vault — the tick was not written`;
+    return;
+  }
+  await vault.write(path, text);
+  syncOpenPanes(path, text);
+  graphStale = true;
+  await pushIssue(path, text, change);
+}
+
+/** The same note open in a pane must not go stale behind the card. */
+function syncOpenPanes(path: string, text: string): void {
+  for (let i = 0; i < panes.length; i++) if (pathOf(panes[i]) === path) editors[i].sync(text);
+}
+
+/**
+ * Announces the change to Linear, and writes back whatever Linear names.
+ *
+ * An issue is created there lazily — the first tick or the first row is what makes it
+ * real, so a note somebody started and abandoned never becomes an issue anybody has to
+ * triage. Identifiers come back into the note as `linear:: ENG-214`, which is how the
+ * app knows, next time, that this row already exists over there.
+ */
+async function pushIssue(path: string, text: string, change: IssueChange): Promise<void> {
+  const announce = change.ticked !== undefined || change.created !== undefined || change.issueState !== undefined;
+  if (!issues.connected || !announce) return;
+
+  const doc = parseIssue(text, noteName(path));
+  let next = text;
+  let failed = false;
+
+  let ref = issueIds.ref(doc.identifier);
+  if (!ref) {
+    const made = await issues.create(doc.title);
+    if (made) {
+      issueIds.remember(made);
+      ref = { id: made.id, identifier: made.identifier };
+      doc.identifier = made.identifier;
+      doc.url = made.url;
+      next = writeIssue(next, doc);
+    } else {
+      failed = true;
+    }
+  }
+
+  if (ref && change.created !== undefined) {
+    const row = doc.rows[change.created];
+    if (row?.title.trim() && !row.identifier) {
+      const made = await issues.addRow(ref, row.title.trim());
+      if (made) {
+        issueIds.remember(made);
+        doc.rows[change.created].identifier = made.identifier;
+        next = writeIssue(next, doc);
+      } else {
+        failed = true;
+      }
+    }
+  }
+
+  if (change.ticked !== undefined) {
+    const row = doc.rows[change.ticked];
+    const rowRef = issueIds.ref(row?.identifier ?? null);
+    // A row with no sub-issue of its own yet: its state rides along when it gets one.
+    if (row && rowRef && !(await issues.setState(rowRef, row.state))) failed = true;
+  }
+  if (ref && change.issueState !== undefined && !(await issues.setState(ref, change.issueState))) {
+    failed = true;
+  }
+
+  if (next !== text) {
+    await vault.write(path, next);
+    graphView.setIssueRaw(path, next);
+    syncOpenPanes(path, next);
+    graphStale = true;
+  }
+  ui.status.textContent = failed
+    ? `${noteName(path)} — saved here; Linear did not take it`
+    : `${noteName(path)} → Linear${doc.identifier ? ` (${doc.identifier})` : ""}`;
+}
+
+/**
+ * Right-click → "New Linear issue": the note goes down where the click was, gets its
+ * name — which IS the issue's title — and opens its checklist ready to type into.
+ * Nothing is announced to Linear until the first tick or the first row.
+ */
+async function createIssueAt(at: { x: number; y: number }, folder: string | null): Promise<void> {
+  const dir = folder ?? ISSUE_DIR;
+  // Named for the moment it was raised, as the cards are — "New issue" was a name
+  // nobody meant, and one you had to clear before typing the one you did. The rename
+  // field opens on it selected, so a real name is still one gesture away.
+  const path = uniquePath(filePaths(), dir, stamp(), ".md");
+  const text = issueTemplate();
+  await vault.createFile(path, text);
+  entries = [...entries, { path, kind: "file" }]; // so the rename's collision check sees it
+  graphView.commitNode(path, noteName(path), dir || undefined, at, "linear");
+  graphView.setIssueRaw(path, text);
+  graphStale = true;
+  ui.status.textContent = `created ${path} — name it, and its checklist opens`;
+  graphView.renameNode(path, (name) => {
+    void (async () => {
+      const finalPath = name ? ((await applyRename(path, "file", name)) ?? path) : path;
+      graphView.toggleIssue(finalPath, true); // its first line opens offering an arrow
+    })();
+  });
+  await refreshSidebar();
 }
 
 /* ---------------------------------------------------------------- active --- */
@@ -1259,7 +1482,12 @@ ui.newFolder.addEventListener("click", () => void newFolder());
 ui.graph.addEventListener("click", () => openGraph());
 ui.gitCommit.addEventListener("click", () => void commitVault());
 
-mountSettings(ui.settings, ui.settingsPanel, settings);
+const redrawSettings = mountSettings(ui.settings, ui.settingsPanel, settings, {
+  detail: (feature) => (feature === "linear" ? linearDetail() : null),
+  onAction: (feature) => {
+    if (feature === "linear") void setUpLinear();
+  },
+});
 settings.onChange = applyFeatures;
 // A card is a file in a visible folder, so making or deleting one must show in the tree.
 stickies.onFilesChanged = () => void refreshSidebar();
@@ -1409,6 +1637,7 @@ window.addEventListener("beforeunload", () => {
   for (let i = 0; i < panes.length; i++) if (panes[i].timer !== undefined) void save(i);
   void spatial.flush(); // don't lose the last drag to a quick ⌘Q
   void stickies.flush();
+  void issueIds.flush();
   void settings.flush();
 });
 
@@ -1420,7 +1649,9 @@ const escapeAttr = (s: string): string => escapeHtml(s).replace(/"/g, "&quot;");
 void (async () => {
   await spatial.attach(vault);
   await stickies.attach(vault);
+  await issueIds.attach(vault);
   await settings.attach(vault);
+  await adoptLinearKey(); // a key stored on a previous run connects itself
   applyFeatures();
   entries = await vault.entries();
   const first = filePaths()[0];

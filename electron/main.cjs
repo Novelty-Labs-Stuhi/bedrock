@@ -2,7 +2,7 @@
 // rather than file:// — a real origin is what makes localStorage and the File
 // System Access API ("Open folder…") work.
 
-const { app, BrowserWindow, ipcMain, protocol, net, session, shell } = require("electron");
+const { app, BrowserWindow, ipcMain, protocol, net, safeStorage, session, shell } = require("electron");
 const { execFile } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -83,6 +83,80 @@ ipcMain.handle("git-commit", async (_event, root) => {
     throw err;
   }
   return `committed ${await git(dir, "log", "-1", "--format=%h — %s")}`;
+});
+
+/*
+ * Linear. The renderer never sees the API key: it hands over a query, the shell adds
+ * the Authorization header. The key is encrypted with the OS keychain (safeStorage)
+ * into the app's own userData folder — deliberately NOT the vault, which the git
+ * button snapshots wholesale; a token in `.notes/` would be committed and pushed.
+ */
+const LINEAR_ENDPOINT = "https://api.linear.app/graphql";
+const keyFile = () => path.join(app.getPath("userData"), "linear.json");
+
+function readAccount() {
+  try {
+    const stored = JSON.parse(fs.readFileSync(keyFile(), "utf8"));
+    if (typeof stored.key !== "string") return null;
+    const key = safeStorage.isEncryptionAvailable()
+      ? safeStorage.decryptString(Buffer.from(stored.key, "base64"))
+      : Buffer.from(stored.key, "base64").toString("utf8");
+    return { key, user: typeof stored.user === "string" ? stored.user : "" };
+  } catch {
+    return null; // never connected, or the keychain refused — both mean "not connected"
+  }
+}
+
+/** One GraphQL call with whatever key is stored. Throws what Linear said, verbatim. */
+async function linearFetch(key, query, variables) {
+  const response = await net.fetch(LINEAR_ENDPOINT, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: key },
+    body: JSON.stringify({ query, variables: variables ?? {} }),
+  });
+  if (!response.ok) {
+    throw new Error(response.status === 401 ? "Linear refused the key" : `Linear said ${response.status}`);
+  }
+  const body = await response.json();
+  if (body.errors?.length) throw new Error(String(body.errors[0]?.message || "Linear rejected the request"));
+  return body.data;
+}
+
+/**
+ * Pasting a key is the whole setup: it is proved against Linear before being kept, so a
+ * typo is told about at once rather than at the first tick that fails to land.
+ */
+ipcMain.handle("linear-connect", async (_event, rawKey) => {
+  const key = String(rawKey || "").trim();
+  if (!key) throw new Error("no key given");
+  const data = await linearFetch(key, `query{viewer{name}}`);
+  const user = String(data?.viewer?.name || "");
+  const stored = safeStorage.isEncryptionAvailable()
+    ? safeStorage.encryptString(key).toString("base64")
+    : Buffer.from(key, "utf8").toString("base64");
+  fs.mkdirSync(path.dirname(keyFile()), { recursive: true });
+  fs.writeFileSync(keyFile(), JSON.stringify({ version: 1, key: stored, user }), { mode: 0o600 });
+  return { user };
+});
+
+ipcMain.handle("linear-status", () => {
+  const account = readAccount();
+  return account ? { connected: true, user: account.user } : { connected: false, user: "" };
+});
+
+ipcMain.handle("linear-forget", () => {
+  try {
+    fs.rmSync(keyFile());
+  } catch {
+    /* nothing stored */
+  }
+  return true;
+});
+
+ipcMain.handle("linear-call", async (_event, query, variables) => {
+  const account = readAccount();
+  if (!account) throw new Error("Linear is not connected");
+  return linearFetch(account.key, String(query), variables);
 });
 
 /*

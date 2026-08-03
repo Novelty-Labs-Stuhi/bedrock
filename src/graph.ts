@@ -23,15 +23,16 @@ import { LinkResolver, parseActive, parseLinks, parseTags, parseType } from "./l
 import { ancestors, basename, dirname, noteName } from "./vault";
 import type { SettingsStore } from "./settings";
 import type { SpatialStore } from "./spatial";
+import { type Sticky, type StickyStore } from "./sticky";
 import {
-  allDone,
-  createdLabel,
-  parseTodo,
-  serializeTodo,
-  type Sticky,
-  type StickyStore,
-  type TodoDoc,
-} from "./sticky";
+  TICK_ORDER,
+  isIssueDir,
+  isIssuePath,
+  parseIssue,
+  writeIssue,
+  type IssueDoc,
+  type TickState,
+} from "./linear";
 
 export type Doc = { path: string; text: string };
 
@@ -83,9 +84,11 @@ function pieData(tags: string[]): Record<string, string | number> {
 }
 
 /**
- * A note's circle grows with how many notes link TO it, so the hubs of a vault are
- * obvious at a glance. Square-rooted: the first couple of references count for a lot,
- * and a heavily referenced note still fits inside its folder.
+ * A note's circle grows with how many connections it has — links to it AND links out of
+ * it — so the hubs of a vault are obvious at a glance. Counting only inbound made a note
+ * that gathers a subject together (an index, a map of content) look like a leaf, which is
+ * the opposite of what it is. Square-rooted: the first couple of links count for a lot,
+ * and a heavily connected note still fits inside its folder.
  */
 const NODE_MIN = 20;
 const NODE_MAX = 68;
@@ -124,6 +127,47 @@ const GEMINI_ICON =
   );
 
 /**
+ * The Linear app icon: the near-black rounded tile — same silhouette the Gemini node
+ * wears, so the two typed notes read as siblings — with the silvered disc on it, three
+ * diagonal slices cut out towards its lower-left.
+ *
+ * Rebuilt as inline SVG rather than embedded as a bitmap: cytoscape needs a URI it can
+ * raster at any zoom, the cuts have to show the tile through them, and the mark's sheen
+ * is a gradient. The explicit 256px keeps it crisp zoomed well in.
+ */
+const LINEAR_ICON =
+  "data:image/svg+xml;utf8," +
+  encodeURIComponent(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 64 64">` +
+      `<defs>` +
+      `<linearGradient id="tile" x1="32" y1="0" x2="32" y2="64" gradientUnits="userSpaceOnUse">` +
+      `<stop offset="0" stop-color="#313237"/><stop offset="1" stop-color="#131416"/>` +
+      `</linearGradient>` +
+      // Brightest at the top-right, falling away towards the corner the slices are cut
+      // from — which is what leaves those slivers reading as silver rather than white.
+      `<linearGradient id="mark" x1="47" y1="13" x2="15" y2="51" gradientUnits="userSpaceOnUse">` +
+      `<stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#a5a9b2"/></linearGradient>` +
+      `<mask id="cuts">` +
+      `<circle cx="32" cy="32" r="20" fill="#fff"/>` +
+      // Parallel to the disc's own diagonal, marching towards the bottom-left corner:
+      // the circle's edge is what makes each remaining sliver shorter than the last.
+      `<g stroke="#000" stroke-width="1.5">` +
+      `<line x1="-2" y1="6" x2="58" y2="66"/>` +
+      `<line x1="-6" y1="10" x2="54" y2="70"/>` +
+      `<line x1="-10" y1="14" x2="50" y2="74"/>` +
+      `</g>` +
+      `</mask>` +
+      `</defs>` +
+      `<rect width="64" height="64" rx="14" fill="url(#tile)"/>` +
+      // A hairline of light on the tile's own edge, or a black tile on a black canvas
+      // has no silhouette at all.
+      `<rect x="0.5" y="0.5" width="63" height="63" rx="13.5" fill="none" ` +
+      `stroke="#ffffff" stroke-opacity="0.1"/>` +
+      `<circle cx="32" cy="32" r="20" fill="url(#mark)" mask="url(#cuts)"/>` +
+      `</svg>`,
+  );
+
+/**
  * Styles by note TYPE — the `type:: …` line a file ends with. Untyped notes are
  * tag-pie circles; a typed one wears its type on its sleeve — a Gemini
  * conversation IS the Gemini app icon. New types slot in here and get their
@@ -137,7 +181,24 @@ const TYPE_STYLES: Record<string, Record<string, unknown>> = {
     "background-opacity": 0,
     "pie-size": "0%",
   },
+  // An issue wears the Linear mark and nothing else: what is IN it opens on a click.
+  // The same rounded tile the Gemini node wears — typed notes are siblings, and both
+  // are the app's own icon rather than anything the vault drew.
+  linear: {
+    shape: "round-rectangle",
+    "background-image": LINEAR_ICON,
+    "background-fit": "cover",
+    "background-opacity": 0,
+    "pie-size": "0%",
+  },
 };
+
+/*
+ * An issue's progress used to be a coloured ring round its icon, and it made the icon
+ * look like something was wrong with it. A finished issue gets a badge on the corner of
+ * its tile instead (see `drawIssueBadges`) — everything else says nothing, which is the
+ * right amount to say about work that is simply under way.
+ */
 
 const typeShapeStyles = (): cytoscape.StylesheetJson =>
   Object.entries(TYPE_STYLES).map(([type, style]) => ({
@@ -301,29 +362,35 @@ const BOXES_KEY = "obsidian-lite:boxes";
 const DRAFT_NODE = "__draft_target__";
 const DRAFT_EDGE = "__draft_edge__";
 
-/* ------------------------------------------------------------------- todos --- */
+/* ------------------------------------------------------------------ issues --- */
 
-/** Side of the little square a todo folds into, in model units. */
-const FOLDED_SIZE = 26;
+/** The card an issue node opens into, in model units — it scales with the graph. */
+const CARD_W = 230;
 
-/** Sticky yellow for an open todo's arrow, green once every task is ticked. */
-const TODO_OPEN = "#e6c34a";
-const TODO_DONE = "#3fb950";
+/**
+ * An issue's own state, read off its checklist: started as soon as anything on it has
+ * moved, done when everything has. Empty rows do not count — a line somebody is still
+ * thinking about must not hold a finished issue open.
+ */
+export const rollUp = (rows: ReadonlyArray<{ state: TickState; title: string }>): TickState => {
+  const live = rows.filter((row) => row.title.trim());
+  if (!live.length) return "unstarted";
+  if (live.every((row) => row.state === "done")) return "done";
+  return live.some((row) => row.state !== "unstarted") ? "started" : "unstarted";
+};
 
-const arrowHead = (id: string, colour: string): string =>
-  `<marker id="${id}" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" ` +
-  `orient="auto-start-reverse"><path d="M0 0 L8 4 L0 8 Z" fill="${colour}" /></marker>`;
-
-const ARROW_DEFS = `<defs>${arrowHead("todo-head", TODO_OPEN)}${arrowHead("todo-head-done", TODO_DONE)}</defs>`;
-
-const arrowLine = (
-  from: { x: number; y: number },
-  to: { x: number; y: number },
-  cls: string,
-  marker: string,
-): string =>
-  `<line x1="${from.x}" y1="${from.y}" x2="${to.x}" y2="${to.y}" class="${cls}" ` +
-  `marker-end="url(#${marker})" />`;
+/**
+ * What a card edit asks the app to announce. An empty object is "nothing to say to
+ * Linear" — the note changed and that is all, which is what typing does.
+ */
+export type IssueChange = {
+  /** A row whose tick moved: push that sub-issue's state. */
+  ticked?: number;
+  /** A row that has just earned a sub-issue of its own. */
+  created?: number;
+  /** The issue's own state, when this edit changed it. */
+  issueState?: TickState;
+};
 
 /* ------------------------------------------------------------------ active --- */
 
@@ -428,6 +495,7 @@ export function buildElements(docs: Doc[], described: ReadonlySet<string> = new 
   // (`built with:: [[Target]]`). Several links to the same note keep every distinct name.
   const byEdge = new Map<string, { source: string; target: string; labels: string[] }>();
   const incoming = new Map<string, number>();
+  const outgoing = new Map<string, number>();
   for (const doc of docs) {
     for (const link of parseLinks(doc.text)) {
       const resolved = resolver.resolve(link.target);
@@ -436,23 +504,38 @@ export function buildElements(docs: Doc[], described: ReadonlySet<string> = new 
       const found = byEdge.get(id) ?? { source: doc.path, target: resolved, labels: [] };
       if (link.label && !found.labels.includes(link.label)) found.labels.push(link.label);
       // Count linking notes, not links: ten mentions in one note is still one voice.
-      if (!byEdge.has(id)) incoming.set(resolved, (incoming.get(resolved) ?? 0) + 1);
+      if (!byEdge.has(id)) {
+        incoming.set(resolved, (incoming.get(resolved) ?? 0) + 1);
+        outgoing.set(doc.path, (outgoing.get(doc.path) ?? 0) + 1);
+      }
       byEdge.set(id, found);
     }
   }
 
   for (const doc of docs) {
-    for (const folder of ancestors(doc.path)) folders.add(folder);
-    const type = parseType(doc.text);
+    // Every folder gets a box on the graph except the ones the app keeps issues in:
+    // `linear/` is not somewhere anybody filed anything, and a rectangle drawn round
+    // every issue you own says nothing while hiding whatever is under it.
+    for (const folder of ancestors(doc.path)) if (!isIssueDir(folder)) folders.add(folder);
+    const home = dirname(doc.path);
+    const boxed = home && !isIssueDir(home) ? home : undefined;
+    // A note in `linear/` (or the `todos/` folder that came before it) is an issue by
+    // where it lives — no `type::` line to write, nothing to migrate. An explicit
+    // `type:: linear` works too, for an issue note filed anywhere else.
+    const type = parseType(doc.text) ?? (isIssuePath(doc.path) ? "linear" : null);
+    const issue = type === "linear" ? parseIssue(doc.text, noteName(doc.path)) : null;
     elements.push({
       data: {
         id: doc.path,
         label: noteName(doc.path),
-        parent: dirname(doc.path) || undefined,
+        parent: boxed,
         kind: "file",
-        size: nodeSize(incoming.get(doc.path) ?? 0),
+        size: nodeSize((incoming.get(doc.path) ?? 0) + (outgoing.get(doc.path) ?? 0)),
         // Always present (empty for untyped), so a removed type line clears on sync.
         ntype: type ?? "",
+        // An issue node carries its own markdown, so the card it opens into can be
+        // built (and rewritten) without a read going back to the vault first.
+        ...(issue ? { raw: doc.text, istate: issue.state } : {}),
         // Likewise always present: `sync` patches the keys a definition carries, so a
         // 0 is what stops a note that has just been quietened from pulsing forever.
         radiating: parseActive(doc.text) ? 1 : 0,
@@ -493,6 +576,13 @@ export type GraphHandlers = {
    * chat URL stored on the node (null when the note carries none yet).
    */
   onOpenGemini: (path: string, url: string | null) => void;
+  /**
+   * An edit made in an issue card: the note's new markdown, and what (if anything) of
+   * it Linear should be told about. The graph has already redrawn — this is the write.
+   */
+  onIssueEdit: (path: string, text: string, change: IssueChange) => void;
+  /** The identifier chip on a card was clicked: open the issue in Linear. */
+  onOpenIssue: (url: string) => void;
   /**
    * Click on a connection: open the markdown file that describes it, creating it on the
    * spot if this is the first time anybody has had something to say about that link.
@@ -574,14 +664,12 @@ export class GraphView {
   private stickyEls = new Map<string, HTMLElement>();
   /** Note path -> the ring that pulses over it, for the notes marked active. */
   private pulseEls = new Map<string, HTMLElement>();
-  /** The SVG sheet the todo arrows are drawn on, under the sticky cards. */
-  private arrowLayer: SVGSVGElement;
-  /** Todo waiting for its arrow: click a note to connect it, typing skips. */
-  private pendingTodo: string | null = null;
-  /** Which of its rows the arrow will belong to — the one just added. */
-  private pendingRow = 0;
-  /** Where the proposed arrow's tip currently is, in rendered coordinates. */
-  private proposalAt: { x: number; y: number } | null = null;
+  /** Note path -> the "done" badge on its icon, for the issues that are finished. */
+  private badgeEls = new Map<string, HTMLElement>();
+  /** The open issue card, if any — one at a time, like a popover. */
+  private issue: { path: string; el: HTMLElement } | null = null;
+  /** Which row of it is waiting for an arrow, while one is being aimed. */
+  private draftRow: number | null = null;
   /**
    * True once this vault's arrangement has been restored (or solved for the first time).
    * Nothing is written back before then — a capture from a half-built graph would
@@ -607,11 +695,6 @@ export class GraphView {
     this.overlay.className = "graph-overlay";
     // A sibling of the canvas: cytoscape clears its own container on destroy().
     this.container.parentElement?.appendChild(this.overlay);
-    // First child of the overlay, so every sticky card is painted over its own arrow.
-    this.arrowLayer = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-    this.arrowLayer.setAttribute("class", "todo-arrows");
-    this.arrowLayer.innerHTML = ARROW_DEFS;
-    this.overlay.appendChild(this.arrowLayer);
 
     // Right-click drives the context menu, so suppress the native one.
     this.container.addEventListener("contextmenu", (event) => event.preventDefault());
@@ -629,9 +712,14 @@ export class GraphView {
     );
     document.addEventListener("keydown", (event) => {
       if (event.key !== "Escape") return;
+      // An aimed arrow is the innermost thing open: it goes first, and alone.
+      if (this.draftRow !== null) {
+        this.cancelRowLink();
+        return;
+      }
       if (this.draftSource) this.cancelDraft();
       if (this.lasso) this.cancelGroup();
-      if (this.pendingTodo) this.cancelProposal(true);
+      if (this.issue) this.closeIssue();
     });
   }
 
@@ -655,9 +743,10 @@ export class GraphView {
     this.stickyEls.clear();
     for (const el of this.pulseEls.values()) el.remove();
     this.pulseEls.clear();
-    this.pendingTodo = null;
-    this.proposalAt = null;
-    this.arrowLayer.innerHTML = ARROW_DEFS;
+    for (const el of this.badgeEls.values()) el.remove();
+    this.badgeEls.clear();
+    this.issue?.el.remove();
+    this.issue = null;
     this.fittedSize = null;
     this.userMoved = false;
   }
@@ -1026,9 +1115,9 @@ export class GraphView {
   private wire(cy: Core): void {
     cy.on("tap", "node", (event) => {
       const node = event.target as NodeSingular;
-      // A todo is waiting for its arrow: this click is the other end of it.
-      if (this.pendingTodo) {
-        if (node.data("kind") === "file") this.connectTodo(node);
+      // A checklist line is waiting for its arrow: this click is the other end of it.
+      if (this.draftRow !== null) {
+        this.finishRowLink(node);
         return;
       }
       if (this.draftSource) {
@@ -1053,6 +1142,12 @@ export class GraphView {
         this.handlers.onOpenGemini(node.id(), (node.data("gurl") as string) || null);
         return;
       }
+      // An issue node is a folded checklist: clicking unfolds it over the canvas
+      // rather than opening the file, which is where the ticks live anyway.
+      if (node.data("ntype") === "linear" && this.settings.enabled("linear")) {
+        this.toggleIssue(node.id());
+        return;
+      }
       this.handlers.onOpen(node.id());
     });
 
@@ -1067,10 +1162,12 @@ export class GraphView {
 
     cy.on("tap", (event) => {
       if (event.target !== cy) return; // background only
-      if (this.pendingTodo) {
-        this.cancelProposal(true); // clicked away — the todo stays, arrowless
+      // An aimed arrow released on nothing is a change of mind, not a new note.
+      if (this.draftRow !== null) {
+        this.cancelRowLink();
         return;
       }
+      if (this.issue) this.closeIssue(); // clicked away — the card folds back up
       if (this.draftSource) {
         const source = this.draftSource;
         const kind = this.draftKind;
@@ -1099,15 +1196,9 @@ export class GraphView {
       }
     });
 
-    // Keep the arrow's tip under the cursor while a link (or todo arrow) is being drawn.
+    // Keep the arrow's tip under the cursor while a link is being drawn.
     cy.on("mousemove", (event) => {
       if (this.draftSource) cy.getElementById(DRAFT_NODE).position(event.position);
-      if (this.pendingTodo) {
-        const zoom = cy.zoom();
-        const pan = cy.pan();
-        this.proposalAt = { x: event.position.x * zoom + pan.x, y: event.position.y * zoom + pan.y };
-        this.drawArrows();
-      }
     });
 
     cy.on("mouseover", "node", (event) => {
@@ -1146,8 +1237,9 @@ export class GraphView {
     });
 
     cy.on("drag", "node", (event) => {
-      this.drawArrows(); // a todo may be pointing at the node being dragged
-      this.drawPulses(); // and its own ring has to stay under the cursor with it
+      this.drawPulses(); // a note's own ring stays under the cursor with it
+      this.placeIssueCard(); // as does an open card, if this is its node
+      this.drawIssueBadges(); // and the badge on an issue's corner
       if (!this.drag) return;
       const node = event.target as NodeSingular;
       if (node.id() !== this.drag.path) return;
@@ -1427,8 +1519,9 @@ export class GraphView {
   private drawOverlay(): void {
     this.drawHandles();
     this.placeStickies();
-    this.drawArrows();
     this.drawPulses();
+    this.placeIssueCard();
+    this.drawIssueBadges();
   }
 
   /** Re-applies the feature toggles to everything drawn above the canvas. */
@@ -1459,10 +1552,13 @@ export class GraphView {
         if (!el) {
           el = document.createElement("div");
           el.className = "node-pulse";
-          // Every ring on the canvas beats together: a negative delay lines each one up
-          // with the same clock, so a note marked active now falls in with the others
-          // instead of pulsing on its own offbeat.
-          el.style.animationDelay = `${-(performance.now() % PULSE_MS) / 1000}s`;
+          // Every ring on the canvas beats together: a negative delay starts a new one
+          // part-way through the cycle, so a note marked active now falls in with the
+          // ones already going instead of pulsing on its own offbeat. The document
+          // timeline, not performance.now(): an animation starts at the frame's time,
+          // and reading the wall clock instead puts each ring a frame out of step.
+          const clock = Number(document.timeline.currentTime ?? performance.now());
+          el.style.animationDelay = `${-(clock % PULSE_MS) / 1000}s`;
           this.overlay.appendChild(el);
           this.pulseEls.set(dot.id(), el);
         }
@@ -1525,15 +1621,13 @@ export class GraphView {
     for (const sticky of this.stickies.all()) {
       // A switched-off integration leaves nothing on the canvas; the text is still
       // in the store, so switching it back on brings everything back.
-      if (!this.settings.enabled(sticky.kind === "todo" ? "todos" : "stickies")) continue;
+      if (!this.settings.enabled("stickies")) continue;
       alive.add(sticky.id);
-      let el = this.stickyEls.get(sticky.id);
-      if (!el) el = sticky.kind === "todo" ? this.buildTodo(sticky) : this.buildSticky(sticky);
-      const folded = sticky.kind === "todo" && sticky.folded;
+      const el = this.stickyEls.get(sticky.id) ?? this.buildSticky(sticky);
       el.style.left = `${sticky.x * zoom + pan.x}px`;
       el.style.top = `${sticky.y * zoom + pan.y}px`;
-      el.style.width = `${(folded ? FOLDED_SIZE : sticky.w) * zoom}px`;
-      el.style.height = `${(folded ? FOLDED_SIZE : sticky.h) * zoom}px`;
+      el.style.width = `${sticky.w * zoom}px`;
+      el.style.height = `${sticky.h * zoom}px`;
       // Everything inside is sized in em, so one font-size scales the whole card —
       // checkboxes, rows, grips — in lockstep with the graph.
       el.style.fontSize = `${13 * zoom}px`;
@@ -1616,220 +1710,10 @@ export class GraphView {
       if (mode === "move") this.stickies.update(id, { x: from.x + dx, y: from.y + dy });
       else this.stickies.update(id, { w: Math.max(90, from.w + dx), h: Math.max(44, from.h + dy) });
       this.placeStickies();
-      this.drawArrows(); // a todo's arrow rides along with its card
     };
     const onUp = (): void => {
       document.removeEventListener("mousemove", onMove);
       document.removeEventListener("mouseup", onUp);
-    };
-    document.addEventListener("mousemove", onMove);
-    document.addEventListener("mouseup", onUp);
-  }
-
-  /* ------------------------------------------------------------------ todos --- */
-
-  /**
-   * Right-click → "New todo": a checklist sticky. It opens already proposing an arrow —
-   * click a note to point the todo at it; starting to type instead keeps it loose.
-   */
-  addTodo(at: cytoscape.Position): void {
-    const sticky = this.stickies.add(at, "todo");
-    this.placeStickies();
-    this.proposeTodoLink(sticky.id, 0);
-    this.focusRow(this.stickyEls.get(sticky.id), 0);
-  }
-
-  private heldSticky(id: string): Sticky | undefined {
-    return this.stickies.all().find((sticky) => sticky.id === id);
-  }
-
-  private buildTodo(sticky: Sticky): HTMLElement {
-    const el = document.createElement("div");
-    el.className = "sticky todo";
-    this.overlay.appendChild(el);
-    this.stickyEls.set(sticky.id, el);
-    this.renderTodo(el, sticky.id);
-
-    el.addEventListener("mousedown", (event) => {
-      const held = this.heldSticky(sticky.id);
-      if (!held) return;
-      if (held.folded) {
-        event.preventDefault();
-        event.stopPropagation();
-        this.dragOrUnfold(sticky.id, event);
-        return;
-      }
-      const target = event.target as HTMLElement;
-      if (target.closest("input") || target.closest(".todo-fold") || target.closest(".sticky-x")) return;
-      event.preventDefault();
-      event.stopPropagation();
-      const grip = target.classList.contains("sticky-grip");
-      this.dragSticky(sticky.id, event, grip ? "size" : "move");
-    });
-
-    // A todo left with nothing in it (and no arrow) clears itself away, like a sticky.
-    el.addEventListener("focusout", () => {
-      window.setTimeout(() => {
-        if (el.contains(document.activeElement)) return;
-        if (this.pendingTodo === sticky.id) return; // still choosing its arrow
-        const held = this.heldSticky(sticky.id);
-        if (!held || held.folded) return;
-        const doc = parseTodo(held.text);
-        if (doc.targets.length || doc.items.some((item) => item.text.trim() || item.target)) return;
-        this.stickies.remove(sticky.id);
-        this.placeStickies();
-        this.drawArrows();
-      }, 0);
-    });
-    return el;
-  }
-
-  /**
-   * (Re)builds a todo card's rows from its markdown. Runs on structural changes only —
-   * new line, removed line, fold, connect — never per keystroke, which would eat focus.
-   * The `- [ ]` prefixes and the `[[link]]` line are the storage, not the rendering:
-   * what shows is a checkbox per task, and the link line shows as nothing at all.
-   */
-  private renderTodo(el: HTMLElement, id: string): void {
-    const held = this.heldSticky(id);
-    if (!held) return;
-    const doc = parseTodo(held.text);
-    el.classList.toggle("folded", !!held.folded);
-    el.classList.toggle("done", allDone(doc));
-
-    if (held.folded) {
-      // Yellow and counting (`2/3`) while work remains; green with a check when done.
-      const ticked = doc.items.filter((item) => item.done).length;
-      const face = allDone(doc) ? "✓" : `${ticked}/${doc.items.length}`;
-      el.innerHTML = `<div class="todo-face" title="Open this todo">${face}</div>`;
-      return;
-    }
-
-    const created = createdLabel(held.id);
-    el.innerHTML =
-      `<div class="sticky-bar" title="Drag to move">` +
-      (created ? `<span class="todo-date">${created}</span>` : "") +
-      `</div>` +
-      `<button class="sticky-x" title="Delete this todo">✕</button>` +
-      `<button class="todo-fold" title="Fold into a little square">▣</button>` +
-      `<div class="todo-rows">` +
-      doc.items
-        .map(
-          (item) =>
-            `<div class="todo-row">` +
-            `<input type="checkbox"${item.done ? " checked" : ""} title="Done" />` +
-            `<input class="todo-text" type="text" spellcheck="false" value="${escapeAttr(item.text)}" placeholder="to do…" />` +
-            `</div>`,
-        )
-        .join("") +
-      `</div><div class="sticky-grip" title="Drag to resize"></div>`;
-
-    el.querySelector<HTMLButtonElement>(".sticky-x")?.addEventListener("click", () =>
-      this.deleteSticky(id),
-    );
-    el.querySelector<HTMLButtonElement>(".todo-fold")?.addEventListener("click", () => {
-      this.stickies.update(id, { folded: true });
-      this.placeStickies();
-      this.renderTodo(el, id);
-      this.drawArrows();
-    });
-
-    el.querySelectorAll<HTMLElement>(".todo-row").forEach((row, index) => {
-      const check = row.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
-      const text = row.querySelector<HTMLInputElement>(".todo-text")!;
-
-      check.addEventListener("change", () => {
-        const next = this.readTodo(el, id);
-        this.stickies.update(id, { text: serializeTodo(next) });
-        el.classList.toggle("done", allDone(next));
-        this.drawArrows(); // ticking a box is what turns its own arrow green
-      });
-
-      text.addEventListener("input", () => {
-        this.stickies.update(id, { text: serializeTodo(this.readTodo(el, id)) });
-        // They typed instead of picking a node: that was the "no arrow" answer.
-        if (this.pendingTodo === id) this.cancelProposal();
-      });
-
-      text.addEventListener("keydown", (event) => {
-        event.stopPropagation(); // never reach the graph's own Escape / delete handling
-        if (event.key === "Enter") {
-          event.preventDefault();
-          const next = this.readTodo(el, id);
-          next.items.splice(index + 1, 0, { done: false, text: "" });
-          this.stickies.update(id, { text: serializeTodo(next) });
-          this.renderTodo(el, id);
-          this.focusRow(el, index + 1);
-          // Every fresh line re-opens the offer: click a note to give THIS line an
-          // arrow, keep typing to skip — the same bargain as when the todo was created.
-          this.proposeTodoLink(id, index + 1);
-        } else if (event.key === "Backspace" && text.value === "") {
-          const next = this.readTodo(el, id);
-          if (next.items.length <= 1) return; // the last line stays; blur clears the card
-          event.preventDefault();
-          next.items.splice(index, 1);
-          this.stickies.update(id, { text: serializeTodo(next) });
-          this.renderTodo(el, id);
-          this.focusRow(el, Math.max(0, index - 1));
-          this.drawArrows(); // a deleted line takes its own arrow with it
-        } else if (event.key === "Escape" && this.pendingTodo === id) {
-          this.cancelProposal();
-        }
-      });
-    });
-  }
-
-  /** The card as it stands in the DOM, plus the arrow targets only the model knows —
-      each row's own (rows render one-to-one with items) and the card-level ones. */
-  private readTodo(el: HTMLElement, id: string): TodoDoc {
-    const held = this.heldSticky(id);
-    const heldDoc: TodoDoc = held ? parseTodo(held.text) : { items: [], targets: [] };
-    const items = [...el.querySelectorAll<HTMLElement>(".todo-row")].map((row, index) => {
-      const target = heldDoc.items[index]?.target;
-      return {
-        done: row.querySelector<HTMLInputElement>('input[type="checkbox"]')!.checked,
-        text: row.querySelector<HTMLInputElement>(".todo-text")!.value,
-        ...(target ? { target } : {}),
-      };
-    });
-    return { items, targets: heldDoc.targets };
-  }
-
-  private focusRow(el: HTMLElement | undefined, index: number): void {
-    const field = el?.querySelectorAll<HTMLInputElement>(".todo-text")[index];
-    if (!field) return;
-    field.focus();
-    field.setSelectionRange(field.value.length, field.value.length);
-  }
-
-  /** On a folded square, a still click opens it back up and a real drag moves it. */
-  private dragOrUnfold(id: string, event: MouseEvent): void {
-    const cy = this.cy;
-    const from = this.heldSticky(id);
-    if (!cy || !from) return;
-    const zoom = cy.zoom();
-    const start = { x: event.clientX, y: event.clientY };
-    let moved = false;
-
-    const onMove = (move: MouseEvent): void => {
-      if (!moved && Math.hypot(move.clientX - start.x, move.clientY - start.y) < 4) return;
-      moved = true;
-      this.stickies.update(id, {
-        x: from.x + (move.clientX - start.x) / zoom,
-        y: from.y + (move.clientY - start.y) / zoom,
-      });
-      this.placeStickies();
-      this.drawArrows();
-    };
-    const onUp = (): void => {
-      document.removeEventListener("mousemove", onMove);
-      document.removeEventListener("mouseup", onUp);
-      if (moved) return;
-      this.stickies.update(id, { folded: false });
-      this.placeStickies();
-      const el = this.stickyEls.get(id);
-      if (el) this.renderTodo(el, id);
-      this.drawArrows();
     };
     document.addEventListener("mousemove", onMove);
     document.addEventListener("mouseup", onUp);
@@ -1837,139 +1721,322 @@ export class GraphView {
 
   /** The ✕ in a card's corner: the card goes, and with it its file. */
   private deleteSticky(id: string): void {
-    if (this.pendingTodo === id) {
-      this.pendingTodo = null;
-      this.proposalAt = null;
-      this.handlers.onHint(null);
-    }
     this.stickies.remove(id);
     this.placeStickies();
-    this.drawArrows();
   }
 
-  /* ------------------------------------------------------------ todo arrows --- */
-
-  private proposeTodoLink(id: string, row: number): void {
-    this.pendingTodo = id;
-    this.pendingRow = row;
-    this.proposalAt = null;
-    this.handlers.onHint("Click a note to point this todo at it — typing (or Esc) skips the arrow");
-    this.drawArrows();
-  }
+  /* ------------------------------------------------------------------ issues --- */
 
   /**
-   * Drops the proposal. `removeEmpty` is for the explicit dismissals (Esc, a click on
-   * the background): a todo nothing was ever typed into goes with its proposal.
+   * An issue node's click gesture. Folded, the node is only the Linear mark — which is
+   * all a canvas full of issues should have to say. Open, it is its checklist, floating
+   * beside the node it belongs to. One at a time: a second click, Esc, the ✕, or a click
+   * on the background folds it back up.
    */
-  private cancelProposal(removeEmpty = false): void {
-    const id = this.pendingTodo;
-    this.pendingTodo = null;
-    this.proposalAt = null;
-    this.handlers.onHint(null);
-    if (removeEmpty && id) {
-      const held = this.heldSticky(id);
-      if (held) {
-        const doc = parseTodo(held.text);
-        if (!doc.targets.length && !doc.items.some((item) => item.text.trim() || item.target)) {
-          this.stickies.remove(id);
-          this.placeStickies();
-        }
-      }
+  toggleIssue(path: string, aimFirstRow = false): void {
+    if (this.issue?.path === path) {
+      this.closeIssue();
+      return;
     }
-    this.drawArrows();
+    this.closeIssue();
+    const el = document.createElement("div");
+    el.className = "issue-card";
+    // Ticking and typing must never reach cytoscape, which would read the press as a
+    // grab on the node underneath and pan the canvas out from under the card.
+    el.addEventListener("mousedown", (event) => event.stopPropagation());
+    this.overlay.appendChild(el);
+    this.issue = { path, el };
+    this.renderIssue();
+    this.placeIssueCard();
+    this.drawIssueBadges(); // this one is unfolded now; its badge steps aside
+    this.focusRow(0);
+    // A brand-new issue opens already offering the first line's arrow; opening one that
+    // already exists does not, or every glance at an issue would arm a gesture.
+    if (aimFirstRow) this.proposeRowLink(0);
+  }
+
+  closeIssue(): void {
+    this.issue?.el.remove();
+    this.issue = null;
+    this.drawIssueBadges(); // folded again — a finished issue gets its badge back
+  }
+
+  /** Which issue is open, if any. */
+  openIssue(): string | null {
+    return this.issue?.path ?? null;
   }
 
   /**
-   * The proposed arrow landed on a note. The connection is written INTO the todo's
-   * markdown — a `[[link]]` at the end of the task line it was proposed for — and
-   * hidden from the card; the arrows on the canvas are those lines' rendering.
-   * Belonging to its line, the arrow goes when the line goes, and turns green the
-   * moment that one task is ticked.
+   * A finished issue wears Linear's done mark on the top-right corner of its tile.
+   *
+   * Only while it is FOLDED: with the card open the head tick says the same thing three
+   * times over, and the badge would sit under the card's own edge. Sized off the node, so
+   * it rides the zoom with the icon it belongs to.
    */
-  private connectTodo(node: NodeSingular): void {
-    const id = this.pendingTodo;
-    this.pendingTodo = null;
-    this.proposalAt = null;
-    this.handlers.onHint(null);
-    const held = id ? this.heldSticky(id) : undefined;
-    if (!id || !held) return;
-    const doc = parseTodo(held.text);
-    const name = noteName(node.id());
-    const row = Math.min(this.pendingRow, doc.items.length - 1);
-    if (row >= 0) doc.items[row].target = name;
-    else if (!doc.targets.some((t) => t.toLowerCase() === name.toLowerCase())) doc.targets.push(name);
-    this.stickies.update(id, { text: serializeTodo(doc) });
-    this.drawArrows();
-    // Back to typing where they were: the line the arrow now belongs to.
-    this.focusRow(this.stickyEls.get(id), Math.max(0, row));
+  private drawIssueBadges(): void {
+    const cy = this.cy;
+    if (!cy) return;
+    const alive = new Set<string>();
+    if (this.settings.enabled("linear")) {
+      cy.nodes().forEach((node) => {
+        const dot = node as NodeSingular;
+        if (dot.data("ntype") !== "linear" || dot.data("istate") !== "done") return;
+        if (this.issue?.path === dot.id()) return; // unfolded: its own head tick says it
+        alive.add(dot.id());
+        let el = this.badgeEls.get(dot.id());
+        if (!el) {
+          el = document.createElement("div");
+          el.className = "issue-badge";
+          el.title = "Done";
+          this.overlay.appendChild(el);
+          this.badgeEls.set(dot.id(), el);
+        }
+        const at = dot.renderedPosition();
+        const half = dot.renderedWidth() / 2;
+        const size = Math.max(5, half * 0.85);
+        // Sat on the corner, overlapping the tile a little, the way an app badge does.
+        el.style.left = `${at.x + half * 0.82}px`;
+        el.style.top = `${at.y - half * 0.82}px`;
+        el.style.width = `${size}px`;
+        el.style.height = `${size}px`;
+        el.style.fontSize = `${size * 0.72}px`;
+      });
+    }
+    for (const [id, el] of this.badgeEls) {
+      if (alive.has(id)) continue;
+      el.remove();
+      this.badgeEls.delete(id);
+    }
   }
 
-  /** The node a todo's `[[link]]` points at — shallowest name match, as links resolve. */
-  private nodeByName(name: string): NodeSingular | null {
-    const cy = this.cy;
-    if (!cy) return null;
-    const wanted = name.replace(/^\/+/, "").toLowerCase();
-    const matches: NodeSingular[] = [];
-    cy.nodes().forEach((node) => {
-      if (node.data("kind") !== "file") return;
-      const path = node.id();
-      if (
-        path.toLowerCase() === wanted ||
-        path.replace(/\.md$/i, "").toLowerCase() === wanted ||
-        noteName(path).toLowerCase() === wanted
-      ) {
-        matches.push(node as NodeSingular);
-      }
+  /**
+   * Hands the graph a note's current markdown, so the node's ring and any open card
+   * follow a write that happened somewhere else — the editor, or a push that has just
+   * stamped an identifier onto a row.
+   */
+  setIssueRaw(path: string, text: string): void {
+    const node = this.cy?.getElementById(path);
+    if (!node || node.empty()) return;
+    node.data("raw", text);
+    node.data("istate", parseIssue(text, noteName(path)).state);
+    this.drawIssueBadges();
+    // Never rebuild the card out from under someone who is typing in it.
+    if (this.issue?.path === path && !this.issue.el.contains(document.activeElement)) {
+      this.renderIssue();
+    }
+  }
+
+  /** The note behind the card, as the graph last heard it. */
+  private issueDoc(path: string): IssueDoc | null {
+    const node = this.cy?.getElementById(path);
+    if (!node || node.empty()) return null;
+    return parseIssue(String(node.data("raw") ?? ""), noteName(path));
+  }
+
+  /**
+   * Rebuilds the card's rows from the note. Structural changes only — a row added or
+   * cut, a tick moved — never per keystroke, which would take the caret with it.
+   */
+  private renderIssue(): void {
+    const open = this.issue;
+    const doc = open ? this.issueDoc(open.path) : null;
+    if (!open || !doc) return;
+
+    const stamp = doc.identifier
+      ? `<button class="issue-id" title="Open ${escapeAttr(doc.identifier)} in Linear">` +
+        `${escapeAttr(doc.identifier)}</button>`
+      : `<span class="issue-id local" title="Not announced to Linear yet">local</span>`;
+
+    open.el.innerHTML =
+      `<div class="issue-head">` +
+      `<button class="tick ${doc.state}" data-tick="-1" title="This issue's own state"></button>` +
+      stamp +
+      `<button class="issue-x" title="Fold it back up">✕</button>` +
+      `</div>` +
+      `<div class="issue-name">${escapeAttr(doc.title)}</div>` +
+      `<div class="issue-rows">` +
+      doc.rows
+        .map(
+          (row, index) =>
+            `<div class="issue-row">` +
+            `<button class="tick ${row.state}" data-tick="${index}" title="Click to move it on"></button>` +
+            `<input class="issue-text" type="text" spellcheck="false" data-row="${index}" ` +
+            `value="${escapeAttr(row.title)}" placeholder="what needs doing…" />` +
+            `<button class="row-aim${row.target ? " on" : ""}" data-aim="${index}" title="${
+              row.target ? `Points at ${escapeAttr(row.target)} — click to aim it elsewhere` : "Point this line at a note"
+            }">↗</button>` +
+            (row.identifier ? `<span class="row-id">${escapeAttr(row.identifier)}</span>` : "") +
+            `</div>`,
+        )
+        .join("") +
+      `</div>`;
+
+    open.el.querySelector<HTMLButtonElement>(".issue-x")?.addEventListener("click", () =>
+      this.closeIssue(),
+    );
+    open.el.querySelector<HTMLButtonElement>(".issue-id")?.addEventListener("click", () => {
+      if (doc.url) this.handlers.onOpenIssue(doc.url);
     });
-    matches.sort((a, b) => a.id().split("/").length - b.id().split("/").length || a.id().localeCompare(b.id()));
-    return matches[0] ?? null;
+
+    open.el.querySelectorAll<HTMLButtonElement>(".tick").forEach((button) => {
+      button.addEventListener("click", () => this.advanceTick(Number(button.dataset.tick)));
+    });
+    open.el.querySelectorAll<HTMLButtonElement>(".row-aim").forEach((button) => {
+      button.addEventListener("click", () => this.proposeRowLink(Number(button.dataset.aim)));
+    });
+
+    open.el.querySelectorAll<HTMLInputElement>(".issue-text").forEach((field) => {
+      const index = Number(field.dataset.row);
+
+      field.addEventListener("input", () => {
+        // They typed instead of picking a note: that was the "no arrow" answer.
+        this.cancelRowLink();
+        this.editIssue((next) => {
+          if (next.rows[index]) next.rows[index].title = field.value;
+        }, {});
+      });
+
+      // Leaving a row with something written in it is what announces it to Linear:
+      // an empty row is a line somebody is still thinking about, not an issue.
+      field.addEventListener("blur", () => this.commitRow(index));
+
+      field.addEventListener("keydown", (event) => {
+        event.stopPropagation(); // never reach the graph's own Escape / delete handling
+        if (event.key === "Enter") {
+          event.preventDefault();
+          this.commitRow(index);
+          this.addRow(index);
+        } else if (event.key === "Backspace" && field.value === "") {
+          const held = this.issue ? this.issueDoc(this.issue.path) : null;
+          if (!held || held.rows.length <= 1) return; // the last line stays
+          event.preventDefault();
+          // The line goes from the note. A sub-issue already in Linear is left alone
+          // there — backspace in a text field must not delete somebody's issue.
+          this.editIssue((next) => next.rows.splice(index, 1), {});
+          this.renderIssue();
+          this.focusRow(Math.max(0, index - 1));
+        } else if (event.key === "Escape") {
+          // The arrow being offered is the innermost thing open, so it goes first;
+          // a second Escape then folds the card away.
+          if (this.draftRow !== null) this.cancelRowLink();
+          else this.closeIssue();
+        }
+      });
+    });
   }
 
-  /** Every todo's arrow, plus the dashed proposal while one is being aimed. */
-  private drawArrows(): void {
-    const cy = this.cy;
-    let lines = "";
-    if (cy && this.settings.enabled("todos")) {
-      const zoom = cy.zoom();
-      const pan = cy.pan();
-      for (const sticky of this.stickies.all()) {
-        if (sticky.kind !== "todo") continue;
-        const w = sticky.folded ? FOLDED_SIZE : sticky.w;
-        const h = sticky.folded ? FOLDED_SIZE : sticky.h;
-        // From the card's centre, all in model units. The card itself covers the tail,
-        // so the line reads as starting at its edge without any rectangle geometry.
-        const from = { x: (sticky.x + w / 2) * zoom + pan.x, y: (sticky.y + h / 2) * zoom + pan.y };
-        const doc = parseTodo(sticky.text);
-        // One arrow per note pointed at. A row's arrow is green as soon as that row
-        // is ticked; a card-level (old-style) arrow waits for the whole card. Two
-        // pointers at one note share the line, green only when both say so.
-        const arrows = new Map<string, { name: string; done: boolean }>();
-        const mark = (name: string, isDone: boolean): void => {
-          const held = arrows.get(name.toLowerCase());
-          if (held) held.done = held.done && isDone;
-          else arrows.set(name.toLowerCase(), { name, done: isDone });
-        };
-        for (const target of doc.targets) mark(target, allDone(doc));
-        for (const item of doc.items) if (item.target) mark(item.target, item.done);
-        for (const { name, done } of arrows.values()) {
-          const node = this.nodeByName(name);
-          if (!node) continue; // the note went away; the line in the text remains
-          const at = node.renderedPosition();
-          const clear = (node.width() / 2) * zoom + 5; // hold the head off the circle
-          const dx = at.x - from.x;
-          const dy = at.y - from.y;
-          const span = Math.hypot(dx, dy);
-          if (span <= clear + 8) continue; // sitting on the node — nothing legible to draw
-          const to = { x: at.x - (dx / span) * clear, y: at.y - (dy / span) * clear };
-          lines += arrowLine(from, to, done ? "todo-arrow done" : "todo-arrow", done ? "todo-head-done" : "todo-head");
-        }
-        // The arrow being aimed rides on top of the ones already there.
-        if (this.pendingTodo === sticky.id && this.proposalAt) {
-          lines += arrowLine(from, this.proposalAt, "todo-arrow proposal", "todo-head");
-        }
-      }
+  private focusRow(index: number): void {
+    const field = this.issue?.el.querySelectorAll<HTMLInputElement>(".issue-text")[index];
+    if (!field) return;
+    field.focus();
+    field.setSelectionRange(field.value.length, field.value.length);
+  }
+
+  /**
+   * Applies a change to the open issue's markdown and hands it on: the app owns the
+   * vault and the push to Linear, the graph owns what is drawn. The node's own copy of
+   * the text is updated first, so the card can be rebuilt from it immediately rather
+   * than waiting for the write to come back.
+   */
+  private editIssue(change: (doc: IssueDoc) => void, what: IssueChange): void {
+    const open = this.issue;
+    const node = open ? this.cy?.getElementById(open.path) : null;
+    if (!open || !node || node.empty()) return;
+    const raw = String(node.data("raw") ?? "");
+    const doc = parseIssue(raw, noteName(open.path));
+    change(doc);
+    const text = writeIssue(raw, doc);
+    node.data("raw", text);
+    node.data("istate", doc.state);
+    this.drawIssueBadges(); // a tick may have just finished (or reopened) the issue
+    this.handlers.onIssueEdit(open.path, text, what);
+  }
+
+  /**
+   * A tick moves on: not started → started → done, then round again. Three states
+   * because that is what a checklist is for; Linear's own five are what these MAP to,
+   * so a team's "In review" column is still where a started row lands.
+   */
+  private advanceTick(index: number): void {
+    const open = this.issue;
+    const doc = open ? this.issueDoc(open.path) : null;
+    if (!open || !doc) return;
+    const from = index < 0 ? doc.state : doc.rows[index]?.state;
+    if (from === undefined) return;
+    const to = TICK_ORDER[(TICK_ORDER.indexOf(from) + 1) % TICK_ORDER.length];
+
+    if (index < 0) {
+      this.editIssue((next) => {
+        next.state = to;
+      }, { issueState: to });
+    } else {
+      // Ticking the last row off finishes the issue, and the first one starts it —
+      // so the node's ring answers a tick without anybody setting it by hand.
+      const rolled = rollUp(doc.rows.map((row, at) => (at === index ? { ...row, state: to } : row)));
+      this.editIssue(
+        (next) => {
+          if (next.rows[index]) next.rows[index].state = to;
+          next.state = rolled;
+        },
+        { ticked: index, ...(rolled === doc.state ? {} : { issueState: rolled }) },
+      );
     }
-    this.arrowLayer.innerHTML = ARROW_DEFS + lines;
+    this.renderIssue();
+  }
+
+  /** A row with words in it and no identifier yet: ask for its sub-issue. */
+  private commitRow(index: number): void {
+    const open = this.issue;
+    const doc = open ? this.issueDoc(open.path) : null;
+    const row = doc?.rows[index];
+    if (!row || !row.title.trim() || row.identifier) return;
+    this.editIssue(() => {}, { created: index });
+  }
+
+  private addRow(after: number): void {
+    const at = after + 1;
+    this.editIssue((doc) => {
+      doc.rows.splice(at, 0, { state: "unstarted", title: "", identifier: null, target: null });
+    }, {});
+    this.renderIssue();
+    this.focusRow(at);
+    // Every new line re-opens the offer: click a note to point THIS one at it, keep
+    // typing to skip — the same bargain the todo rows made.
+    this.proposeRowLink(at);
+  }
+
+  /**
+   * The card sits beside its node and rides the viewport with it.
+   *
+   * It is PART of the graph, so it scales with the zoom 1:1 — width, text, ticks, the
+   * gap to its node, all of it — exactly as the sticky cards do. Zoom out and it shrinks
+   * away with the notes around it; nothing here is clamped, because a card that kept its
+   * own size while the graph got smaller would swell to cover half the picture.
+   */
+  private placeIssueCard(): void {
+    const open = this.issue;
+    const cy = this.cy;
+    if (!open || !cy) return;
+    const node = cy.getElementById(open.path);
+    if (node.empty()) {
+      this.closeIssue(); // the note went away from under it
+      return;
+    }
+    const dot = node as NodeSingular;
+    const zoom = cy.zoom();
+    const at = dot.renderedPosition();
+    const half = dot.renderedWidth() / 2;
+    const width = CARD_W * zoom;
+    const gap = 8 * zoom;
+    // To the right of its node, or to the left when there is no room for it there.
+    const room = this.container.clientWidth - (at.x + half + gap);
+    const left = room > width ? at.x + half + gap : at.x - half - gap - width;
+    open.el.style.left = `${Math.max(4, left)}px`;
+    open.el.style.top = `${at.y - 16 * zoom}px`;
+    open.el.style.width = `${width}px`;
+    // Everything inside is sized in em, so this one number scales the whole card —
+    // rows, circles, the identifier chip — in lockstep with the graph.
+    open.el.style.fontSize = `${13 * zoom}px`;
   }
 
   /**
@@ -2118,11 +2185,12 @@ export class GraphView {
 
   /* ------------------------------------------------------------ link draft --- */
 
-  private startDraft(source: NodeSingular, kind: "note" | "gemini" = "note"): void {
+  private startDraft(source: NodeSingular, kind: "note" | "gemini" = "note", row: number | null = null): void {
     if (!this.cy) return;
     this.cy.elements().removeClass("faded").removeClass("highlight");
     this.draftSource = source.id();
     this.draftKind = kind;
+    this.draftRow = row;
     source.addClass("draft-source");
     this.cy.add([
       {
@@ -2140,10 +2208,56 @@ export class GraphView {
       },
     ]);
     this.handlers.onHint(
-      kind === "gemini"
-        ? "Click empty space to put the Gemini conversation there — Esc cancels"
-        : "Click a note to link to it, or empty space to create one — Esc cancels",
+      row !== null
+        ? "Click a note to point this line at it — typing (or Esc) leaves it without an arrow"
+        : kind === "gemini"
+          ? "Click empty space to put the Gemini conversation there — Esc cancels"
+          : "Click a note to link to it, or empty space to create one — Esc cancels",
     );
+  }
+
+  /**
+   * A checklist line offers to point at a note, the way a todo row used to. The arrow
+   * comes out of the issue's own icon — which is sitting just to the left of the open
+   * card — and follows the cursor until a note is clicked. Typing instead keeps the line
+   * arrowless, which is the same bargain as before: the offer costs nothing to refuse.
+   */
+  private proposeRowLink(row: number): void {
+    const open = this.issue;
+    const node = open ? this.cy?.getElementById(open.path) : null;
+    if (!open || !node || node.empty()) return;
+    this.clearDraft();
+    this.startDraft(node as NodeSingular, "note", row);
+  }
+
+  /**
+   * The aimed arrow landed on a note. The link is written into that line of the
+   * markdown, so from then on it is an ordinary link in an ordinary note — and the
+   * arrow on the canvas is the graph's own, counted in the note's backlinks like
+   * every other. It is drawn at once rather than at the next rebuild.
+   */
+  private finishRowLink(node: NodeSingular): void {
+    const row = this.draftRow;
+    const open = this.issue;
+    if (row === null || !open) return;
+    // A folder box or the issue itself: not a target. The arrow stays armed.
+    if (node.data("kind") !== "file" || node.id() === open.path) return;
+    const target = noteName(node.id());
+    this.clearDraft();
+    this.handlers.onHint(null);
+    this.editIssue((doc) => {
+      if (doc.rows[row]) doc.rows[row].target = target;
+    }, {});
+    this.commitLink(open.path, node.id());
+    this.renderIssue();
+    this.focusRow(row);
+  }
+
+  /** Drops the offer without touching the line. */
+  private cancelRowLink(): void {
+    if (this.draftRow === null) return;
+    this.clearDraft();
+    this.handlers.onHint(null);
   }
 
   private finishDraftOnNode(node: NodeSingular): void {
@@ -2178,6 +2292,7 @@ export class GraphView {
     this.cy.getElementById(DRAFT_NODE).remove();
     this.draftSource = null;
     this.draftKind = "note";
+    this.draftRow = null;
   }
 
   /**
@@ -2271,6 +2386,9 @@ export class GraphView {
       },
       position: this.freeSpot(parent, at),
     });
+    // Nothing links to it yet, but say so from the live graph rather than by assumption:
+    // this is the one place a size is set without an edge having been drawn.
+    this.resizeNode(path);
     this.handlers.onHint(null);
     this.drawOverlay();
   }
@@ -2336,7 +2454,7 @@ export class GraphView {
           label: newNode.label,
           parent: newNode.parent,
           kind: "file",
-          size: nodeSize(1),
+          size: nodeSize(0), // resized off the live graph the moment its edge is in
           ntype: newNode.type ?? "",
           ...(newNode.url ? { gurl: newNode.url } : {}),
         },
@@ -2347,7 +2465,28 @@ export class GraphView {
     if (this.cy.getElementById(id).empty()) {
       this.cy.add({ group: "edges", data: { id, source, target } });
     }
+    // Both ends have one more connection than they did a moment ago, and both have to
+    // say so now — see `resizeNode`.
+    this.resizeNode(source);
+    this.resizeNode(target);
     this.handlers.onHint(null);
+  }
+
+  /**
+   * Brings a node's size back in line with the links it actually has.
+   *
+   * The LIVE graph is the authority, never a guess made when the node was added. A
+   * provisional size only caught up at the next rebuild, and rebuilds are lazy — which
+   * is how two issues with one arrow apiece ended up drawn at two different sizes,
+   * depending on whether the graph had happened to be rebuilt since each was made.
+   */
+  private resizeNode(id: string): void {
+    const node = this.cy?.getElementById(id);
+    if (!node || node.empty() || node.data("kind") !== "file") return;
+    // Links either way, which is what `buildElements` counts too. The half-drawn draft
+    // edge is not one of them.
+    const links = node.connectedEdges().filter((edge) => edge.id() !== DRAFT_EDGE).length;
+    node.data("size", nodeSize(links));
   }
 }
 

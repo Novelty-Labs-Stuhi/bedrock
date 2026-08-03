@@ -12,7 +12,7 @@ const GESTURES: Row[] = [
   ["click a line", "describe that connection"],
   ["right-drag a note", "link it — drop on a note, or on space"],
   ["right-click a note", "link, rename, delete"],
-  ["right-click space", "new note, folder, sticky or todo"],
+  ["right-click space", "new note, folder, sticky or issue"],
   ["shift+drag", "draw a folder round some notes"],
   ["drag a note", "move it — push past a box edge to refile"],
   ["drag a box corner", "resize the folder"],
