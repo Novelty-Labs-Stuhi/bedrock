@@ -5,12 +5,18 @@
 
 import type { Vault } from "./vault";
 
-export type Feature = "stickies" | "todos" | "git" | "gemini";
+export type Feature = "stickies" | "todos" | "git" | "gemini" | "active";
 
 export const CONFIG_FILE = ".notes/config.json";
 
 /** Stickies default on — they predate the switch, so an old vault keeps what it had. */
-const DEFAULTS: Record<Feature, boolean> = { stickies: true, todos: false, git: false, gemini: false };
+const DEFAULTS: Record<Feature, boolean> = {
+  stickies: true,
+  todos: false,
+  git: false,
+  gemini: false,
+  active: false,
+};
 
 const WRITE_DELAY = 700;
 
@@ -85,6 +91,7 @@ const ROWS: Array<{ feature: Feature; name: string; what: string }> = [
   { feature: "todos", name: "Todos", what: "checklist stickies that can point an arrow at a note" },
   { feature: "git", name: "Git", what: "a commit button that snapshots the vault (desktop app)" },
   { feature: "gemini", name: "Gemini", what: "conversation notes — rectangles that open the chat in the browser" },
+  { feature: "active", name: "Active", what: "right-click a note to make it radiate a green pulse" },
 ];
 
 /**

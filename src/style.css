@@ -651,12 +651,18 @@ button.twisty:hover {
 }
 
 .editor {
-  width: 100%;
+  position: absolute;
+  inset: 0;
+}
+
+/*
+ * The editor is monospaced on purpose, live preview and all. Revealing the block under the
+ * caret shows characters that were hidden a moment ago, and in a monospaced column that only
+ * shifts the line sideways — in a proportional one every glyph changes width and the whole
+ * paragraph re-wraps under the cursor. Headings still grow; nothing else changes shape.
+ */
+.cm-editor {
   height: 100%;
-  padding: 28px max(28px, calc(50% - 380px));
-  border: 0;
-  outline: none;
-  resize: none;
   background: var(--bg);
   color: var(--text);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -664,82 +670,105 @@ button.twisty:hover {
   line-height: 1.7;
 }
 
-.preview {
-  height: 100%;
+.cm-editor.cm-focused {
+  outline: none;
+}
+
+.cm-editor .cm-scroller {
+  font-family: inherit;
+  line-height: inherit;
   overflow: auto;
+}
+
+.cm-editor .cm-content {
   padding: 28px max(28px, calc(50% - 380px));
-  line-height: 1.7;
+  caret-color: var(--text);
 }
 
-.preview h1,
-.preview h2,
-.preview h3 {
-  line-height: 1.3;
-}
-
-.preview code {
-  background: #2b2c2f;
-  padding: 1px 4px;
-  border-radius: 3px;
-  font-size: 12.5px;
-}
-
-.preview pre {
-  background: #2b2c2f;
-  padding: 10px 12px;
-  border-radius: 5px;
-  overflow-x: auto;
-}
-
-.preview pre code {
-  background: none;
+.cm-editor .cm-line {
   padding: 0;
 }
 
-.preview mark {
+.cm-editor .cm-placeholder {
+  color: var(--muted);
+}
+
+/* ---- what the live layer renders ---- */
+
+/* Headings keep the column's rhythm; only the size and the weight change. */
+.cm-hd {
+  font-weight: 650;
+  line-height: 1.3;
+}
+
+.cm-h1 {
+  font-size: 1.9em;
+}
+
+.cm-h2 {
+  font-size: 1.5em;
+}
+
+.cm-h3 {
+  font-size: 1.25em;
+}
+
+.cm-h4,
+.cm-h5,
+.cm-h6 {
+  font-size: 1.05em;
+}
+
+.cm-strong {
+  font-weight: 700;
+}
+
+.cm-em {
+  font-style: italic;
+}
+
+.cm-del {
+  color: var(--muted);
+  text-decoration: line-through;
+}
+
+.cm-mark {
   background: rgb(249 36 17 / 28%);
-  color: var(--text);
-  padding: 0 2px;
   border-radius: 2px;
 }
 
-.preview del {
-  color: var(--muted);
+.cm-code {
+  background: #2b2c2f;
+  border-radius: 3px;
+  padding: 1px 3px;
 }
 
-.preview blockquote {
-  margin: 0;
-  padding-left: 12px;
-  border-left: 3px solid var(--line);
-  color: var(--muted);
-}
-
-.preview a {
-  color: #7cb0ff;
-}
-
-/* The name of a connection, as written before the link: `built with:: [[Target]]`. */
-.preview .rel {
-  color: var(--muted);
-  font-size: 12.5px;
-}
-
-.preview .rel::after {
-  content: " →";
-  opacity: 0.6;
+/* Wikilinks stay literal — brackets and all. This only says that they lead somewhere,
+   and ⌘-click is what follows one. */
+.cm-wikilink-raw {
+  color: var(--accent);
 }
 
 /* Attachments: an embed never overflows the column, and a broken one says so. */
-.preview img.embed {
-  display: block;
+.cm-embed img {
   max-width: 100%;
   height: auto;
-  margin: 12px 0;
   border-radius: 5px;
   background: #2b2c2f;
 }
 
-.preview .embed-missing {
+.cm-embed-alone {
+  display: block;
+  margin: 6px 0;
+}
+
+/* Something has to hold the line open while the bytes are being read, or the note jumps. */
+.cm-embed-waiting {
+  display: inline-block;
+  min-height: 1.7em;
+}
+
+.embed-missing {
   display: inline-block;
   padding: 6px 10px;
   border: 1px dashed var(--line);
@@ -749,21 +778,9 @@ button.twisty:hover {
 }
 
 /* Drop an image anywhere on the note to attach it. */
-.editor.drop-target,
-.preview.drop-target {
+.page.drop-target {
   outline: 2px dashed var(--accent);
   outline-offset: -6px;
-}
-
-.preview a.wikilink {
-  color: var(--accent);
-  cursor: pointer;
-  text-decoration: none;
-  border-bottom: 1px solid rgba(249, 36, 17, 0.4);
-}
-
-.preview a.wikilink:hover {
-  border-bottom-color: var(--accent);
 }
 
 #status {
@@ -1085,12 +1102,22 @@ button.twisty:hover {
   opacity: 1;
 }
 
-/* Folded: the little yellow square. The number is how many tasks are still open. */
+/* Folded: the little yellow square, wearing `done/total`; green with a check
+   once every task is ticked. */
 .sticky.todo.folded {
   padding: 0;
   border-color: #b3922f;
   background: #e6c34a;
   cursor: pointer;
+}
+
+.sticky.todo.folded.done {
+  border-color: #2f7d3c;
+  background: #3fb950;
+}
+
+.sticky.todo.folded.done .todo-face {
+  color: #10301b;
 }
 
 .todo-face {
@@ -1128,6 +1155,56 @@ button.twisty:hover {
 .todo-arrow.proposal {
   stroke-dasharray: 5 4;
   opacity: 0.8;
+}
+
+/* An active note radiates: a faint green halo on its rim at all times, and one ring
+   travelling out of it every three seconds. The halo is what says "active" when the
+   canvas is glanced at between beats; the ring is what catches the eye across the room.
+   Both sit in the overlay, so the pulse keeps time without the canvas redrawing. */
+.node-pulse {
+  position: absolute;
+  width: 20px;
+  height: 20px;
+  border: 1.5px solid rgba(63, 185, 80, 0.5);
+  border-radius: 50%;
+  box-shadow: 0 0 8px rgba(63, 185, 80, 0.3);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+
+.node-pulse::after {
+  content: "";
+  position: absolute;
+  inset: -1.5px;
+  border: 2px solid #3fb950;
+  border-radius: 50%;
+  /* Inherited, not declared: `drawPulses` sets the delay on the element itself so
+     every ring on the canvas beats on the same clock. */
+  animation: node-pulse 3s cubic-bezier(0.2, 0.65, 0.35, 1) infinite;
+  animation-delay: inherit;
+}
+
+/* Out and gone by 60%, then nothing for the rest of the cycle — the quiet gap is
+   what keeps a radiating note from reading as a warning light. */
+@keyframes node-pulse {
+  0% {
+    transform: scale(1);
+    opacity: 0.7;
+  }
+  60% {
+    transform: scale(2.9);
+    opacity: 0;
+  }
+  100% {
+    transform: scale(2.9);
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .node-pulse::after {
+    animation: none;
+  }
 }
 
 /* Corner grips: nothing is drawn, the cursor is the only sign they are there. */

@@ -1,14 +1,19 @@
 // The format bar: a strip of buttons that appears over whatever text is selected, plus the
 // keyboard shortcuts and the typing behaviour that make it unnecessary once you know them.
 //
-// Two things here are less obvious than they look:
-//
-//   - A textarea has no selection RECTANGLE, only character offsets. The position comes from
-//     a throwaway mirror div wearing the textarea's own metrics — see `caretRect`.
-//   - Every edit goes through `execCommand("insertText")`. It is deprecated, and it is still
-//     the only way to change a textarea without wiping the browser's undo stack; assigning
-//     to `.value` would make ⌘Z jump back past everything you had typed.
+// Every action is a pure function in `format.ts` returning a `Patch`; all this file does is
+// read the selection, apply the patch as a transaction, and put the bar somewhere sensible.
+// The editor's own history takes care of undo — one patch is one step.
 
+import { Prec, type Extension } from "@codemirror/state";
+import {
+  EditorView,
+  ViewPlugin,
+  keymap,
+  type Command,
+  type KeyBinding,
+  type ViewUpdate,
+} from "@codemirror/view";
 import * as md from "./format";
 import type { Patch } from "./format";
 
@@ -51,249 +56,182 @@ const GROUPS: Action[][] = [
   [{ label: "✕", title: "Clear formatting", run: md.clear }],
 ];
 
-/** Everything the mirror has to wear for its text to wrap exactly as the textarea's does. */
-const MIRRORED = [
-  "boxSizing",
-  "fontFamily",
-  "fontSize",
-  "fontWeight",
-  "fontStyle",
-  "fontVariant",
-  "letterSpacing",
-  "lineHeight",
-  "textIndent",
-  "textTransform",
-  "wordSpacing",
-  "tabSize",
-  "paddingTop",
-  "paddingRight",
-  "paddingBottom",
-  "paddingLeft",
-  "borderTopWidth",
-  "borderRightWidth",
-  "borderBottomWidth",
-  "borderLeftWidth",
-] as const;
-
-type Anchor = { top: number; left: number; width: number; height: number };
-
-/**
- * Where the selection actually sits on screen. A copy of the textarea's text is laid out in
- * a hidden div with the same font, padding and width, with the selected run in a span — the
- * span's box, less the textarea's scroll, is the answer. It reads the selection start, so a
- * selection dragged over ten lines still anchors to its first one.
- */
-function caretRect(ta: HTMLTextAreaElement): Anchor | null {
-  const cs = getComputedStyle(ta);
-  const mirror = document.createElement("div");
-  for (const prop of MIRRORED) mirror.style[prop] = cs[prop];
-  mirror.style.position = "absolute";
-  mirror.style.top = "0";
-  mirror.style.left = "-9999px";
-  mirror.style.width = `${ta.clientWidth}px`;
-  mirror.style.height = "auto";
-  mirror.style.visibility = "hidden";
-  mirror.style.whiteSpace = "pre-wrap";
-  mirror.style.overflowWrap = "break-word";
-  mirror.textContent = ta.value.slice(0, ta.selectionStart);
-
-  const run = document.createElement("span");
-  // An empty span has no box to measure; a stop stands in for one while it is being placed.
-  run.textContent = ta.value.slice(ta.selectionStart, ta.selectionEnd) || ".";
-  mirror.appendChild(run);
-  document.body.appendChild(mirror);
-  const top = run.offsetTop;
-  const left = run.offsetLeft;
-  const width = run.offsetWidth;
-  mirror.remove();
-
-  const box = ta.getBoundingClientRect();
-  const line = parseFloat(cs.lineHeight) || parseFloat(cs.fontSize) * 1.5;
-  return {
-    top: box.top + top - ta.scrollTop,
-    left: box.left + left - ta.scrollLeft,
-    // A run spanning lines has no meaningful width to centre on; only a single line does.
-    width: ta.value.slice(ta.selectionStart, ta.selectionEnd).includes("\n") ? 0 : width,
-    height: line,
-  };
+/** Writes a patch and leaves the selection where the patch asked for it. */
+export function applyPatch(view: EditorView, patch: Patch): void {
+  view.dispatch({
+    changes: { from: patch.from, to: patch.to, insert: patch.insert },
+    selection: { anchor: patch.select[0], head: patch.select[1] },
+    scrollIntoView: true,
+  });
+  view.focus();
 }
 
-/** Mounts the bar and takes over the editing keys for the given editors. */
-export function mountToolbar(editors: HTMLTextAreaElement[]): void {
-  const bar = document.createElement("div");
-  bar.className = "format-bar hidden";
+/* -------------------------------------------------------------- the bar --- */
+
+/** One bar for the whole app; both panes borrow it. Built on the first editor mounted. */
+let bar: HTMLElement | null = null;
+/** The editor the bar is currently attached to — also the editor its buttons act on. */
+let host: EditorView | null = null;
+
+function hide(): void {
+  host = null;
+  bar?.classList.add("hidden");
+}
+
+function barElement(): HTMLElement {
+  if (bar) return bar;
+  const el = document.createElement("div");
+  el.className = "format-bar hidden";
   for (const group of GROUPS) {
-    if (bar.childElementCount) bar.appendChild(document.createElement("i"));
+    if (el.childElementCount) el.appendChild(document.createElement("i"));
     for (const action of group) {
       const button = document.createElement("button");
       button.type = "button";
       button.textContent = action.label;
       button.title = action.title;
       if (action.cls) button.className = action.cls;
-      button.addEventListener("click", () => run(action));
-      bar.appendChild(button);
+      button.addEventListener("click", () => {
+        // `host` is still set and still focused: the bar's own mousedown is prevented below.
+        if (!host) return;
+        const { from, to } = host.state.selection.main;
+        const patch = action.run(host.state.doc.toString(), from, to);
+        if (patch) applyPatch(host, patch);
+      });
+      el.appendChild(button);
     }
   }
-  // The whole bar, not just the buttons: a mousedown that reaches the document blurs the
-  // textarea, and a blurred textarea has no selection left to format.
-  bar.addEventListener("mousedown", (event) => event.preventDefault());
-  document.body.appendChild(bar);
-
-  /** The editor the bar is currently attached to, if any. */
-  let host: HTMLTextAreaElement | null = null;
-  /** True while an edit is being written, so our own input events are not read as typing. */
-  let applying = false;
-
-  const hide = (): void => {
-    host = null;
-    bar.classList.add("hidden");
-  };
-
-  function place(ta: HTMLTextAreaElement): void {
-    const at = caretRect(ta);
-    const box = ta.getBoundingClientRect();
-    // Scrolled out of the editor's own window: there is nothing to point at.
-    if (!at || at.top < box.top - at.height || at.top > box.bottom) return hide();
-
-    bar.classList.remove("hidden");
-    const width = bar.offsetWidth;
-    const height = bar.offsetHeight;
-    let top = at.top - height - 8;
-    if (top < 4) top = at.top + at.height + 8; // no room above — sit under the line instead
-    // Held inside the editor's own box rather than the window's: a selection near the left
-    // margin would otherwise push the bar out over the sidebar.
-    const left = Math.min(
-      Math.max(at.left + at.width / 2 - width / 2, Math.max(box.left + 4, 8)),
-      Math.max(box.right - width - 4, 8),
-    );
-    bar.style.top = `${Math.round(top)}px`;
-    bar.style.left = `${Math.round(left)}px`;
-  }
-
-  /**
-   * Writes a patch through the browser's own editing command, so the change joins the undo
-   * stack instead of replacing it. The selection the patch asks for is restored afterwards —
-   * that is what lets B then I be pressed one after the other without reselecting.
-   */
-  function applyPatch(ta: HTMLTextAreaElement, patch: Patch): void {
-    ta.focus();
-    ta.setSelectionRange(patch.from, patch.to);
-    applying = true;
-    let done = false;
-    try {
-      if (patch.insert === "") done = patch.from === patch.to || document.execCommand("delete");
-      else done = document.execCommand("insertText", false, patch.insert);
-    } finally {
-      applying = false;
-    }
-    if (!done) {
-      // No execCommand: the edit still has to land, undo stack or not.
-      ta.setRangeText(patch.insert, patch.from, patch.to, "end");
-      ta.dispatchEvent(new Event("input", { bubbles: true }));
-    }
-    ta.setSelectionRange(patch.select[0], patch.select[1]);
-  }
-
-  function run(action: Action): void {
-    // Resolved at click time, not from what the last measurement happened to leave behind:
-    // the bar's mousedown is prevented, so the editor still holds focus when this fires.
-    const active = document.activeElement;
-    const ta = active instanceof HTMLTextAreaElement && editors.includes(active) ? active : host;
-    if (!ta) return;
-    const patch = action.run(ta.value, ta.selectionStart, ta.selectionEnd);
-    if (patch) applyPatch(ta, patch);
-  }
-
-  /** The shortcut for a key combination, or null when the key is not one of ours. */
-  function shortcut(event: KeyboardEvent): Action["run"] | null {
-    if (!(event.metaKey || event.ctrlKey) || event.altKey) return null;
-    switch (event.key.toLowerCase()) {
-      case "b":
-        return bold;
-      case "i":
-        return italic;
-      case "e":
-        return md.code;
-      case "k":
-        return event.shiftKey ? md.link : md.wikilink;
-      default:
-        return null;
-    }
-  }
-
-  function onKeyDown(ta: HTMLTextAreaElement, event: KeyboardEvent): void {
-    const plain = !event.metaKey && !event.ctrlKey && !event.altKey;
-
-    if (event.key === "Enter" && plain && !event.shiftKey && ta.selectionStart === ta.selectionEnd) {
-      const patch = md.continueLine(ta.value, ta.selectionStart);
-      if (!patch) return;
-      event.preventDefault();
-      applyPatch(ta, patch);
-      return;
-    }
-
-    if (event.key === "Tab" && plain) {
-      const patch = md.indent(ta.value, ta.selectionStart, ta.selectionEnd, event.shiftKey);
-      if (!patch) return; // not a list and not a block — let Tab move focus, as it should
-      event.preventDefault();
-      applyPatch(ta, patch);
-      return;
-    }
-
-    const action = shortcut(event);
-    if (!action) return;
-    event.preventDefault();
-    const patch = action(ta.value, ta.selectionStart, ta.selectionEnd);
-    if (patch) applyPatch(ta, patch);
-  }
-
-  /**
-   * Typing `*` or `[` with text selected wraps it rather than replacing it. Read from
-   * `beforeinput` rather than a keypress so it follows the keyboard layout, whatever it is.
-   */
-  function onBeforeInput(ta: HTMLTextAreaElement, event: InputEvent): void {
-    if (applying || event.inputType !== "insertText" || event.data?.length !== 1) return;
-    const patch = md.typedWrap(ta.value, ta.selectionStart, ta.selectionEnd, event.data);
-    if (!patch) return;
-    event.preventDefault();
-    applyPatch(ta, patch);
-  }
-
-  for (const ta of editors) {
-    ta.addEventListener("keydown", (event) => onKeyDown(ta, event));
-    ta.addEventListener("beforeinput", (event) => onBeforeInput(ta, event as InputEvent));
-    ta.addEventListener("scroll", () => {
-      if (host === ta) place(ta);
-    });
-    // Clicking the bar cannot blur it (mousedown is prevented above), so any blur that does
-    // arrive is somebody leaving the editor — a tab, the tree, the Read button.
-    ta.addEventListener("blur", hide);
-  }
-
-  /**
-   * One signal for every way a selection can change — dragging, shift+arrows, ⌘A, and the
-   * reselect each edit does — collapsed to one measurement per frame.
-   */
-  let queued = false;
-  document.addEventListener("selectionchange", () => {
-    if (queued) return;
-    queued = true;
-    requestAnimationFrame(() => {
-      queued = false;
-      const active = document.activeElement;
-      if (
-        !(active instanceof HTMLTextAreaElement) ||
-        !editors.includes(active) ||
-        active.selectionStart === active.selectionEnd
-      ) {
-        return hide();
-      }
-      host = active;
-      place(active);
-    });
-  });
-
+  // The whole bar, not just the buttons: a mousedown reaching the document blurs the editor,
+  // and a blurred editor has no selection left to format.
+  el.addEventListener("mousedown", (event) => event.preventDefault());
+  document.body.appendChild(el);
   window.addEventListener("resize", () => {
     if (host) place(host);
   });
+  bar = el;
+  return el;
+}
+
+function place(view: EditorView): void {
+  const el = barElement();
+  const { from, to } = view.state.selection.main;
+  const start = view.coordsAtPos(from);
+  if (!start) return hide();
+
+  const box = view.dom.getBoundingClientRect();
+  const line = start.bottom - start.top;
+  // Scrolled out of the editor's own window: there is nothing left to point at.
+  if (start.top < box.top - line || start.top > box.bottom) return hide();
+
+  el.classList.remove("hidden");
+  const width = el.offsetWidth;
+  let top = start.top - el.offsetHeight - 8;
+  if (top < 4) top = start.top + line + 8; // no room above — sit under the line instead
+
+  // A run spanning lines has no width worth centring on; a single-line one does.
+  const end = view.coordsAtPos(to);
+  const span = end && Math.abs(end.top - start.top) < 1 ? end.right - start.left : 0;
+  // Held inside the editor's own box rather than the window's: a selection near the left
+  // margin would otherwise push the bar out over the sidebar.
+  const left = Math.min(
+    Math.max(start.left + span / 2 - width / 2, Math.max(box.left + 4, 8)),
+    Math.max(box.right - width - 4, 8),
+  );
+  el.style.top = `${Math.round(top)}px`;
+  el.style.left = `${Math.round(left)}px`;
+}
+
+/**
+ * One signal for every way a selection can change — dragging, shift+arrows, ⌘A, and the
+ * reselect each edit does. The measurement waits a frame because selecting text reveals its
+ * block, and a revealed block reflows: measuring first would anchor the bar to the old layout.
+ */
+const barPlugin = ViewPlugin.define((view: EditorView) => {
+  const onScroll = (): void => {
+    if (host === view) place(view);
+  };
+  view.scrollDOM.addEventListener("scroll", onScroll);
+
+  return {
+    update(update: ViewUpdate): void {
+      const moved =
+        update.selectionSet || update.docChanged || update.focusChanged || update.geometryChanged;
+      if (!moved) return;
+      if (!update.view.hasFocus || update.view.state.selection.main.empty) {
+        if (host === update.view) hide();
+        return;
+      }
+      host = update.view;
+      requestAnimationFrame(() => {
+        if (host === update.view) place(update.view);
+      });
+    },
+    destroy(): void {
+      view.scrollDOM.removeEventListener("scroll", onScroll);
+      if (host === view) hide();
+    },
+  };
+});
+
+/* ------------------------------------------------------------ the keys --- */
+
+/** An action bound to a key: applied if it means something here, passed on if it does not. */
+const patcher =
+  (action: Action["run"]): Command =>
+  (view) => {
+    const { from, to } = view.state.selection.main;
+    const patch = action(view.state.doc.toString(), from, to);
+    if (!patch) return false;
+    applyPatch(view, patch);
+    return true;
+  };
+
+/** Enter continues a list or a quote. With text selected it is an ordinary Enter. */
+const onEnter: Command = (view) => {
+  const { from, to } = view.state.selection.main;
+  if (from !== to) return false;
+  const patch = md.continueLine(view.state.doc.toString(), from);
+  if (!patch) return false;
+  applyPatch(view, patch);
+  return true;
+};
+
+/** Tab indents list items. Anywhere else it falls through, so Tab still moves focus. */
+const onTab = (out: boolean): Command => (view) => {
+  const { from, to } = view.state.selection.main;
+  const patch = md.indent(view.state.doc.toString(), from, to, out);
+  if (!patch) return false;
+  applyPatch(view, patch);
+  return true;
+};
+
+const KEYS: KeyBinding[] = [
+  { key: "Mod-b", run: patcher(bold) },
+  { key: "Mod-i", run: patcher(italic) },
+  { key: "Mod-e", run: patcher(md.code) },
+  { key: "Mod-k", run: patcher(md.wikilink) },
+  { key: "Mod-Shift-k", run: patcher(md.link) },
+  { key: "Enter", run: onEnter },
+  { key: "Tab", run: onTab(false) },
+  { key: "Shift-Tab", run: onTab(true) },
+];
+
+/**
+ * Typing `*` or `[` with text selected wraps it rather than replacing it. Read from the input
+ * handler rather than a keypress so it follows the keyboard layout, whatever it is.
+ */
+const onType = (view: EditorView, from: number, to: number, text: string): boolean => {
+  if (text.length !== 1) return false;
+  const patch = md.typedWrap(view.state.doc.toString(), from, to, text);
+  if (!patch) return false;
+  applyPatch(view, patch);
+  return true;
+};
+
+/**
+ * The bar, the shortcuts and the typing behaviour, as one extension. High precedence so Enter
+ * and Tab reach these before the editor's default bindings get them.
+ */
+export function formatting(): Extension {
+  barElement();
+  return [Prec.high(keymap.of(KEYS)), Prec.high(EditorView.inputHandler.of(onType)), barPlugin];
 }

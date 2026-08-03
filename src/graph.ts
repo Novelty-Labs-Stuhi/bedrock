@@ -19,7 +19,7 @@ import {
 import { edgeNotePath, edgeTitle, isEdgeNote } from "./edges";
 import { inlineEdit, type InlineEditor } from "./inline";
 import { layoutGraph } from "./apply-layout";
-import { LinkResolver, parseLinks, parseTags, parseType } from "./links";
+import { LinkResolver, parseActive, parseLinks, parseTags, parseType } from "./links";
 import { ancestors, basename, dirname, noteName } from "./vault";
 import type { SettingsStore } from "./settings";
 import type { SpatialStore } from "./spatial";
@@ -93,16 +93,56 @@ export const nodeSize = (incoming: number): number =>
   Math.min(NODE_MAX, Math.round(NODE_MIN + 16 * Math.sqrt(incoming)));
 
 /**
- * Shapes by note TYPE — the `type:: …` line a file ends with. Untyped notes are
- * circles; a typed one wears its type as a shape, so what a node IS reads at a
- * glance. New types slot in here and get their selector generated below.
+ * The Gemini app icon, drawn inline: a white rounded tile with the four-point
+ * sparkle, red at the top fading through yellow and green into blue — an image,
+ * because cytoscape cannot gradient-fill a node on its own.
  */
-const TYPE_SHAPES = { gemini: "round-rectangle" } as const;
+const GEMINI_ICON =
+  "data:image/svg+xml;utf8," +
+  encodeURIComponent(
+    // The explicit size matters twice over: without one the browser falls back to
+    // 300x150, which `cover` then crops off-centre and re-crops at every zoom; and
+    // it is the raster resolution, so 256 keeps the icon crisp zoomed well in.
+    `<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 64 64">` +
+      `<defs>` +
+      `<radialGradient id="r" cx="32" cy="5" r="36" gradientUnits="userSpaceOnUse">` +
+      `<stop offset="0" stop-color="#ff4641"/><stop offset="1" stop-color="#ff4641" stop-opacity="0"/></radialGradient>` +
+      `<radialGradient id="y" cx="5" cy="32" r="36" gradientUnits="userSpaceOnUse">` +
+      `<stop offset="0" stop-color="#ffc300"/><stop offset="1" stop-color="#ffc300" stop-opacity="0"/></radialGradient>` +
+      `<radialGradient id="g" cx="32" cy="59" r="36" gradientUnits="userSpaceOnUse">` +
+      `<stop offset="0" stop-color="#00a94f"/><stop offset="1" stop-color="#00a94f" stop-opacity="0"/></radialGradient>` +
+      `<clipPath id="s"><path d="M32 6 C34.6 20.5 43.5 29.4 58 32 C43.5 34.6 34.6 43.5 32 58 C29.4 43.5 20.5 34.6 6 32 C20.5 29.4 29.4 20.5 32 6 Z"/></clipPath>` +
+      `</defs>` +
+      `<rect width="64" height="64" rx="14" fill="#ffffff"/>` +
+      `<g clip-path="url(#s)">` +
+      `<rect width="64" height="64" fill="#3086ff"/>` +
+      `<rect width="64" height="64" fill="url(#r)"/>` +
+      `<rect width="64" height="64" fill="url(#y)"/>` +
+      `<rect width="64" height="64" fill="url(#g)"/>` +
+      `</g>` +
+      `</svg>`,
+  );
+
+/**
+ * Styles by note TYPE — the `type:: …` line a file ends with. Untyped notes are
+ * tag-pie circles; a typed one wears its type on its sleeve — a Gemini
+ * conversation IS the Gemini app icon. New types slot in here and get their
+ * selector generated below.
+ */
+const TYPE_STYLES: Record<string, Record<string, unknown>> = {
+  gemini: {
+    shape: "round-rectangle",
+    "background-image": GEMINI_ICON,
+    "background-fit": "cover",
+    "background-opacity": 0,
+    "pie-size": "0%",
+  },
+};
 
 const typeShapeStyles = (): cytoscape.StylesheetJson =>
-  Object.entries(TYPE_SHAPES).map(([type, shape]) => ({
+  Object.entries(TYPE_STYLES).map(([type, style]) => ({
     selector: `node[ntype = "${type}"]`,
-    style: { shape },
+    style,
   })) as unknown as cytoscape.StylesheetJson;
 
 /** First web link in a conversation note — what a click on its node opens. */
@@ -130,7 +170,7 @@ const STYLE: cytoscape.StylesheetJson = [
     selector: 'node[kind = "file"]',
     style: { width: "data(size)", height: "data(size)", ...pieStyle() },
   },
-  // Typed notes wear their type as a shape — a Gemini conversation is a rectangle.
+  // Typed notes wear their type — a Gemini conversation is the Gemini icon.
   ...typeShapeStyles(),
   {
     selector: "node:parent",
@@ -285,6 +325,15 @@ const arrowLine = (
   `<line x1="${from.x}" y1="${from.y}" x2="${to.x}" y2="${to.y}" class="${cls}" ` +
   `marker-end="url(#${marker})" />`;
 
+/* ------------------------------------------------------------------ active --- */
+
+/**
+ * How long one pulse takes, start to start. A note that radiates is saying "this is
+ * live", not asking to be looked at, so the beat is slow on purpose — the ring is gone
+ * for most of the cycle, and a canvas with a dozen active notes still reads as a canvas.
+ */
+const PULSE_MS = 3000;
+
 const clientPoint = (event: cytoscape.EventObject): { x: number; y: number } => {
   const original = event.originalEvent as MouseEvent | undefined;
   return { x: original?.clientX ?? 0, y: original?.clientY ?? 0 };
@@ -404,6 +453,9 @@ export function buildElements(docs: Doc[], described: ReadonlySet<string> = new 
         size: nodeSize(incoming.get(doc.path) ?? 0),
         // Always present (empty for untyped), so a removed type line clears on sync.
         ntype: type ?? "",
+        // Likewise always present: `sync` patches the keys a definition carries, so a
+        // 0 is what stops a note that has just been quietened from pulsing forever.
+        radiating: parseActive(doc.text) ? 1 : 0,
         // A conversation node opens its link directly, so the URL rides on the node —
         // a click must not wait on a file read (popup blockers honour only the click).
         ...(type === "gemini" ? { gurl: URL_RE.exec(doc.text)?.[0] ?? "" } : {}),
@@ -520,10 +572,14 @@ export class GraphView {
   private lasso: HTMLElement | null = null;
   /** Sticky id -> its element in the overlay. */
   private stickyEls = new Map<string, HTMLElement>();
+  /** Note path -> the ring that pulses over it, for the notes marked active. */
+  private pulseEls = new Map<string, HTMLElement>();
   /** The SVG sheet the todo arrows are drawn on, under the sticky cards. */
   private arrowLayer: SVGSVGElement;
   /** Todo waiting for its arrow: click a note to connect it, typing skips. */
   private pendingTodo: string | null = null;
+  /** Which of its rows the arrow will belong to — the one just added. */
+  private pendingRow = 0;
   /** Where the proposed arrow's tip currently is, in rendered coordinates. */
   private proposalAt: { x: number; y: number } | null = null;
   /**
@@ -597,6 +653,8 @@ export class GraphView {
     this.handles.clear();
     for (const el of this.stickyEls.values()) el.remove();
     this.stickyEls.clear();
+    for (const el of this.pulseEls.values()) el.remove();
+    this.pulseEls.clear();
     this.pendingTodo = null;
     this.proposalAt = null;
     this.arrowLayer.innerHTML = ARROW_DEFS;
@@ -1089,6 +1147,7 @@ export class GraphView {
 
     cy.on("drag", "node", (event) => {
       this.drawArrows(); // a todo may be pointing at the node being dragged
+      this.drawPulses(); // and its own ring has to stay under the cursor with it
       if (!this.drag) return;
       const node = event.target as NodeSingular;
       if (node.id() !== this.drag.path) return;
@@ -1369,11 +1428,76 @@ export class GraphView {
     this.drawHandles();
     this.placeStickies();
     this.drawArrows();
+    this.drawPulses();
   }
 
   /** Re-applies the feature toggles to everything drawn above the canvas. */
   refreshOverlay(): void {
     this.drawOverlay();
+  }
+
+  /* ------------------------------------------------------------------ active --- */
+
+  /**
+   * The notes marked `active:: true` radiate: one green ring out of a note's rim every
+   * PULSE_MS. Cytoscape has no notion of a repeating animation, so the ring is a DOM
+   * element in the overlay and CSS runs it — which keeps the beat going while the canvas
+   * sits idle, and costs nothing at all on a vault with no active notes.
+   */
+  private drawPulses(): void {
+    const cy = this.cy;
+    if (!cy) return;
+    const alive = new Set<string>();
+    // A switched-off integration leaves nothing on the canvas; the marks stay in the
+    // notes, so switching it back on brings every ring back.
+    if (this.settings.enabled("active")) {
+      cy.nodes().forEach((node) => {
+        const dot = node as NodeSingular;
+        if (dot.data("kind") !== "file" || !dot.data("radiating")) return;
+        alive.add(dot.id());
+        let el = this.pulseEls.get(dot.id());
+        if (!el) {
+          el = document.createElement("div");
+          el.className = "node-pulse";
+          // Every ring on the canvas beats together: a negative delay lines each one up
+          // with the same clock, so a note marked active now falls in with the others
+          // instead of pulsing on its own offbeat.
+          el.style.animationDelay = `${-(performance.now() % PULSE_MS) / 1000}s`;
+          this.overlay.appendChild(el);
+          this.pulseEls.set(dot.id(), el);
+        }
+        // Rendered units: the ring rides the zoom with the note it belongs to.
+        const at = dot.renderedPosition();
+        const size = dot.renderedWidth() + 4;
+        el.style.left = `${at.x}px`;
+        el.style.top = `${at.y}px`;
+        el.style.width = `${size}px`;
+        el.style.height = `${size}px`;
+      });
+    }
+    for (const [id, el] of this.pulseEls) {
+      if (alive.has(id)) continue;
+      el.remove();
+      this.pulseEls.delete(id);
+    }
+  }
+
+  /** Whether a note is radiating, as the live graph has it — what the menu offers to flip. */
+  isRadiating(path: string): boolean {
+    const node = this.cy?.getElementById(path);
+    return !!(node && node.nonempty() && node.data("radiating"));
+  }
+
+  /**
+   * Starts or stops a note radiating on the live graph, so the ring answers the
+   * right-click that asked for it rather than waiting for the next rebuild. The mark
+   * itself is a line in the note's markdown — `setActive` in `links.ts`.
+   */
+  setRadiating(path: string, on: boolean): void {
+    const node = this.cy?.getElementById(path);
+    if (!node || node.empty()) return;
+    node.data("radiating", on ? 1 : 0);
+    this.drawPulses();
   }
 
   /* --------------------------------------------------------------- stickies --- */
@@ -1511,7 +1635,7 @@ export class GraphView {
   addTodo(at: cytoscape.Position): void {
     const sticky = this.stickies.add(at, "todo");
     this.placeStickies();
-    this.proposeTodoLink(sticky.id);
+    this.proposeTodoLink(sticky.id, 0);
     this.focusRow(this.stickyEls.get(sticky.id), 0);
   }
 
@@ -1551,7 +1675,7 @@ export class GraphView {
         const held = this.heldSticky(sticky.id);
         if (!held || held.folded) return;
         const doc = parseTodo(held.text);
-        if (doc.targets.length || doc.items.some((item) => item.text.trim())) return;
+        if (doc.targets.length || doc.items.some((item) => item.text.trim() || item.target)) return;
         this.stickies.remove(sticky.id);
         this.placeStickies();
         this.drawArrows();
@@ -1574,8 +1698,10 @@ export class GraphView {
     el.classList.toggle("done", allDone(doc));
 
     if (held.folded) {
-      const open = doc.items.filter((item) => !item.done).length;
-      el.innerHTML = `<div class="todo-face" title="Open this todo">${open || "✓"}</div>`;
+      // Yellow and counting (`2/3`) while work remains; green with a check when done.
+      const ticked = doc.items.filter((item) => item.done).length;
+      const face = allDone(doc) ? "✓" : `${ticked}/${doc.items.length}`;
+      el.innerHTML = `<div class="todo-face" title="Open this todo">${face}</div>`;
       return;
     }
 
@@ -1616,7 +1742,7 @@ export class GraphView {
         const next = this.readTodo(el, id);
         this.stickies.update(id, { text: serializeTodo(next) });
         el.classList.toggle("done", allDone(next));
-        this.drawArrows(); // ticking the last box is what turns the arrow green
+        this.drawArrows(); // ticking a box is what turns its own arrow green
       });
 
       text.addEventListener("input", () => {
@@ -1634,9 +1760,9 @@ export class GraphView {
           this.stickies.update(id, { text: serializeTodo(next) });
           this.renderTodo(el, id);
           this.focusRow(el, index + 1);
-          // Every fresh line re-opens the offer: click a note to add another arrow,
-          // keep typing to skip — the same bargain as when the todo was created.
-          this.proposeTodoLink(id);
+          // Every fresh line re-opens the offer: click a note to give THIS line an
+          // arrow, keep typing to skip — the same bargain as when the todo was created.
+          this.proposeTodoLink(id, index + 1);
         } else if (event.key === "Backspace" && text.value === "") {
           const next = this.readTodo(el, id);
           if (next.items.length <= 1) return; // the last line stays; blur clears the card
@@ -1645,6 +1771,7 @@ export class GraphView {
           this.stickies.update(id, { text: serializeTodo(next) });
           this.renderTodo(el, id);
           this.focusRow(el, Math.max(0, index - 1));
+          this.drawArrows(); // a deleted line takes its own arrow with it
         } else if (event.key === "Escape" && this.pendingTodo === id) {
           this.cancelProposal();
         }
@@ -1652,15 +1779,20 @@ export class GraphView {
     });
   }
 
-  /** The card as it stands in the DOM, plus the arrow targets only the model knows. */
+  /** The card as it stands in the DOM, plus the arrow targets only the model knows —
+      each row's own (rows render one-to-one with items) and the card-level ones. */
   private readTodo(el: HTMLElement, id: string): TodoDoc {
     const held = this.heldSticky(id);
-    const targets = held ? parseTodo(held.text).targets : [];
-    const items = [...el.querySelectorAll<HTMLElement>(".todo-row")].map((row) => ({
-      done: row.querySelector<HTMLInputElement>('input[type="checkbox"]')!.checked,
-      text: row.querySelector<HTMLInputElement>(".todo-text")!.value,
-    }));
-    return { items, targets };
+    const heldDoc: TodoDoc = held ? parseTodo(held.text) : { items: [], targets: [] };
+    const items = [...el.querySelectorAll<HTMLElement>(".todo-row")].map((row, index) => {
+      const target = heldDoc.items[index]?.target;
+      return {
+        done: row.querySelector<HTMLInputElement>('input[type="checkbox"]')!.checked,
+        text: row.querySelector<HTMLInputElement>(".todo-text")!.value,
+        ...(target ? { target } : {}),
+      };
+    });
+    return { items, targets: heldDoc.targets };
   }
 
   private focusRow(el: HTMLElement | undefined, index: number): void {
@@ -1717,8 +1849,9 @@ export class GraphView {
 
   /* ------------------------------------------------------------ todo arrows --- */
 
-  private proposeTodoLink(id: string): void {
+  private proposeTodoLink(id: string, row: number): void {
     this.pendingTodo = id;
+    this.pendingRow = row;
     this.proposalAt = null;
     this.handlers.onHint("Click a note to point this todo at it — typing (or Esc) skips the arrow");
     this.drawArrows();
@@ -1737,7 +1870,7 @@ export class GraphView {
       const held = this.heldSticky(id);
       if (held) {
         const doc = parseTodo(held.text);
-        if (!doc.targets.length && !doc.items.some((item) => item.text.trim())) {
+        if (!doc.targets.length && !doc.items.some((item) => item.text.trim() || item.target)) {
           this.stickies.remove(id);
           this.placeStickies();
         }
@@ -1748,8 +1881,10 @@ export class GraphView {
 
   /**
    * The proposed arrow landed on a note. The connection is written INTO the todo's
-   * markdown — one more `[[link]]` line, exactly what a note would hold — and hidden
-   * from the card; the arrows on the canvas are those lines' rendering.
+   * markdown — a `[[link]]` at the end of the task line it was proposed for — and
+   * hidden from the card; the arrows on the canvas are those lines' rendering.
+   * Belonging to its line, the arrow goes when the line goes, and turns green the
+   * moment that one task is ticked.
    */
   private connectTodo(node: NodeSingular): void {
     const id = this.pendingTodo;
@@ -1760,11 +1895,13 @@ export class GraphView {
     if (!id || !held) return;
     const doc = parseTodo(held.text);
     const name = noteName(node.id());
-    if (!doc.targets.some((t) => t.toLowerCase() === name.toLowerCase())) doc.targets.push(name);
+    const row = Math.min(this.pendingRow, doc.items.length - 1);
+    if (row >= 0) doc.items[row].target = name;
+    else if (!doc.targets.some((t) => t.toLowerCase() === name.toLowerCase())) doc.targets.push(name);
     this.stickies.update(id, { text: serializeTodo(doc) });
     this.drawArrows();
-    // Back to typing where they were: the freshest line, not the top of the card.
-    this.focusRow(this.stickyEls.get(id), Math.max(0, doc.items.length - 1));
+    // Back to typing where they were: the line the arrow now belongs to.
+    this.focusRow(this.stickyEls.get(id), Math.max(0, row));
   }
 
   /** The node a todo's `[[link]]` points at — shallowest name match, as links resolve. */
@@ -1803,9 +1940,19 @@ export class GraphView {
         // so the line reads as starting at its edge without any rectangle geometry.
         const from = { x: (sticky.x + w / 2) * zoom + pan.x, y: (sticky.y + h / 2) * zoom + pan.y };
         const doc = parseTodo(sticky.text);
-        const done = allDone(doc);
-        for (const target of doc.targets) {
-          const node = this.nodeByName(target);
+        // One arrow per note pointed at. A row's arrow is green as soon as that row
+        // is ticked; a card-level (old-style) arrow waits for the whole card. Two
+        // pointers at one note share the line, green only when both say so.
+        const arrows = new Map<string, { name: string; done: boolean }>();
+        const mark = (name: string, isDone: boolean): void => {
+          const held = arrows.get(name.toLowerCase());
+          if (held) held.done = held.done && isDone;
+          else arrows.set(name.toLowerCase(), { name, done: isDone });
+        };
+        for (const target of doc.targets) mark(target, allDone(doc));
+        for (const item of doc.items) if (item.target) mark(item.target, item.done);
+        for (const { name, done } of arrows.values()) {
+          const node = this.nodeByName(name);
           if (!node) continue; // the note went away; the line in the text remains
           const at = node.renderedPosition();
           const clear = (node.width() / 2) * zoom + 5; // hold the head off the circle

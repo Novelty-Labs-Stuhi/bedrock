@@ -333,12 +333,15 @@ async function readGeometryFile(
 // the note it points at is an ordinary `[[wikilink]]` line. The link line is stored
 // like any other markdown but never shown — the arrow on the canvas is its rendering.
 
-export type TodoItem = { done: boolean; text: string };
-/** A todo can point at any number of notes — one `[[link]]` line, one arrow, each. */
+/** A task line. Its arrow, if it has one, is a trailing `[[link]]` on the same line. */
+export type TodoItem = { done: boolean; text: string; target?: string };
+/** `targets` are the card-level `[[link]]` lines — the old shape, one arrow each. */
 export type TodoDoc = { items: TodoItem[]; targets: string[] };
 
 const ITEM_RE = /^- \[([ xX])\] ?(.*)$/;
 const TARGET_RE = /^\[\[([^\][|]+)\]\]$/;
+/** A task line's own arrow: the `[[link]]` it ends with. */
+const ITEM_TARGET_RE = /\s*\[\[([^\][|]+)\]\]\s*$/;
 
 /** Reads a todo sticky's markdown. A stray prose line counts as an unchecked task. */
 export function parseTodo(text: string): TodoDoc {
@@ -347,7 +350,11 @@ export function parseTodo(text: string): TodoDoc {
   for (const line of text.split("\n")) {
     const item = ITEM_RE.exec(line);
     if (item) {
-      items.push({ done: item[1] !== " ", text: item[2] });
+      let body = item[2];
+      const inline = ITEM_TARGET_RE.exec(body);
+      const target = inline?.[1].trim();
+      if (inline) body = body.slice(0, inline.index);
+      items.push({ done: item[1] !== " ", text: body, ...(target ? { target } : {}) });
       continue;
     }
     const link = TARGET_RE.exec(line.trim());
@@ -361,9 +368,11 @@ export function parseTodo(text: string): TodoDoc {
   return { items, targets };
 }
 
-/** Writes it back: the task lines, then the (hidden) link lines. */
+/** Writes it back: the task lines (arrow links inline), then the card-level link lines. */
 export function serializeTodo(doc: TodoDoc): string {
-  const lines = doc.items.map((item) => `- [${item.done ? "x" : " "}] ${item.text}`);
+  const lines = doc.items.map(
+    (item) => `- [${item.done ? "x" : " "}] ${item.text}${item.target ? ` [[${item.target}]]` : ""}`,
+  );
   for (const target of doc.targets) lines.push(`[[${target}]]`);
   return lines.join("\n");
 }

@@ -69,6 +69,49 @@ const TYPE_RE = /^type::[ \t]*([\w-]+)[ \t]*$/im;
 export const parseType = (text: string): string | null =>
   TYPE_RE.exec(text)?.[1].toLowerCase() ?? null;
 
+/*
+ * A note's ACTIVITY: `active:: true` on a line of its own, the same inline-field spelling
+ * as `type::`. An active note radiates on the graph — it is the one being worked on, the
+ * live end of the vault — and because the mark is a line in the file it travels with the
+ * folder, shows up in the editor, and can be typed by hand like anything else.
+ */
+const ACTIVE_RE = /^[ \t]*active::[ \t]*(.*?)[ \t]*$/i;
+
+/** Off spellings, so `active:: false` reads as a note that was active and no longer is. */
+const OFF = new Set(["", "false", "no", "off", "0"]);
+
+const activeLineAt = (lines: string[]): number => lines.findIndex((line) => ACTIVE_RE.test(line));
+
+export function parseActive(text: string): boolean {
+  const lines = text.split("\n");
+  const at = activeLineAt(lines);
+  if (at < 0) return false;
+  return !OFF.has((ACTIVE_RE.exec(lines[at])?.[1] ?? "").toLowerCase());
+}
+
+/**
+ * Writes the mark into (or out of) a note's markdown. Switching it off removes the line
+ * rather than writing `active:: false`: a note that is not being worked on should read
+ * like every other quiet note in the vault, with nothing said about it either way.
+ */
+export function setActive(text: string, on: boolean): string {
+  const lines = text.split("\n");
+  const at = activeLineAt(lines);
+  if (at >= 0) {
+    if (on) {
+      lines[at] = "active:: true";
+      return lines.join("\n");
+    }
+    lines.splice(at, 1);
+    // The field sat on a line of its own between blanks; leave one, not two.
+    if (at > 0 && lines[at - 1].trim() === "" && (lines[at] ?? "x").trim() === "") lines.splice(at, 1);
+    return lines.join("\n");
+  }
+  if (!on) return text;
+  const gap = text === "" || text.endsWith("\n\n") ? "" : text.endsWith("\n") ? "\n" : "\n\n";
+  return `${text}${gap}active:: true\n`;
+}
+
 /** Same shape as LINK_RE, but keeping the `|alias` tail so a rewrite can put it back. */
 const REWRITE_RE = /(?<!!)\[\[([^\][|]+)(\|[^\][]*)?\]\]/g;
 

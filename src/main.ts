@@ -1,15 +1,15 @@
 import "./style.css";
 import { GraphView, type Doc } from "./graph";
-import { LinkResolver, labelledLink, relinkText } from "./links";
+import { LinkResolver, labelledLink, relinkText, setActive } from "./links";
 import { askConfirm, askText } from "./dialog";
 import { EDGE_DIR, edgeNotePath, edgeNoteTemplate, edgeTitle, isEdgeNote, renamedEdgeNote } from "./edges";
 import { showMenu, type MenuItem } from "./menu";
 import { mountHelp } from "./help";
 import { SettingsStore, mountSettings } from "./settings";
-import { hydrateImages, imageFiles, insertAtCaret, saveImage } from "./images";
-import { linkTargets, renderMarkdown } from "./markdown";
+import { imageFiles, resetAssets, saveImage } from "./images";
+import { createEditor, type Editor } from "./editor";
+import { linkTargets } from "./markdown";
 import { Sidebar } from "./sidebar";
-import { mountToolbar } from "./toolbar";
 import { SpatialStore } from "./spatial";
 import { STICKY_DIR, TODO_DIR, StickyStore, isCardPath } from "./sticky";
 import {
@@ -31,10 +31,11 @@ import {
 type Tab = { kind: "file"; path: string } | { kind: "graph" };
 
 /**
- * One side of the split. Read/edit and the pending save are per pane, so the two
- * sides never fight over a mode or over each other's buffer.
+ * One side of the split. The pending save is per pane, so the two sides never fight over
+ * each other's buffer. There is no read/edit mode: the editor renders as you type, and an
+ * editor you are not typing in renders everything.
  */
-type Pane = { tabs: Tab[]; active: number; mode: "edit" | "read"; timer?: number };
+type Pane = { tabs: Tab[]; active: number; timer?: number };
 
 const el = <T extends HTMLElement>(id: string): T => {
   const node = document.getElementById(id);
@@ -73,8 +74,7 @@ type PaneUI = {
   actions: HTMLElement;
   page: HTMLElement;
   empty: HTMLElement;
-  editor: HTMLTextAreaElement;
-  preview: HTMLElement;
+  mount: HTMLElement;
 };
 
 /** Both panes exist in the DOM from the start; the right one is hidden until split. */
@@ -84,13 +84,8 @@ const view: PaneUI[] = [0, 1].map((i) => ({
   actions: el(`actions-${i}`),
   page: el(`page-${i}`),
   empty: el(`empty-${i}`),
-  editor: el<HTMLTextAreaElement>(`editor-${i}`),
-  preview: el(`preview-${i}`),
+  mount: el(`editor-${i}`),
 }));
-
-// Selection toolbar, markdown shortcuts and the list/indent/wrap typing behaviour, for
-// both editors. It reads and writes the textareas directly — no state of the app's own.
-mountToolbar(view.map((v) => v.editor));
 
 const MAX_PANES = 2;
 const SIDE_KEY = "obsidian-lite:sidebar";
@@ -105,7 +100,7 @@ const stickies = new StickyStore();
 const settings = new SettingsStore();
 let entries: Entry[] = [];
 /** The graph is pinned as the first tab of the left pane and is never closed. */
-let panes: Pane[] = [{ tabs: [{ kind: "graph" }], active: 0, mode: "read" }];
+let panes: Pane[] = [{ tabs: [{ kind: "graph" }], active: 0 }];
 let focused = 0;
 /** Edits while the graph tab is hidden are folded into the next time it is shown. */
 let graphStale = true;
@@ -117,6 +112,32 @@ const pathOf = (p: Pane): string | null => {
   const tab = tabOf(p);
   return tab?.kind === "file" ? tab.path : null;
 };
+
+/**
+ * The editing surfaces. Built after the vault and the pane list, because the live-preview
+ * layer asks both of them what it is looking at the moment it is constructed.
+ */
+const editors: Editor[] = view.map((v, index) =>
+  createEditor(v.mount, {
+    changed: () => scheduleSave(index),
+    escaped: () => void flushSave(index),
+    followLink: (target) => void followLink(target, index),
+    pasted: (data) => {
+      const files = imageFiles(data);
+      if (!files.length) return false; // plain text — let the ordinary paste have it
+      void attachImages(index, files, null);
+      return true;
+    },
+    dropped: (data, pos) => {
+      const files = imageFiles(data);
+      if (!files.length) return false;
+      void attachImages(index, files, pos);
+      return true;
+    },
+    note: () => pathOf(pane(index)) ?? "",
+    vault: () => vault,
+  }),
+);
 
 const sidebar = new Sidebar(ui.tree, {
   onOpen: (path) => void openFile(path),
@@ -148,6 +169,13 @@ const graphView = new GraphView(ui.cy, {
     const items: MenuItem[] = [{ label: "Link to a note…", run: () => graphView.startLink(path) }];
     if (settings.enabled("gemini")) {
       items.push({ label: "Link to a Gemini chat…", run: () => graphView.startLink(path, "gemini") });
+    }
+    if (settings.enabled("active")) {
+      const on = graphView.isRadiating(path);
+      items.push({
+        label: on ? "Stop radiating" : "Make it radiate",
+        run: () => void setRadiating(path, !on),
+      });
     }
     items.push(
       { label: `Rename "${noteName(path)}"`, run: () => renameOnGraph(path) },
@@ -292,8 +320,6 @@ function renderPane(index: number, v: PaneUI): void {
   if (index === 0) ui.cy.classList.toggle("hidden", !graphOpen);
   v.page.classList.toggle("hidden", graphOpen || !tab);
   v.empty.classList.toggle("hidden", !!tab);
-  v.editor.classList.toggle("hidden", p.mode !== "edit");
-  v.preview.classList.toggle("hidden", p.mode !== "read");
   if (graphOpen) graphView.resize();
 }
 
@@ -313,9 +339,7 @@ const ONE_PANE_ICON = paneIcon(false);
  */
 function actionsHtml(index: number, tab: Tab | undefined): string {
   const bits: string[] = [];
-  if (tab?.kind === "file") {
-    bits.push(`<button data-act="mode">${panes[index].mode === "edit" ? "Read" : "Edit"}</button>`);
-  } else if (tab?.kind === "graph") {
+  if (tab?.kind === "graph") {
     bits.push(
       `<label class="toggle" title="Show or hide the folder boxes">` +
         `<input data-act="boxes" type="checkbox"${graphView.boxesShown() ? " checked" : ""} /> Boxes</label>`,
@@ -332,16 +356,15 @@ function actionsHtml(index: number, tab: Tab | undefined): string {
 async function renderPage(index: number): Promise<void> {
   const tab = tabOf(pane(index));
   if (tab?.kind !== "file") return;
-  const text = await vault.read(tab.path);
-  view[index].editor.value = text;
-  await paint(index, tab.path, text);
+  /*
+   * Settle any save still queued for this pane before the buffer underneath it is replaced.
+   * The timer was scheduled against the note being navigated away from, and the editor still
+   * holds that note's text — so flush it now. Letting it fire after the load would write this
+   * note's text to the other one's path.
+   */
+  await flushSave(index);
+  editors[index].load(await vault.read(tab.path));
   render();
-}
-
-/** Preview HTML + the attachment pass that gives its `![[…]]` embeds real bytes. */
-async function paint(index: number, path: string, text: string): Promise<void> {
-  view[index].preview.innerHTML = renderMarkdown(text);
-  await hydrateImages(view[index].preview, path, vault);
 }
 
 /** Only call with the graph tab already rendered — the layout needs a sized container. */
@@ -389,7 +412,7 @@ async function splitPane(): Promise<void> {
     left.tabs.splice(at, 1);
     if (left.active >= at) left.active = Math.max(0, left.active - 1);
   }
-  panes.push({ tabs: take ? [take] : [], active: 0, mode: "read" });
+  panes.push({ tabs: take ? [take] : [], active: 0 });
   focused = 1;
   render();
   await showAll(); // the left pane just lost a tab — it has a different note on it now
@@ -732,7 +755,7 @@ async function pickFolder(): Promise<void> {
   await stickies.attach(vault);
   await settings.attach(vault); // and its own set of switched-on integrations
   applyFeatures();
-  panes = [{ tabs: [{ kind: "graph" }], active: 0, mode: "read" }];
+  panes = [{ tabs: [{ kind: "graph" }], active: 0 }];
   focused = 0;
   lastFile = null;
   sidebar.reveal("");
@@ -866,7 +889,7 @@ const flushAll = async (): Promise<void> => {
 async function save(index: number): Promise<void> {
   const tab = tabOf(pane(index));
   if (tab?.kind !== "file") return;
-  const text = view[index].editor.value;
+  const text = editors[index].text();
   /*
    * `write` creates whatever is missing, so a save aimed at a note that has since been
    * moved or deleted does not fail — it puts the file back, with the editor's buffer in
@@ -878,13 +901,12 @@ async function save(index: number): Promise<void> {
     return;
   }
   await vault.write(tab.path, text);
-  await paint(index, tab.path, text);
-  // The same note can be open on both sides; the other one must not go stale.
+  // The same note can be open on both sides; the other one must not go stale. `sync` keeps
+  // that side's caret and undo history — it is the same note, not a newly opened one.
   for (let other = 0; other < panes.length; other++) {
     if (other === index) continue;
     if (pathOf(panes[other]) !== tab.path) continue;
-    view[other].editor.value = text;
-    await paint(other, tab.path, text);
+    editors[other].sync(text);
   }
   ui.status.textContent = `${tab.path} — saved`;
   graphStale = true; // picked up when the graph tab is next shown
@@ -924,8 +946,11 @@ async function openEdgeNote(source: string, target: string, label: string | null
     graphStale = true;
   }
   await openFile(path);
-  // A brand-new connection note is empty apart from its heading — open it ready to write in.
-  if (fresh) panes[focused].mode = "edit";
+  // A brand-new connection note is empty apart from its heading — put the caret in it.
+  if (fresh) {
+    editors[focused].focus();
+    editors[focused].caretToEnd();
+  }
   render();
 }
 
@@ -959,6 +984,33 @@ function renameOnGraph(path: string): void {
   graphView.renameNode(path, (name) => {
     if (name) void applyRename(path, "file", name);
   });
+}
+
+/* ---------------------------------------------------------------- active --- */
+
+/**
+ * Right-click → "Make it radiate": the note becomes one of the live ends of the vault and
+ * its node pulses green. The mark is a line in the note's own markdown (`active:: true`),
+ * so it travels with the folder and can be typed or deleted by hand like any other field.
+ * The node is switched first, so the ring answers the click, and the file follows behind.
+ */
+async function setRadiating(path: string, on: boolean): Promise<void> {
+  graphView.setRadiating(path, on);
+  await flushAll(); // the note may be open and mid-edit — don't write over its own buffer
+  const text = await vault.read(path);
+  const next = setActive(text, on);
+  if (next !== text) {
+    if (!(await tryVault(`could not mark ${noteName(path)}`, () => vault.write(path, next)))) {
+      graphView.setRadiating(path, !on); // the vault refused; the ring must not claim otherwise
+      return;
+    }
+    // Open in a pane: the field appears in the editor too, caret and undo history intact.
+    for (let i = 0; i < panes.length; i++) if (pathOf(panes[i]) === path) editors[i].sync(next);
+  }
+  graphStale = true;
+  ui.status.textContent = on
+    ? `${noteName(path)} is radiating — right-click it again to stop`
+    : `${noteName(path)} stopped radiating`;
 }
 
 /* ---------------------------------------------------------------- gemini --- */
@@ -1215,11 +1267,11 @@ stickies.onFilesChanged = () => void refreshSidebar();
 /* ------------------------------------------------------------ attachments --- */
 
 /**
- * Store the images and write their embeds into the open note. In edit mode they land at the caret;
- * dropping onto the rendered page appends instead — there is no caret there, and the alternative
- * (silently switching to edit mode) loses the reading position.
+ * Store the images and write their embeds into the open note. `at` is where they land — the
+ * position under a drop, or null for the caret's own line. Several files go in one after
+ * another, each after the last, so a drop of four pictures reads in the order they were picked.
  */
-async function attachImages(index: number, files: File[], at: "caret" | "end"): Promise<void> {
+async function attachImages(index: number, files: File[], at: number | null): Promise<void> {
   const tab = tabOf(pane(index));
   if (tab?.kind !== "file") {
     ui.status.textContent = "open a note first — images are attached to a note";
@@ -1227,33 +1279,35 @@ async function attachImages(index: number, files: File[], at: "caret" | "end"): 
   }
   if (!files.length) return;
 
-  const editor = view[index].editor;
+  const editor = editors[index];
   const saved: string[] = [];
+  let pos = at;
   for (const file of files) {
     try {
       const { path, embed } = await saveImage(vault, file);
       saved.push(path);
-      if (at === "caret") {
-        insertAtCaret(editor, embed);
-      } else {
-        const text = editor.value;
-        const gap = text === "" || text.endsWith("\n\n") ? "" : text.endsWith("\n") ? "\n" : "\n\n";
-        editor.value = `${text}${gap}${embed}\n`;
-      }
+      pos = editor.insertAt(pos, embed);
     } catch (err) {
       ui.status.textContent = `could not attach ${file.name}: ${(err as Error).message}`;
       break;
     }
   }
   if (!saved.length) return;
+  // The vault has files it did not have a moment ago, so what an embed resolves to has
+  // changed — including embeds already cached as missing.
+  resetAssets();
   await flushSave(index);
-  await save(index); // writes the note and repaints, so the image shows immediately
+  await save(index);
   ui.status.textContent =
     saved.length === 1 ? `attached ${saved[0]}` : `attached ${saved.length} images to ${tab.path}`;
 }
 
-/** Drop targets: the editor (caret) and the rendered page (append). */
-function makeDropZone(zone: HTMLElement, index: number, where: "caret" | "end"): void {
+/**
+ * The note's page as a drop target. A drop that lands in the text is handled by the editor,
+ * which knows the position under the cursor; this catches the rest of the page — the margins
+ * either side of the column — and puts those at the end of the note.
+ */
+function makeDropZone(zone: HTMLElement, index: number): void {
   zone.addEventListener("dragover", (event: DragEvent) => {
     if (!event.dataTransfer?.types.includes("Files")) return;
     event.preventDefault();
@@ -1262,11 +1316,12 @@ function makeDropZone(zone: HTMLElement, index: number, where: "caret" | "end"):
   });
   zone.addEventListener("dragleave", () => zone.classList.remove("drop-target"));
   zone.addEventListener("drop", (event: DragEvent) => {
-    const files = imageFiles(event.dataTransfer);
     zone.classList.remove("drop-target");
+    if (event.defaultPrevented) return; // the editor took it, at the position dropped on
+    const files = imageFiles(event.dataTransfer);
     if (!files.length) return; // not images — let the default handling have it
     event.preventDefault();
-    void attachImages(index, files, where);
+    void attachImages(index, files, null);
   });
 }
 
@@ -1289,10 +1344,6 @@ view.forEach((v, index) => {
   v.actions.addEventListener("click", (event) => {
     const act = (event.target as HTMLElement).closest<HTMLElement>("[data-act]")?.dataset.act;
     switch (act) {
-      case "mode":
-        panes[index].mode = panes[index].mode === "edit" ? "read" : "edit";
-        render();
-        break;
       case "split":
         void splitPane();
         break;
@@ -1307,44 +1358,9 @@ view.forEach((v, index) => {
     if (node.dataset.act === "boxes") graphView.setBoxesVisible(node.checked);
   });
 
-  v.editor.addEventListener("input", () => scheduleSave(index));
-
-  v.editor.addEventListener("keydown", (event) => {
-    if (event.key !== "Escape") return;
-    event.preventDefault();
-    void flushSave(index).then(() => {
-      panes[index].mode = "read";
-      render();
-    });
-  });
-
-  v.preview.addEventListener("click", (event) => {
-    const node = event.target as HTMLElement;
-    const link = node.closest<HTMLElement>(".wikilink");
-    if (link?.dataset.link) {
-      event.preventDefault();
-      void followLink(link.dataset.link, index);
-      return;
-    }
-    if (node.closest("a")) return; // external link — let it open
-    // Clicking the rendered text drops into edit mode, as Obsidian does.
-    if (!window.getSelection()?.isCollapsed) return; // they were selecting text
-    panes[index].mode = "edit";
-    render();
-    v.editor.focus();
-    v.editor.setSelectionRange(v.editor.value.length, v.editor.value.length);
-  });
-
-  // Pasted screenshots (⌘V) take the same path — the clipboard hands us the same File objects.
-  v.editor.addEventListener("paste", (event) => {
-    const files = imageFiles(event.clipboardData);
-    if (!files.length) return; // plain text — default paste
-    event.preventDefault();
-    void attachImages(index, files, "caret");
-  });
-
-  makeDropZone(v.editor, index, "caret");
-  makeDropZone(v.preview, index, "end");
+  // Typing, Escape, ⌘-click on a link and pasted screenshots all arrive through the editor's
+  // own hooks, where the selection is — see the `createEditor` call above.
+  makeDropZone(v.page, index);
 });
 
 /* -------------------------------------------------------------- chrome --- */

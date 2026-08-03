@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "A markdown vault whose graph is the place you work \u2014 spatial, durable, plain files.",
+  "description": "A markdown vault whose graph is the place you work — spatial, durable, plain files.",
   "main": "electron/main.cjs",
   "scripts": {
     "dev": "vite",
@@ -13,6 +13,9 @@
     "app": "electron ."
   },
   "dependencies": {
+    "@codemirror/commands": "^6.10.4",
+    "@codemirror/state": "^6.7.1",
+    "@codemirror/view": "^6.43.7",
     "cytoscape": "^3.30.2",
     "cytoscape-cola": "^2.5.1"
   },
