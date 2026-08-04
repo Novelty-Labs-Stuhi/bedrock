@@ -5,7 +5,7 @@
 
 import type { Vault } from "./vault";
 
-export type Feature = "stickies" | "linear" | "git" | "gemini" | "active";
+export type Feature = "stickies" | "linear" | "git" | "gemini" | "claude" | "active";
 
 export const CONFIG_FILE = ".notes/config.json";
 
@@ -15,6 +15,7 @@ const DEFAULTS: Record<Feature, boolean> = {
   linear: false,
   git: false,
   gemini: false,
+  claude: false,
   active: false,
 };
 
@@ -98,6 +99,11 @@ const ROWS: Array<{ feature: Feature; name: string; what: string }> = [
   { feature: "linear", name: "Linear", what: "issue notes — tick them here, the tick lands in Linear" },
   { feature: "git", name: "Git", what: "a commit button that snapshots the vault (desktop app)" },
   { feature: "gemini", name: "Gemini", what: "conversation notes — rectangles that open the chat in the browser" },
+  {
+    feature: "claude",
+    name: "Claude Code",
+    what: "session notes — the node opens a coding session in the Claude app (desktop app)",
+  },
   { feature: "active", name: "Active", what: "right-click a note to make it radiate a green pulse" },
 ];
 

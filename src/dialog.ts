@@ -59,6 +59,64 @@ export function askText(message: string, initial = "", okLabel = "OK"): Promise<
   });
 }
 
+/**
+ * Pick one of a few known answers, or type your own — the shape of a question that has
+ * usual answers without being limited to them. Resolves to the chosen string, or null if
+ * it was dismissed.
+ */
+export function askChoice(
+  message: string,
+  choices: string[],
+  typeLabel = "Somewhere else…",
+  typePrompt = message,
+  typeInitial?: string,
+): Promise<string | null> {
+  return new Promise<string | null>((resolve) => {
+    const box = overlay();
+    box.classList.add("open");
+    box.innerHTML =
+      `<div class="dialog-card">` +
+      `<div class="dialog-title"></div>` +
+      `<div class="dialog-choices"></div>` +
+      `<div class="dialog-row"><button class="dialog-cancel">Cancel</button></div>` +
+      `</div>`;
+    box.querySelector<HTMLElement>(".dialog-title")!.textContent = message;
+    const list = box.querySelector<HTMLElement>(".dialog-choices")!;
+    for (const choice of choices) {
+      const button = document.createElement("button");
+      button.className = "dialog-choice";
+      button.textContent = choice;
+      button.onclick = () => {
+        close();
+        resolve(choice);
+      };
+      list.appendChild(button);
+    }
+    const other = document.createElement("button");
+    other.className = "dialog-choice other";
+    other.textContent = typeLabel;
+    other.onclick = () => {
+      close();
+      // Chained rather than nested: the typed answer IS the answer to this question.
+      void askText(typePrompt, typeInitial ?? choices[0] ?? "", "Use this").then(resolve);
+    };
+    list.appendChild(other);
+    const done = (): void => {
+      close();
+      resolve(null);
+    };
+    box.querySelector<HTMLElement>(".dialog-cancel")!.onclick = done;
+    box.onmousedown = (event) => {
+      if (event.target === box) done();
+    };
+    box.onkeydown = (event) => {
+      event.stopPropagation();
+      if (event.key === "Escape") done();
+    };
+    list.querySelector<HTMLButtonElement>(".dialog-choice")?.focus();
+  });
+}
+
 /** Yes/no confirmation, styled like askText so the app looks of a piece. */
 export function askConfirm(message: string, confirmLabel = "Delete"): Promise<boolean> {
   return new Promise<boolean>((resolve) => {

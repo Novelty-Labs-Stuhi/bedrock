@@ -878,6 +878,40 @@ button.twisty:hover {
   border-color: #b3392b;
 }
 
+/* A question with usual answers: one row per answer, and a last row for anything else.
+   Paths are what these mostly are, so they get the monospace and are allowed to wrap
+   rather than be trimmed — a folder you cannot read is not an answer. */
+.dialog-choices {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.dialog-choice {
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  text-align: left;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.dialog-choice:hover,
+.dialog-choice:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+/* Not one of the folders — typing your own is a different kind of answer. */
+.dialog-choice.other {
+  margin-top: 4px;
+  font-family: inherit;
+  color: var(--muted);
+}
+
 /* ---------------------------------------------------------- context menu --- */
 
 #menu {
@@ -1048,6 +1082,51 @@ button.twisty:hover {
   content: "✓";
 }
 
+/* What a Claude session is doing, on the corner of its tile. One dot, four readings:
+   grey and blinking while Claude is working, amber when it is waiting on an answer, blue
+   when a turn has finished that nobody has looked at, and an empty ring otherwise. The
+   blink is CSS for the same reason the active ring's beat is — it keeps time whether or
+   not the canvas is redrawing, and costs nothing when no session is running. */
+.session-badge {
+  position: absolute;
+  border-radius: 50%;
+  /* A ring in the canvas colour, so the dot reads as sitting ON the tile. */
+  box-shadow: 0 0 0 0.12em var(--bg);
+  border: 0.18em solid transparent;
+  box-sizing: border-box;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+
+/* Nothing running — the outline of a dot, which is the quietest thing that is still
+   legibly a status and not a smudge on the tile. */
+.session-badge.idle {
+  border-color: rgba(220, 221, 222, 0.45);
+}
+
+.session-badge.running {
+  background: #9198a1;
+  animation: session-blink 1.2s ease-in-out infinite;
+}
+
+.session-badge.waiting {
+  background: #e3b341;
+}
+
+.session-badge.unseen {
+  background: #58a6ff;
+}
+
+@keyframes session-blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.2;
+  }
+}
+
 /* --------------------------------------------------------------- issues --- */
 /* An issue node wears the Linear mark and nothing else; this is what it opens into.
    A popover, not a sticky: it belongs to the node beside it, it is never dragged,
@@ -1200,6 +1279,10 @@ button.issue-id:hover {
 .tick {
   position: relative;
   flex: none;
+  /* A button does NOT inherit its font, so without this its em is the browser's own
+     13px and the circle keeps that size at every zoom level — the card shrinks around
+     a ring that will not shrink with it. Everything below is em off this line. */
+  font: inherit;
   width: 1.05em;
   height: 1.05em;
   padding: 0;

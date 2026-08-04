@@ -1,7 +1,7 @@
 import "./style.css";
-import { GraphView, type Doc } from "./graph";
-import { LinkResolver, labelledLink, relinkText, setActive } from "./links";
-import { askConfirm, askText } from "./dialog";
+import { GraphView, type Doc, type SessionState } from "./graph";
+import { LinkResolver, labelledLink, parseField, relinkText, setActive, setField } from "./links";
+import { askChoice, askConfirm, askText } from "./dialog";
 import { EDGE_DIR, edgeNotePath, edgeNoteTemplate, edgeTitle, isEdgeNote, renamedEdgeNote } from "./edges";
 import { showMenu, type MenuItem } from "./menu";
 import { mountHelp } from "./help";
@@ -170,20 +170,31 @@ const sidebar = new Sidebar(ui.tree, {
 const graphView = new GraphView(ui.cy, {
   onOpen: (path) => void openFile(path),
   onOpenGemini: (path, url) => openGeminiNode(path, url),
+  onOpenClaude: (path, session) => void openClaudeSession(path, session),
   onIssueEdit: (path, text, change) => editIssue(path, text, change),
   onOpenIssue: (url) => {
     if (!window.open(url, "_blank", "noopener")) ui.status.textContent = `the browser blocked ${url}`;
   },
   onOpenEdge: (source, target, label) => void openEdgeNote(source, target, label),
   onLinkExisting: (source, target) => linkNotes(source, target),
-  onLinkNew: (source, at, folder, kind) =>
-    kind === "gemini" ? void createGeminiAt(at, folder, source) : void linkToNewNote(source, at, folder),
+  onLinkNew: (source, at, folder, kind) => {
+    if (kind === "gemini") void createGeminiAt(at, folder, source);
+    else if (kind === "claude") void createClaudeAt(at, folder, source);
+    else void linkToNewNote(source, at, folder);
+  },
   onReparent: (path, folder) => void moveEntry(path, "file", folder, true),
   onGroup: (paths, frame) => void groupIntoFolder(paths, frame),
   onNodeMenu: (path, client) => {
     const items: MenuItem[] = [{ label: "Link to a note…", run: () => graphView.startLink(path) }];
     if (settings.enabled("gemini")) {
       items.push({ label: "Link to a Gemini chat…", run: () => graphView.startLink(path, "gemini") });
+    }
+    if (settings.enabled("claude")) {
+      items.push({ label: "Link to a Claude session…", run: () => graphView.startLink(path, "claude") });
+      // Only a session note can be plugged into one; on any other note it would mean nothing.
+      if (graphView.sessionNote(path)) {
+        items.push({ label: "Plug in a session…", run: () => void plugInSession(path) });
+      }
     }
     if (settings.enabled("active")) {
       const on = graphView.isRadiating(path);
@@ -213,6 +224,9 @@ const graphView = new GraphView(ui.cy, {
     }
     if (settings.enabled("gemini")) {
       items.push({ label: "New Gemini conversation", run: () => void createGeminiAt(at, folder) });
+    }
+    if (settings.enabled("claude")) {
+      items.push({ label: "New Claude session", run: () => void createClaudeAt(at, folder) });
     }
     showMenu(client, items);
   },
@@ -388,6 +402,7 @@ async function renderPage(index: number): Promise<void> {
 async function drawGraph(): Promise<void> {
   graphStale = false;
   graphView.render(await readDocs(), lastFile, await describedEdges());
+  void pollSessions(); // the dots belong to the graph that has just gone up
 }
 
 /** Brings one pane's visible content back in line with its active tab. */
@@ -803,8 +818,11 @@ async function copyText(text: string): Promise<void> {
  * Neither localStorage nor the File System Access API hands out a real filesystem
  * path, so the vault's location on disk is asked for once and remembered per vault.
  */
+/** The vault's location if it has already been given, without asking for it. */
+const knownVaultRoot = (): string | null => localStorage.getItem(ROOT_KEY + vault.name);
+
 async function vaultRoot(): Promise<string | null> {
-  const stored = localStorage.getItem(ROOT_KEY + vault.name);
+  const stored = knownVaultRoot();
   if (stored) return stored;
   const typed = await askText(
     `Where does "${vault.name}" live on disk? Asked once, then remembered.`,
@@ -859,6 +877,7 @@ async function commitVault(): Promise<void> {
 function applyFeatures(): void {
   ui.gitCommit.classList.toggle("hidden", !settings.enabled("git"));
   graphView.refreshOverlay();
+  watchSessions();
   void ensureCardDirs();
 }
 
@@ -1404,6 +1423,348 @@ async function createGeminiAt(
     })();
   });
   await refreshSidebar();
+}
+
+/* ---------------------------------------------------------------- claude --- */
+
+/**
+ * A session note has NO PROSE IN IT. It is a handle on a session, not a document about one:
+ * the folder the session runs in, the id the Claude app minted for it, how much of it has
+ * been read — and nothing else, not even a heading. Its name on the graph is its filename,
+ * which is the one place a name belongs when the file has nothing else in it.
+ */
+const claudeTemplate = (folder: string | null): string =>
+  `type:: claude\n${folder ? `\nfolder:: ${folder}\n` : ""}`;
+
+/** The name a session note is born with, until it is given one. */
+const CLAUDE_NAME = "Claude session";
+
+/**
+ * Where a new session runs — asked, not guessed. "The folder Claude Code last worked in" is
+ * a bad guess on a machine where anything else is using Claude Code: the most recent folder
+ * is whatever happened to be touched last, which is rarely what this note is about. The
+ * recent ones are offered because they are usually right; typing a path is always there.
+ * Answered once per note, then it lives in the note as `folder::`.
+ */
+async function askClaudeFolder(): Promise<string | null> {
+  const recent = (await window.bedrock?.claudeFolders(8).catch(() => [])) ?? [];
+  // The vault itself belongs on the list — a session about these notes may well run in
+  // them — but only if its location is already known. Asking where the vault lives in order
+  // to ask which folder to run in is two questions to answer one.
+  const root = knownVaultRoot();
+  const choices = [...new Set([...recent, ...(root ? [root] : [])])];
+  if (!choices.length) return askText("Which folder should this session run in?", "~/", "Use this");
+  return askChoice(
+    "Which folder should this session run in?",
+    choices,
+    "Another folder…",
+    "Which folder should this session run in?",
+  );
+}
+
+/** Notes with a start in flight — a second click must not open a second session. */
+const claudeStarting = new Set<string>();
+
+/**
+ * Opens a session note's node.
+ *
+ * With an id in the note, that is `claude://resume` — the same session, in the state it was
+ * left. Without one, the note may still HAVE a session: one was started, something was said
+ * in it, and the id never made it home. So the note is given the chance to catch up with
+ * itself off disk before anything new is opened — which is the difference between clicking a
+ * node twice and ending up with two sessions.
+ *
+ * Only a note that has genuinely never been run starts one: the session opens in its folder
+ * with the note's name already in the composer, and `started::` goes into the note first, so
+ * even if this window never sees the id, the note knows enough to find it later.
+ */
+async function openClaudeSession(path: string, session: string | null): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) {
+    ui.status.textContent = "Claude sessions need the desktop app — npm start";
+    return;
+  }
+  if (session) return resumeClaudeSession(path, session);
+  if (claudeStarting.has(path)) {
+    ui.status.textContent = `${noteName(path)} — a session is already open for this note; send it a message and its id saves itself`;
+    return;
+  }
+  await flushAll(); // the note may be open and mid-edit; its fields have to be current
+  const text = await vault.read(path);
+  // Started before and never caught? Then it is not a new session that is wanted.
+  const caught = await adoptClaudeSession(path, parseField(text, "folder"), parseField(text, "started"));
+  if (caught) return resumeClaudeSession(path, caught);
+
+  const folder = parseField(text, "folder") || (await askClaudeFolder());
+  if (!folder) return; // nowhere to run it, and the ask was declined
+  const started = new Date().toISOString();
+  // On disk BEFORE the link opens: this is the note's own record of what it is waiting for,
+  // and it has to outlive this window.
+  let next = setField(text, "started", started);
+  if (!parseField(text, "folder")) next = setField(next, "folder", folder);
+  if (next !== text) {
+    if (!(await tryVault(`could not write to ${noteName(path)}`, () => vault.write(path, next)))) return;
+    graphView.setClaudePending(path, folder, started);
+    graphStale = true;
+    syncOpenPanes(path, next);
+  }
+  claudeStarting.add(path);
+  ui.status.textContent = `${noteName(path)} — empty session opening in ${folder}; the id saves itself on the first message`;
+  try {
+    const id = await bridge.claudeStart(folder);
+    if (id) await saveClaudeSession(path, id);
+  } catch (err) {
+    ui.status.textContent = `Claude: ${(err as Error).message}`;
+  } finally {
+    claudeStarting.delete(path);
+  }
+}
+
+/** Hands a note's session back to the Claude app, and counts that as having read it. */
+async function resumeClaudeSession(path: string, session: string): Promise<void> {
+  try {
+    await window.bedrock?.claudeResume(session);
+    await markSessionSeen(path);
+    ui.status.textContent = `${noteName(path)} → its session in Claude`;
+  } catch (err) {
+    ui.status.textContent = `Claude: ${(err as Error).message}`;
+  }
+}
+
+/**
+ * Looks on disk for the session a note started and never got the id of, and writes it in.
+ * Returns the id, or null if there is nothing to catch up with — a note that was never
+ * started, one whose session nobody has said anything in yet, or one the shell would only be
+ * guessing at. Nothing is sent to Claude for these notes, so there is no fingerprint to match
+ * on: when more than one session was started in that folder in the meantime, the note is left
+ * unbound and SAYS SO, because a note pointing at the wrong session looks exactly as healthy
+ * as one pointing at the right session — which is how this went unnoticed the first time.
+ */
+async function adoptClaudeSession(
+  path: string,
+  folder: string | null,
+  started: string | null,
+): Promise<string | null> {
+  if (!folder || !started) return null;
+  const found = await window.bedrock?.claudeAdopt(folder, started).catch(() => null);
+  if (!found?.id) {
+    if (found && found.candidates.length > 1 && !claudeAmbiguous.has(path)) {
+      claudeAmbiguous.add(path);
+      ui.status.textContent =
+        `${noteName(path)} — ${found.candidates.length} sessions were started in ${folder} since; ` +
+        `not guessing which is this note's. Right-click it → "Plug in a session…"`;
+    }
+    return null;
+  }
+  claudeAmbiguous.delete(path);
+  await saveClaudeSession(path, found.id);
+  return found.id;
+}
+
+/** Notes already reported as unbindable — the poll must not say it every four seconds. */
+const claudeAmbiguous = new Set<string>();
+
+/**
+ * Writes a session's id into its note, and clears the `started::` marker it was found by —
+ * the id says everything that line was standing in for. Safe to run twice: a note that
+ * already carries this id is left exactly as it is.
+ */
+async function saveClaudeSession(path: string, id: string, folder?: string): Promise<void> {
+  if (!(await vault.exists(path))) return; // the note went away mid-session
+  await flushAll();
+  const text = await vault.read(path);
+  let next = setField(setField(text, "session", id), "started", null);
+  // A session knows which folder it ran in better than the note does — a note plugged into
+  // an existing session takes that folder rather than keeping whatever it was guessing at.
+  if (folder) next = setField(next, "folder", folder);
+  if (next === text) return;
+  if (!(await tryVault(`could not write to ${noteName(path)}`, () => vault.write(path, next)))) return;
+  graphView.setClaudeSession(path, id, folder);
+  graphStale = true;
+  syncOpenPanes(path, next);
+  ui.status.textContent = `${noteName(path)} now opens its own session`;
+}
+
+/* --------------------------------------------------- plugging in a session --- */
+
+const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Compact enough to read in a list, and never the whole ISO stamp. */
+const shortWhen = (ms: number): string => {
+  const at = new Date(ms);
+  const pad = (n: number): string => String(n).padStart(2, "0");
+  return `${at.getMonth() + 1}/${pad(at.getDate())} ${pad(at.getHours())}:${pad(at.getMinutes())}`;
+};
+
+/**
+ * One line per session in the picker: what it was about, the folder it ran in, when it was
+ * last touched, and the head of its id — which is there to be recognised, and to keep two
+ * sessions with the same title from being the same line.
+ */
+const sessionLabel = (session: { id: string; folder: string; title: string; at: number }): string =>
+  `${session.title || "(nothing said yet)"} — ${basename(session.folder) || "?"} · ` +
+  `${shortWhen(session.at)} · ${session.id.slice(0, 8)}`;
+
+/**
+ * Right-click → "Plug in a session…": point this note at a session that already exists.
+ *
+ * The reliable counterpart to adoption. A note opened from the graph can only be guessed at,
+ * because nothing is sent on its behalf to recognise it by — but a session already on this
+ * machine can simply be CHOSEN, and then the note is plugged into it for good: its id goes
+ * into the note, and a tap resumes it.
+ */
+async function plugInSession(path: string): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) {
+    ui.status.textContent = "Claude sessions need the desktop app — npm start";
+    return;
+  }
+  const sessions = (await bridge.claudeSessions(14).catch(() => [])) ?? [];
+  const byLabel = new Map(sessions.map((session) => [sessionLabel(session), session]));
+  const picked = await askChoice(
+    `Which session should "${noteName(path)}" open?`,
+    [...byLabel.keys()],
+    "Paste a session id…",
+    "Session id",
+    "",
+  );
+  if (!picked) return;
+  const chosen = byLabel.get(picked);
+  const id = chosen?.id ?? picked.trim();
+  if (!SESSION_ID_RE.test(id)) {
+    ui.status.textContent = `"${id}" is not a session id`;
+    return;
+  }
+  claudeAmbiguous.delete(path); // whatever it could not decide before, this settles
+  await saveClaudeSession(path, id, chosen?.folder || undefined);
+  void pollSessions(); // its dot should say something true immediately
+}
+
+/**
+ * "New Claude session" — from the canvas menu, or from a link draft released on empty space
+ * (`source` is then the note the arrow came from). The session is NOT opened yet: the note
+ * gets its name first, which names the node on the graph and nothing else. Claude is never
+ * told the name, or anything at all.
+ */
+async function createClaudeAt(
+  at: { x: number; y: number },
+  folder: string | null,
+  source: string | null = null,
+): Promise<void> {
+  const dir = folder ?? "";
+  // Asked now rather than at the click, so the note says where it runs from the start — and
+  // only where the shell can answer: in a browser the note is made without a folder and the
+  // click reports what it needs.
+  const where = window.bedrock ? await askClaudeFolder() : null;
+  const path = uniquePath(filePaths(), dir, CLAUDE_NAME, ".md");
+  await vault.createFile(path, claudeTemplate(where));
+  entries = [...entries, { path, kind: "file" }]; // so the rename's collision check sees it
+  if (source) {
+    graphView.commitLink(source, path, {
+      label: noteName(path),
+      parent: dir || undefined,
+      at,
+      type: "claude",
+    });
+  } else {
+    graphView.commitNode(path, noteName(path), dir || undefined, at, "claude");
+  }
+  graphStale = true;
+  ui.status.textContent = `created ${path} — name it, and the session opens${where ? ` in ${where}` : ""}`;
+  graphView.renameNode(path, (name) => {
+    void (async () => {
+      const finalPath = name ? ((await applyRename(path, "file", name)) ?? path) : path;
+      // No popup blocker to satisfy here — the shell hands the link to the Claude app — so
+      // the session can wait for the rename to land and be prompted with the real name.
+      if (!source) {
+        await openClaudeSession(finalPath, null);
+        return;
+      }
+      // Linked session: the connection gets its name too, exactly like drawing any link,
+      // and only then does the session open.
+      graphView.promptConnection(source, finalPath, (label) => {
+        void finishLink(source, finalPath, label);
+        void openClaudeSession(finalPath, null);
+      });
+    })();
+  });
+  await refreshSidebar();
+}
+
+/* ------------------------------------------------- what the sessions are doing --- */
+
+/** How often the graph asks what the sessions are doing. */
+const SESSION_POLL_MS = 4000;
+let sessionTimer: number | undefined;
+
+/**
+ * Keeps the corner dots current. Polled rather than watched: the shell would need a file
+ * watcher per transcript to push this, and reading the tail of a handful of files every few
+ * seconds is both cheaper than that and unable to miss an append. Runs only while the
+ * integration is on, the graph is actually on screen, and the vault has sessions to ask
+ * about — a vault with none never wakes the shell at all.
+ */
+async function pollSessions(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge || !settings.enabled("claude")) return;
+  if (!panes.some((p) => tabOf(p)?.kind === "graph")) return;
+  const notes = graphView.sessionNodes();
+  if (!notes.length) return;
+  // A note still waiting on an id gets another go at finding it every time round. This is
+  // the belt to the watch's braces: whatever happened to the window that opened the link —
+  // a reload, a quit, a second click — the id lands as soon as the transcript exists.
+  for (const note of notes) {
+    if (!note.session && note.started && !claudeStarting.has(note.path)) {
+      await adoptClaudeSession(note.path, note.folder, note.started);
+    }
+  }
+  const sessions = graphView.sessionNodes().filter((note) => note.session);
+  if (!sessions.length) return;
+  const status = await bridge.claudeStatus(sessions.map((s) => s.session)).catch(() => null);
+  if (!status) return; // the shell is unhappy; the dots keep saying what they last said
+  for (const { path, session, seen } of sessions) {
+    const found = status[session];
+    // A finished turn is only worth a badge if nobody has read it — which the note knows
+    // and the shell cannot. Everything else the shell says stands as it is.
+    const state: SessionState = !found
+      ? "idle"
+      : found.state === "done"
+        ? found.at > seen
+          ? "unseen"
+          : "idle"
+        : found.state;
+    graphView.setSessionState(path, state, found?.at ?? 0);
+  }
+}
+
+/** Starts or stops the poll to match the toggles and what is on screen. */
+function watchSessions(): void {
+  const wanted = settings.enabled("claude") && !!window.bedrock;
+  if (wanted && sessionTimer === undefined) {
+    sessionTimer = window.setInterval(() => void pollSessions(), SESSION_POLL_MS);
+    void pollSessions(); // don't make the first dot wait out a whole interval
+  } else if (!wanted && sessionTimer !== undefined) {
+    clearInterval(sessionTimer);
+    sessionTimer = undefined;
+  }
+}
+
+/**
+ * Opening a session is reading it, so the blue dot goes out — `seen::` in the note, which
+ * is why it stays out across a restart. Written only when there is something to have seen:
+ * a session nobody has run yet has no turn to be caught up with.
+ */
+async function markSessionSeen(path: string): Promise<void> {
+  const at = graphView.sessionActivity(path);
+  if (!at) return;
+  graphView.setSessionSeen(path, at);
+  await flushAll();
+  const text = await vault.read(path);
+  const next = setField(text, "seen", new Date(at).toISOString());
+  if (next === text) return;
+  await tryVault(`could not mark ${noteName(path)} as seen`, () => vault.write(path, next));
+  graphStale = true;
+  for (let i = 0; i < panes.length; i++) if (pathOf(panes[i]) === path) editors[i].sync(next);
 }
 
 /**

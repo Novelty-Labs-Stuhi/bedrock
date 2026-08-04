@@ -33,6 +33,7 @@ const MARKDOWN: Row[] = [
   ["made with:: [[Note]]", "a named link — the name rides the edge"],
   ["#tag", "tag — colours the note's circle"],
   ["type:: gemini", "types the note — typed notes change shape (Gemini = rectangle)"],
+  ["type:: claude", "a Claude Code session — the node opens it in the Claude app"],
   ["![[picture.png]]", "an image you dropped in"],
   ["[text](https://…)", "a web link"],
 ];

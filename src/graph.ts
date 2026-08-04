@@ -19,7 +19,7 @@ import {
 import { edgeNotePath, edgeTitle, isEdgeNote } from "./edges";
 import { inlineEdit, type InlineEditor } from "./inline";
 import { layoutGraph } from "./apply-layout";
-import { LinkResolver, parseActive, parseLinks, parseTags, parseType } from "./links";
+import { LinkResolver, parseActive, parseField, parseLinks, parseTags, parseType } from "./links";
 import { ancestors, basename, dirname, noteName } from "./vault";
 import type { SettingsStore } from "./settings";
 import type { SpatialStore } from "./spatial";
@@ -168,6 +168,46 @@ const LINEAR_ICON =
   );
 
 /**
+ * The Claude app icon: the coral tile with the off-white burst. Traced off the app's own
+ * icon rather than approximated — twelve round-capped spokes whose UNEVEN spacing is the
+ * whole character of the mark (an evenly spaced one reads as a sparkle or a compass rose,
+ * which is a different logo). Angles and reaches are measured, tile and burst colours are
+ * the icon's own; the spokes meet in the middle, which is what fills the centre in.
+ */
+const CLAUDE_SPOKES: Array<[number, number]> = [
+  [14.5, 23.7],
+  [42.25, 24.1],
+  [59, 23.3],
+  [94, 23.9],
+  [123.5, 24],
+  [146, 23],
+  [180.25, 24.2],
+  [212.75, 24.5],
+  [243, 26.1],
+  [279, 23.1],
+  [310.5, 23.8],
+  [350.75, 23.2],
+];
+
+const CLAUDE_ICON =
+  "data:image/svg+xml;utf8," +
+  encodeURIComponent(
+    // Sized explicitly for the same two reasons the others are: no 300x150 fallback for
+    // `cover` to crop, and 256px of raster to stay crisp zoomed in.
+    `<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 64 64">` +
+      `<rect width="64" height="64" rx="14" fill="#da704d"/>` +
+      `<g transform="translate(32 32)" stroke="#fefcfb" stroke-width="4" stroke-linecap="round">` +
+      CLAUDE_SPOKES.map(([angle, reach]) => {
+        const radians = (angle * Math.PI) / 180;
+        const x = (Math.cos(radians) * reach).toFixed(2);
+        const y = (Math.sin(radians) * reach).toFixed(2);
+        return `<line x1="0" y1="0" x2="${x}" y2="${y}"/>`;
+      }).join("") +
+      `</g>` +
+      `</svg>`,
+  );
+
+/**
  * Styles by note TYPE — the `type:: …` line a file ends with. Untyped notes are
  * tag-pie circles; a typed one wears its type on its sleeve — a Gemini
  * conversation IS the Gemini app icon. New types slot in here and get their
@@ -187,6 +227,15 @@ const TYPE_STYLES: Record<string, Record<string, unknown>> = {
   linear: {
     shape: "round-rectangle",
     "background-image": LINEAR_ICON,
+    "background-fit": "cover",
+    "background-opacity": 0,
+    "pie-size": "0%",
+  },
+  // A coding session, the third of the same siblings: the app's own tile, and clicking it
+  // goes to the session rather than to the file.
+  claude: {
+    shape: "round-rectangle",
+    "background-image": CLAUDE_ICON,
     "background-fit": "cover",
     "background-opacity": 0,
     "pie-size": "0%",
@@ -542,6 +591,25 @@ export function buildElements(docs: Doc[], described: ReadonlySet<string> = new 
         // A conversation node opens its link directly, so the URL rides on the node —
         // a click must not wait on a file read (popup blockers honour only the click).
         ...(type === "gemini" ? { gurl: URL_RE.exec(doc.text)?.[0] ?? "" } : {}),
+        // Same bargain for a session note: its id rides the node, so a click can go
+        // straight to `claude://resume` without a read first. Empty until the Claude app
+        // has minted one — that is a note that has never been run.
+        ...(type === "claude"
+          ? {
+              csession: parseField(doc.text, "session") ?? "",
+              // How much of the session has been looked at (`seen::`), so a turn that
+              // finished while the graph was closed still reads as unseen when it opens.
+              // What the session is DOING is deliberately NOT here: `sync` patches the
+              // keys a definition carries, and a rebuild must not blank a live badge
+              // back to nothing until the next poll comes round.
+              cseen: Date.parse(parseField(doc.text, "seen") ?? "") || 0,
+              // Where it runs, and when it was last sent to Claude with no id to show for
+              // it: between them a note can find its own session on disk afterwards, which
+              // is what makes catching the id survive a second click or a restart.
+              cfolder: parseField(doc.text, "folder") ?? "",
+              cstarted: parseField(doc.text, "started") ?? "",
+            }
+          : {}),
         ...pieData(parseTags(doc.text)),
       },
     });
@@ -569,6 +637,33 @@ export function buildElements(docs: Doc[], described: ReadonlySet<string> = new 
 
 export type Client = { x: number; y: number };
 
+/**
+ * What a link draft is aimed at making when it lands on empty space: an ordinary note, or
+ * one of the typed notes that stand for something outside the vault.
+ */
+export type DraftKind = "note" | "gemini" | "claude";
+
+/**
+ * What a Claude session is doing, as the corner of its node reports it. `unseen` is the
+ * renderer's own reading of a finished turn: the shell says a turn ended, the note says how
+ * much of the session has been read, and only together do they mean "go and look".
+ */
+export type SessionState = "running" | "waiting" | "unseen" | "idle";
+
+const SESSION_TITLES: Record<SessionState, string> = {
+  running: "Claude is working",
+  waiting: "waiting on you",
+  unseen: "finished — not looked at yet",
+  idle: "nothing running",
+};
+
+/** What each kind is called in the hints a draft puts on the status bar. */
+const DRAFT_NAMES: Record<DraftKind, string> = {
+  note: "note",
+  gemini: "Gemini conversation",
+  claude: "Claude session",
+};
+
 export type GraphHandlers = {
   onOpen: (path: string) => void;
   /**
@@ -576,6 +671,12 @@ export type GraphHandlers = {
    * chat URL stored on the node (null when the note carries none yet).
    */
   onOpenGemini: (path: string, url: string | null) => void;
+  /**
+   * Click on a Claude Code session node: hand over the session id stored on the node, or
+   * null for a note that has never been run — which is the difference between resuming a
+   * session and starting one.
+   */
+  onOpenClaude: (path: string, session: string | null) => void;
   /**
    * An edit made in an issue card: the note's new markdown, and what (if anything) of
    * it Linear should be told about. The graph has already redrawn — this is the write.
@@ -598,10 +699,9 @@ export type GraphHandlers = {
   /**
    * Link draft finished on empty canvas: create a note THERE and link to it. `folder` is the box
    * the release landed in (null at the root) — the note belongs where the user dropped it, not
-   * wherever the source note happens to live. `kind` is what the draft was aimed at making:
-   * an ordinary note, or a Gemini conversation.
+   * wherever the source note happens to live. `kind` is what the draft was aimed at making.
    */
-  onLinkNew: (source: string, at: cytoscape.Position, folder: string | null, kind: "note" | "gemini") => void;
+  onLinkNew: (source: string, at: cytoscape.Position, folder: string | null, kind: DraftKind) => void;
   /** A note was dragged deep enough into a folder box to move it there. */
   onReparent: (path: string, folder: string) => void;
   /**
@@ -646,7 +746,7 @@ export class GraphView {
   private sizeWatcher: ResizeObserver | null = null;
   private draftSource: string | null = null;
   /** What the open draft will create if it lands on empty space. */
-  private draftKind: "note" | "gemini" = "note";
+  private draftKind: DraftKind = "note";
   private drag: DragState | null = null;
   private frames: FrameStore;
   private boxesVisible = localStorage.getItem(BOXES_KEY) !== "off";
@@ -666,6 +766,8 @@ export class GraphView {
   private pulseEls = new Map<string, HTMLElement>();
   /** Note path -> the "done" badge on its icon, for the issues that are finished. */
   private badgeEls = new Map<string, HTMLElement>();
+  /** Note path -> the dot on its corner saying what its Claude session is doing. */
+  private sessionEls = new Map<string, HTMLElement>();
   /** The open issue card, if any — one at a time, like a popover. */
   private issue: { path: string; el: HTMLElement } | null = null;
   /** Which row of it is waiting for an arrow, while one is being aimed. */
@@ -1142,6 +1244,12 @@ export class GraphView {
         this.handlers.onOpenGemini(node.id(), (node.data("gurl") as string) || null);
         return;
       }
+      // A session node is where the work is happening, not a page about it: clicking it
+      // opens the session in the Claude app.
+      if (node.data("ntype") === "claude" && this.settings.enabled("claude")) {
+        this.handlers.onOpenClaude(node.id(), (node.data("csession") as string) || null);
+        return;
+      }
       // An issue node is a folded checklist: clicking unfolds it over the canvas
       // rather than opening the file, which is where the ticks live anyway.
       if (node.data("ntype") === "linear" && this.settings.enabled("linear")) {
@@ -1522,6 +1630,7 @@ export class GraphView {
     this.drawPulses();
     this.placeIssueCard();
     this.drawIssueBadges();
+    this.drawSessionBadges();
   }
 
   /** Re-applies the feature toggles to everything drawn above the canvas. */
@@ -1562,13 +1671,16 @@ export class GraphView {
           this.overlay.appendChild(el);
           this.pulseEls.set(dot.id(), el);
         }
-        // Rendered units: the ring rides the zoom with the note it belongs to.
+        // Model units and a transform: the ring rides the zoom with the note it belongs
+        // to, and so do its rim and its glow — a size in rendered pixels would shrink the
+        // circle while leaving a 1.5px border to thicken around it.
         const at = dot.renderedPosition();
-        const size = dot.renderedWidth() + 4;
+        const size = dot.width() + 4;
         el.style.left = `${at.x}px`;
         el.style.top = `${at.y}px`;
         el.style.width = `${size}px`;
         el.style.height = `${size}px`;
+        el.style.transform = `translate(-50%, -50%) scale(${cy.zoom()})`;
       });
     }
     for (const [id, el] of this.pulseEls) {
@@ -1793,13 +1905,17 @@ export class GraphView {
         }
         const at = dot.renderedPosition();
         const half = dot.renderedWidth() / 2;
-        const size = Math.max(5, half * 0.85);
+        // Model units and a transform, never a size in rendered pixels: scaling the whole
+        // element takes the ring around it and the check inside it along, and nothing is
+        // floored — a badge that stopped shrinking would end up swallowing its own tile.
+        const size = (dot.width() / 2) * 0.85;
         // Sat on the corner, overlapping the tile a little, the way an app badge does.
         el.style.left = `${at.x + half * 0.82}px`;
         el.style.top = `${at.y - half * 0.82}px`;
         el.style.width = `${size}px`;
         el.style.height = `${size}px`;
         el.style.fontSize = `${size * 0.72}px`;
+        el.style.transform = `translate(-50%, -50%) scale(${cy.zoom()})`;
       });
     }
     for (const [id, el] of this.badgeEls) {
@@ -2177,15 +2293,15 @@ export class GraphView {
     this.rename.editor.move(at.x, at.y);
   }
 
-  /** Public entry for the context menu's link actions — to a note, or to a Gemini chat. */
-  startLink(path: string, kind: "note" | "gemini" = "note"): void {
+  /** Public entry for the context menu's link actions — to a note, or to a typed one. */
+  startLink(path: string, kind: DraftKind = "note"): void {
     const node = this.cy?.getElementById(path);
     if (node && node.nonempty()) this.startDraft(node as NodeSingular, kind);
   }
 
   /* ------------------------------------------------------------ link draft --- */
 
-  private startDraft(source: NodeSingular, kind: "note" | "gemini" = "note", row: number | null = null): void {
+  private startDraft(source: NodeSingular, kind: DraftKind = "note", row: number | null = null): void {
     if (!this.cy) return;
     this.cy.elements().removeClass("faded").removeClass("highlight");
     this.draftSource = source.id();
@@ -2210,8 +2326,8 @@ export class GraphView {
     this.handlers.onHint(
       row !== null
         ? "Click a note to point this line at it — typing (or Esc) leaves it without an arrow"
-        : kind === "gemini"
-          ? "Click empty space to put the Gemini conversation there — Esc cancels"
+        : kind !== "note"
+          ? `Click empty space to put the ${DRAFT_NAMES[kind]} there — Esc cancels`
           : "Click a note to link to it, or empty space to create one — Esc cancels",
     );
   }
@@ -2261,13 +2377,14 @@ export class GraphView {
   }
 
   private finishDraftOnNode(node: NodeSingular): void {
-    // A chat draft has no business landing on a note: silently turning it into a
+    // A typed draft has no business landing on a note: silently turning it into a
     // note-to-note link is exactly where phantom connections came from. The draft
     // stays armed — empty space is the only thing that finishes it. The hint waits
     // a tick, or the click's own grab/free cycle wipes it before it is ever seen.
-    if (this.draftKind === "gemini") {
+    if (this.draftKind !== "note") {
+      const what = DRAFT_NAMES[this.draftKind];
       window.setTimeout(
-        () => this.handlers.onHint("A Gemini chat wants empty space — click beside the notes (Esc cancels)"),
+        () => this.handlers.onHint(`A ${what} wants empty space — click beside the notes (Esc cancels)`),
         0,
       );
       return;
@@ -2343,6 +2460,133 @@ export class GraphView {
   setGeminiUrl(path: string, url: string): void {
     const node = this.cy?.getElementById(path);
     if (node && node.nonempty()) node.data("gurl", url);
+  }
+
+  /** Likewise for the session id the Claude app has just minted — it is no longer pending. */
+  setClaudeSession(path: string, session: string, folder?: string): void {
+    const node = this.cy?.getElementById(path);
+    if (!node || node.empty()) return;
+    node.data("csession", session);
+    node.data("cstarted", "");
+    if (folder) node.data("cfolder", folder);
+  }
+
+  /** A note that has just been sent to Claude and has no id to show for it yet. */
+  setClaudePending(path: string, folder: string, started: string): void {
+    const node = this.cy?.getElementById(path);
+    if (!node || node.empty()) return;
+    node.data("cfolder", folder);
+    node.data("cstarted", started);
+  }
+
+  /* --------------------------------------------------- what a session is doing --- */
+
+  /** The session note at `path`, or null when that node is not one. */
+  sessionNote(path: string): ReturnType<GraphView["sessionNodes"]>[number] | null {
+    const node = this.cy?.getElementById(path);
+    if (!node || node.empty() || node.data("ntype") !== "claude") return null;
+    return {
+      path,
+      session: (node.data("csession") as string) || "",
+      seen: Number(node.data("cseen")) || 0,
+      folder: (node.data("cfolder") as string) || "",
+      started: (node.data("cstarted") as string) || "",
+    };
+  }
+
+  /** Every session note on the canvas, with what the graph knows about each. */
+  sessionNodes(): Array<{
+    path: string;
+    session: string;
+    seen: number;
+    folder: string;
+    started: string;
+  }> {
+    const cy = this.cy;
+    if (!cy) return [];
+    const out: ReturnType<GraphView["sessionNodes"]> = [];
+    cy.nodes().forEach((node) => {
+      if (node.data("ntype") !== "claude") return;
+      out.push({
+        path: node.id(),
+        session: (node.data("csession") as string) || "",
+        seen: Number(node.data("cseen")) || 0,
+        folder: (node.data("cfolder") as string) || "",
+        started: (node.data("cstarted") as string) || "",
+      });
+    });
+    return out;
+  }
+
+  /** A polled state, onto the live node and its badge. `at` is the session's last turn. */
+  setSessionState(path: string, state: SessionState, at: number): void {
+    const node = this.cy?.getElementById(path);
+    if (!node || node.empty()) return;
+    if (node.data("cstate") === state && node.data("cat") === at) return;
+    node.data("cstate", state);
+    node.data("cat", at);
+    this.drawSessionBadges();
+  }
+
+  /** The session's last turn as the last poll had it — what "seen up to here" means. */
+  sessionActivity(path: string): number {
+    const node = this.cy?.getElementById(path);
+    return node && node.nonempty() ? Number(node.data("cat")) || 0 : 0;
+  }
+
+  /** Opening a session is reading it: the blue dot goes out at once, not at the next poll. */
+  setSessionSeen(path: string, at: number): void {
+    const node = this.cy?.getElementById(path);
+    if (!node || node.empty()) return;
+    node.data("cseen", at);
+    if (node.data("cstate") === "unseen") node.data("cstate", "idle");
+    this.drawSessionBadges();
+  }
+
+  /**
+   * What each session is doing, on the top-left corner of its tile: a blinking grey dot
+   * while Claude is working, amber when it is waiting on an answer, blue when a turn has
+   * finished that nobody has looked at, and an empty ring the rest of the time — including
+   * for a note that has never been run, which is a session that could be there and isn't.
+   *
+   * Left corner, not right: the node's label hangs off its right side, and a dot under the
+   * first letters of the name is a dot nobody can read. Drawn in the overlay and sized off
+   * the node, like the issue badge, so it rides the zoom; the blink is CSS, so it keeps
+   * time while the canvas sits idle.
+   */
+  private drawSessionBadges(): void {
+    const cy = this.cy;
+    if (!cy) return;
+    const alive = new Set<string>();
+    if (this.settings.enabled("claude")) {
+      cy.nodes().forEach((node) => {
+        const dot = node as NodeSingular;
+        if (dot.data("ntype") !== "claude") return;
+        alive.add(dot.id());
+        let el = this.sessionEls.get(dot.id());
+        if (!el) {
+          el = document.createElement("div");
+          this.overlay.appendChild(el);
+          this.sessionEls.set(dot.id(), el);
+        }
+        const state = ((dot.data("cstate") as SessionState) || "idle") as SessionState;
+        el.className = `session-badge ${state}`;
+        el.title = SESSION_TITLES[state];
+        const at = dot.renderedPosition();
+        const half = dot.renderedWidth() / 2;
+        const size = (dot.width() / 2) * 0.5;
+        el.style.left = `${at.x - half * 0.82}px`;
+        el.style.top = `${at.y - half * 0.82}px`;
+        el.style.width = `${size}px`;
+        el.style.height = `${size}px`;
+        el.style.transform = `translate(-50%, -50%) scale(${cy.zoom()})`;
+      });
+    }
+    for (const [id, el] of this.sessionEls) {
+      if (alive.has(id)) continue;
+      el.remove();
+      this.sessionEls.delete(id);
+    }
   }
 
   /** Writes a relation name onto the live edge, so it shows without a rebuild. */
