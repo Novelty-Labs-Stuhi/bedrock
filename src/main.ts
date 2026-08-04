@@ -1523,9 +1523,12 @@ async function openClaudeSession(path: string, session: string | null): Promise<
 /** Hands a note's session back to the Claude app, and counts that as having read it. */
 async function resumeClaudeSession(path: string, session: string): Promise<void> {
   try {
-    await window.bedrock?.claudeResume(session);
+    const how = await window.bedrock?.claudeOpen(session);
     await markSessionSeen(path);
-    ui.status.textContent = `${noteName(path)} → its session in Claude`;
+    ui.status.textContent =
+      how === "imported"
+        ? `${noteName(path)} → its conversation, brought into Claude`
+        : `${noteName(path)} → its conversation in Claude`;
   } catch (err) {
     ui.status.textContent = `Claude: ${(err as Error).message}`;
   }

@@ -16,7 +16,7 @@ contextBridge.exposeInMainWorld("bedrock", {
   claudeFolders: (limit) => ipcRenderer.invoke("claude-folders", limit),
   claudeSessions: (limit) => ipcRenderer.invoke("claude-sessions", limit),
   claudeStart: (folder) => ipcRenderer.invoke("claude-start", folder),
-  claudeResume: (session) => ipcRenderer.invoke("claude-resume", session),
+  claudeOpen: (session) => ipcRenderer.invoke("claude-open", session),
   claudeStatus: (sessions) => ipcRenderer.invoke("claude-status", sessions),
   claudeAdopt: (folder, since) => ipcRenderer.invoke("claude-adopt", folder, since),
   linearConnect: (key) => ipcRenderer.invoke("linear-connect", key),

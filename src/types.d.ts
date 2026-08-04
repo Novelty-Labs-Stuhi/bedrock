@@ -26,8 +26,11 @@ interface Window {
         composer — nothing is sent on the note's behalf. Resolves with the session's id once
         the first message is sent, or null if none ever is. */
     claudeStart(folder: string): Promise<string | null>;
-    /** Reopens a session in the Claude app by id. */
-    claudeResume(session: string): Promise<boolean>;
+    /** Opens THE session in the Claude app — its own view, live or dormant ("opened"). A
+        session the app has never seen (born in a terminal) is brought in through the app's
+        import door instead ("imported"), which happens at most once: from then on it has a
+        view of its own. */
+    claudeOpen(session: string): Promise<"opened" | "imported">;
     /** The session started in `folder` since `since` (an ISO stamp), found on disk — how a
         note catches up with its session when the live watch was interrupted. `id` is set only
         when there is exactly one candidate; more than one and it will not guess, so they are

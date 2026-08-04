@@ -562,11 +562,86 @@ ipcMain.handle("claude-start", async (_event, folder) => {
   return watchForSession(dir, before);
 });
 
-ipcMain.handle("claude-resume", async (_event, session) => {
+/** Where the Claude app keeps its own record of every session it shows. */
+const appSessionsDir = () => path.join(app.getPath("appData"), "Claude", "claude-code-sessions");
+
+/**
+ * The Claude app's OWN id for a session, found by the transcript it points at.
+ *
+ * The app keys its sessions by an id it mints itself and records the transcript's id beside
+ * it as `cliSessionId` — so the transcript id has to be translated before the app can be
+ * pointed anywhere. Among the records for one transcript (an import leaves a second,
+ * hollow one behind), the one with the newest activity is the session as the user knows it.
+ */
+function appSessionId(id) {
+  const root = appSessionsDir();
+  let best = null;
+  let accounts = [];
+  try {
+    accounts = fs.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return null; // the app has never kept a session here
+  }
+  for (const account of accounts) {
+    if (!account.isDirectory()) continue;
+    const accountDir = path.join(root, account.name);
+    let spaces = [];
+    try {
+      spaces = fs.readdirSync(accountDir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const space of spaces) {
+      if (!space.isDirectory()) continue;
+      const spaceDir = path.join(accountDir, space.name);
+      let files = [];
+      try {
+        files = fs.readdirSync(spaceDir);
+      } catch {
+        continue;
+      }
+      for (const name of files) {
+        if (!name.endsWith(".json")) continue;
+        let record;
+        try {
+          record = JSON.parse(fs.readFileSync(path.join(spaceDir, name), "utf8"));
+        } catch {
+          continue;
+        }
+        if (record.cliSessionId !== id || record.isArchived) continue;
+        if (typeof record.sessionId !== "string") continue;
+        const at = Number(record.lastActivityAt) || 0;
+        if (!best || at > best.at) best = { sessionId: record.sessionId, at };
+      }
+    }
+  }
+  return best && best.sessionId;
+}
+
+/*
+ * Opens a session in the Claude app — THE session, not a copy.
+ *
+ * `claude://claude.ai/claude-code-desktop/<app id>` loads that path in the app's window and
+ * the web app routes it to the session view. It is the one deep link that reaches an
+ * existing local session (`resume` imports a duplicate; `epitaxy` links are dropped; the
+ * `code` host only admits remote ids) — found by elimination, then proven twice over with
+ * the focus stamp the app writes on the record when its view comes up: once on a live
+ * session, once on one that had sat untouched for over an hour.
+ *
+ * A session the app has never seen — born in a terminal, no record — cannot be navigated
+ * to; importing is the app's own door for those, and it is taken exactly once, since from
+ * then on the session has a record.
+ */
+ipcMain.handle("claude-open", async (_event, session) => {
   const id = String(session);
   if (!SESSION_ID.test(id)) throw new Error(`${id} is not a session id`);
+  const record = appSessionId(id);
+  if (record) {
+    await shell.openExternal(`claude://claude.ai/claude-code-desktop/${encodeURIComponent(record)}`);
+    return "opened";
+  }
   await shell.openExternal(`claude://resume?session=${id}`);
-  return true;
+  return "imported";
 });
 
 /*
