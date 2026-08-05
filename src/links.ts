@@ -127,6 +127,18 @@ export function parseActive(text: string): boolean {
 export const setActive = (text: string, on: boolean): string =>
   setField(text, "active", on ? "true" : null);
 
+/**
+ * The opposite end of the vault: `ghost:: true`. A ghosted note is parked — still on the
+ * graph, but grey, dimmed and dotted, so what is live reads against what is on ice.
+ */
+export function parseGhost(text: string): boolean {
+  const value = parseField(text, "ghost");
+  return value !== null && !OFF.has(value.toLowerCase());
+}
+
+export const setGhost = (text: string, on: boolean): string =>
+  setField(text, "ghost", on ? "true" : null);
+
 /** Same shape as LINK_RE, but keeping the `|alias` tail so a rewrite can put it back. */
 const REWRITE_RE = /(?<!!)\[\[([^\][|]+)(\|[^\][]*)?\]\]/g;
 

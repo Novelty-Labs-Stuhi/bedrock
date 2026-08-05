@@ -19,7 +19,7 @@ import {
 import { edgeNotePath, edgeTitle, isEdgeNote } from "./edges";
 import { inlineEdit, type InlineEditor } from "./inline";
 import { layoutGraph } from "./apply-layout";
-import { LinkResolver, parseActive, parseField, parseLinks, parseTags, parseType } from "./links";
+import { LinkResolver, parseActive, parseField, parseGhost, parseLinks, parseTags, parseType } from "./links";
 import { ancestors, basename, dirname, noteName } from "./vault";
 import type { SettingsStore } from "./settings";
 import type { SpatialStore } from "./spatial";
@@ -207,6 +207,64 @@ const CLAUDE_ICON =
       `</svg>`,
   );
 
+/*
+ * A file or folder on this machine wears the sidebar's own icons — the same yellow
+ * folder with its darker tab, the same blue page with the folded corner, path for
+ * path — so the node and the tree row read as the same thing. No tile behind them,
+ * unlike the app icons above: an app node is a tile because the icon IS a tile;
+ * these are the shapes themselves. 256px of raster for the usual two reasons.
+ */
+const FOLDER_NODE_ICON =
+  "data:image/svg+xml;utf8," +
+  encodeURIComponent(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 20 20">` +
+      `<path d="M2 5.2C2 4.26 2.76 3.5 3.7 3.5h3.9c.45 0 .88.18 1.2.5l1.5 1.5H2z" fill="#c78e10"/>` +
+      `<rect x="2" y="5.6" width="16" height="10.9" rx="1.7" fill="url(#fold-shine)"/>` +
+      `<defs><linearGradient id="fold-shine" x1="0" y1="0" x2="0" y2="1">` +
+      `<stop offset="0" stop-color="#ffdd75"/><stop offset="1" stop-color="#f6b81f"/>` +
+      `</linearGradient></defs></svg>`,
+  );
+
+const FILE_NODE_ICON =
+  "data:image/svg+xml;utf8," +
+  encodeURIComponent(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 20 20">` +
+      `<path d="M4.5 4a2 2 0 0 1 2-2h5.4L16 6.1v9.9a2 2 0 0 1-2 2H6.5a2 2 0 0 1-2-2z" fill="#55d0f7"/>` +
+      `<path d="M11.9 2 16 6.1h-3.1a1 1 0 0 1-1-1z" fill="#2f7fd6"/>` +
+      `</svg>`,
+  );
+
+/**
+ * The ghost a parked note wears: the classic sheet — rounded head, two eye slots, three
+ * drips of uneven length trailing off the bottom — floating over its own little shadow.
+ * Darker grey on the grey the node turns, so a ghosted note reads as a shape with the
+ * light off rather than a different kind of note. Inline SVG like the app icons above,
+ * and 256px of raster for the same reason they are.
+ */
+const GHOST_GREY = "#565b63";
+const GHOST_DARK = "#2b2e33";
+
+const GHOST_ICON =
+  "data:image/svg+xml;utf8," +
+  encodeURIComponent(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 64 64">` +
+      // Head and shoulders: a semicircle carried straight down a little, so the drips
+      // below hang off a body rather than straight off the dome.
+      `<path fill="${GHOST_DARK}" d="M12 26 a20 20 0 0 1 40 0 v6 h-40 z"/>` +
+      // The drips: round-capped strokes of uneven length, the middle one longest —
+      // even lengths read as a paw print, not a ghost.
+      `<g stroke="${GHOST_DARK}" stroke-width="11" stroke-linecap="round">` +
+      `<line x1="17.5" y1="30" x2="17.5" y2="41"/>` +
+      `<line x1="32" y1="30" x2="32" y2="46"/>` +
+      `<line x1="46.5" y1="30" x2="46.5" y2="36"/>` +
+      `</g>` +
+      // Eyes cut in the node's own grey, so they read as holes rather than dots.
+      `<rect x="24" y="16" width="5.5" height="10" rx="2.75" fill="${GHOST_GREY}"/>` +
+      `<rect x="34.5" y="16" width="5.5" height="10" rx="2.75" fill="${GHOST_GREY}"/>` +
+      `<ellipse cx="32" cy="58" rx="10" ry="2.8" fill="${GHOST_DARK}" opacity="0.5"/>` +
+      `</svg>`,
+  );
+
 /**
  * Styles by note TYPE — the `type:: …` line a file ends with. Untyped notes are
  * tag-pie circles; a typed one wears its type on its sleeve — a Gemini
@@ -236,6 +294,23 @@ const TYPE_STYLES: Record<string, Record<string, unknown>> = {
   claude: {
     shape: "round-rectangle",
     "background-image": CLAUDE_ICON,
+    "background-fit": "cover",
+    "background-opacity": 0,
+    "pie-size": "0%",
+  },
+  // Something on the disk itself: the sidebar's blue page, and clicking it opens the
+  // file in whatever the OS opens that kind of file with.
+  file: {
+    shape: "round-rectangle",
+    "background-image": FILE_NODE_ICON,
+    "background-fit": "cover",
+    "background-opacity": 0,
+    "pie-size": "0%",
+  },
+  // Its sibling: the sidebar's yellow folder, and a click opens Finder/Explorer there.
+  folder: {
+    shape: "round-rectangle",
+    "background-image": FOLDER_NODE_ICON,
     "background-fit": "cover",
     "background-opacity": 0,
     "pie-size": "0%",
@@ -347,6 +422,50 @@ const STYLE: cytoscape.StylesheetJson = [
       "text-background-shape": "roundrectangle",
     },
   },
+  /*
+   * The marks a right-click can put on things (see `applyMarks`). A ghost is parked, not
+   * gone: the node turns grey and wears the ghost itself, ringed by long dashes — long
+   * on purpose, a dash you can read from across the canvas where a dot is just fuzz.
+   * The edge version is the same statement drawn along a line. A radiating edge is the
+   * line counterpart of a radiating note — the same green, with `syncEdgeBeat` walking
+   * the dashes along it so the flow reads as flowing.
+   */
+  {
+    selector: "node.ghost",
+    style: {
+      "pie-size": "0%",
+      "background-color": GHOST_GREY,
+      "background-opacity": 1,
+      "background-image": GHOST_ICON,
+      "background-image-opacity": 1,
+      "background-fit": "none",
+      "background-width": "74%",
+      "background-height": "74%",
+      "border-width": 2,
+      "border-color": "#8b949e",
+      "border-style": "dashed",
+      "border-dash-pattern": [9, 6],
+      color: "#8b949e",
+    },
+  },
+  {
+    selector: "edge.ghost",
+    style: {
+      "line-style": "dashed",
+      "line-dash-pattern": [12, 8],
+      "line-color": "#6e7681",
+      "target-arrow-color": "#6e7681",
+    },
+  },
+  {
+    selector: "edge.radiate",
+    style: {
+      "line-style": "dashed",
+      "line-dash-pattern": [7, 5],
+      "line-color": "#3fb950",
+      "target-arrow-color": "#3fb950",
+    },
+  },
   { selector: "node.active", style: { "border-width": 3, "border-color": "#dcddde" } },
   { selector: ".faded", style: { opacity: 0.25 } },
   // The arrow is recoloured with the line everywhere, or a highlighted edge keeps a red
@@ -407,6 +526,31 @@ const STYLE: cytoscape.StylesheetJson = [
 ];
 
 const BOXES_KEY = "obsidian-lite:boxes";
+
+/* ------------------------------------------------------------------- marks --- */
+
+/**
+ * The statuses a right-click can set: radiating (the live end of the vault) or ghost
+ * (parked). A node's mark lives in its own markdown — `active:: true` / `ghost:: true` —
+ * so it travels with the folder. An edge has no file of its own unless it has been
+ * described, so edge marks live beside the boxes toggle instead, keyed by edge id.
+ */
+export type Mark = "radiate" | "ghost";
+
+const MARKS_KEY = "obsidian-lite:edge-marks";
+
+function readEdgeMarks(): Record<string, Mark> {
+  try {
+    const kept = JSON.parse(localStorage.getItem(MARKS_KEY) ?? "{}") as Record<string, unknown>;
+    const out: Record<string, Mark> = {};
+    for (const [id, mark] of Object.entries(kept)) {
+      if (mark === "radiate" || mark === "ghost") out[id] = mark;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
 
 const DRAFT_NODE = "__draft_target__";
 const DRAFT_EDGE = "__draft_edge__";
@@ -538,7 +682,26 @@ export function buildElements(docs: Doc[], described: ReadonlySet<string> = new 
   const elements: ElementDefinition[] = [];
   const folders = new Set<string>();
 
-  // Edges are resolved FIRST: a note is sized by how many others point at it, so the
+  // Issues are read FIRST: a solved issue leaves the canvas altogether, and a solved row
+  // takes its arrow down with it — so the link pass below has to know what is finished
+  // before it counts anything. The notes themselves keep every line and every link;
+  // reopen a row (or the issue) and it all comes back.
+  const types = new Map<string, string | null>();
+  const issues = new Map<string, IssueDoc>();
+  const solved = new Set<string>();
+  for (const doc of docs) {
+    // A note in `linear/` (or the `todos/` folder that came before it) is an issue by
+    // where it lives — no `type::` line to write, nothing to migrate. An explicit
+    // `type:: linear` works too, for an issue note filed anywhere else.
+    const type = parseType(doc.text) ?? (isIssuePath(doc.path) ? "linear" : null);
+    types.set(doc.path, type);
+    if (type !== "linear") continue;
+    const issue = parseIssue(doc.text, noteName(doc.path));
+    issues.set(doc.path, issue);
+    if (issue.state === "done" || rollUp(issue.rows) === "done") solved.add(doc.path);
+  }
+
+  // Edges are resolved next: a note is sized by how many others point at it, so the
   // link pass has to have run before the nodes can be emitted.
   // One edge per (source, target); its label is the relation named in the file
   // (`built with:: [[Target]]`). Several links to the same note keep every distinct name.
@@ -546,9 +709,16 @@ export function buildElements(docs: Doc[], described: ReadonlySet<string> = new 
   const incoming = new Map<string, number>();
   const outgoing = new Map<string, number>();
   for (const doc of docs) {
+    if (solved.has(doc.path)) continue;
+    const settled = issues
+      .get(doc.path)
+      ?.rows.filter((row) => row.state === "done" && row.target)
+      .map((row) => resolver.resolve(row.target as string));
+    const settledRows = settled ? new Set(settled) : null;
     for (const link of parseLinks(doc.text)) {
       const resolved = resolver.resolve(link.target);
-      if (!resolved || resolved === doc.path) continue;
+      if (!resolved || resolved === doc.path || solved.has(resolved)) continue;
+      if (settledRows?.has(resolved)) continue;
       const id = edgeId(doc.path, resolved);
       const found = byEdge.get(id) ?? { source: doc.path, target: resolved, labels: [] };
       if (link.label && !found.labels.includes(link.label)) found.labels.push(link.label);
@@ -562,17 +732,15 @@ export function buildElements(docs: Doc[], described: ReadonlySet<string> = new 
   }
 
   for (const doc of docs) {
+    if (solved.has(doc.path)) continue; // a finished issue is not on the canvas at all
     // Every folder gets a box on the graph except the ones the app keeps issues in:
     // `linear/` is not somewhere anybody filed anything, and a rectangle drawn round
     // every issue you own says nothing while hiding whatever is under it.
     for (const folder of ancestors(doc.path)) if (!isIssueDir(folder)) folders.add(folder);
     const home = dirname(doc.path);
     const boxed = home && !isIssueDir(home) ? home : undefined;
-    // A note in `linear/` (or the `todos/` folder that came before it) is an issue by
-    // where it lives — no `type::` line to write, nothing to migrate. An explicit
-    // `type:: linear` works too, for an issue note filed anywhere else.
-    const type = parseType(doc.text) ?? (isIssuePath(doc.path) ? "linear" : null);
-    const issue = type === "linear" ? parseIssue(doc.text, noteName(doc.path)) : null;
+    const type = types.get(doc.path) ?? null;
+    const issue = issues.get(doc.path) ?? null;
     elements.push({
       data: {
         id: doc.path,
@@ -588,9 +756,13 @@ export function buildElements(docs: Doc[], described: ReadonlySet<string> = new 
         // Likewise always present: `sync` patches the keys a definition carries, so a
         // 0 is what stops a note that has just been quietened from pulsing forever.
         radiating: parseActive(doc.text) ? 1 : 0,
+        // Its grey twin, same bargain: `ghost:: true` in the note, 0 when the line goes.
+        ghost: parseGhost(doc.text) ? 1 : 0,
         // A conversation node opens its link directly, so the URL rides on the node —
         // a click must not wait on a file read (popup blockers honour only the click).
         ...(type === "gemini" ? { gurl: URL_RE.exec(doc.text)?.[0] ?? "" } : {}),
+        // A file/folder node opens what its `path::` points at, riding along the same way.
+        ...(type === "file" || type === "folder" ? { fspath: parseField(doc.text, "path") ?? "" } : {}),
         // Same bargain for a session note: its id rides the node, so a click can go
         // straight to `claude://resume` without a read first. Empty until the Claude app
         // has minted one — that is a note that has never been run.
@@ -641,7 +813,7 @@ export type Client = { x: number; y: number };
  * What a link draft is aimed at making when it lands on empty space: an ordinary note, or
  * one of the typed notes that stand for something outside the vault.
  */
-export type DraftKind = "note" | "gemini" | "claude";
+export type DraftKind = "note" | "gemini" | "claude" | "file" | "folder";
 
 /**
  * What a Claude session is doing, as the corner of its node reports it. `unseen` is the
@@ -662,6 +834,8 @@ const DRAFT_NAMES: Record<DraftKind, string> = {
   note: "note",
   gemini: "Gemini conversation",
   claude: "Claude session",
+  file: "file link",
+  folder: "folder link",
 };
 
 export type GraphHandlers = {
@@ -678,6 +852,12 @@ export type GraphHandlers = {
    */
   onOpenClaude: (path: string, session: string | null) => void;
   /**
+   * Click on a file/folder node: hand over the disk path stored on the node (null when
+   * the note carries none), and which of the two it is — a file opens in its default
+   * app, a folder opens in Finder/Explorer.
+   */
+  onOpenPath: (path: string, target: string | null, kind: "file" | "folder") => void;
+  /**
    * An edit made in an issue card: the note's new markdown, and what (if anything) of
    * it Linear should be told about. The graph has already redrawn — this is the write.
    */
@@ -692,6 +872,8 @@ export type GraphHandlers = {
   onOpenEdge: (source: string, target: string, label: string | null) => void;
   /** Right-click on a note: offer "link" / "delete". */
   onNodeMenu: (path: string, client: Client) => void;
+  /** Right-click on a connection: offer its marks, and the note that describes it. */
+  onEdgeMenu: (source: string, target: string, label: string | null, client: Client) => void;
   /** Right-click on empty canvas, or inside a folder box: offer "new note/folder". */
   onCanvasMenu: (at: cytoscape.Position, client: Client, folder: string | null) => void;
   /** Link draft finished on another note: link `source` -> `target`. */
@@ -764,6 +946,10 @@ export class GraphView {
   private stickyEls = new Map<string, HTMLElement>();
   /** Note path -> the ring that pulses over it, for the notes marked active. */
   private pulseEls = new Map<string, HTMLElement>();
+  /** Edge id -> its mark. Nodes keep theirs in their own markdown; edges keep them here. */
+  private edgeMarks: Record<string, Mark> = readEdgeMarks();
+  /** The timer walking the dashes along radiating edges, while there are any to walk. */
+  private edgeBeat: number | undefined;
   /** Note path -> the "done" badge on its icon, for the issues that are finished. */
   private badgeEls = new Map<string, HTMLElement>();
   /** Note path -> the dot on its corner saying what its Claude session is doing. */
@@ -834,6 +1020,10 @@ export class GraphView {
   reset(): void {
     this.ready = false;
     this.builtFor = -1;
+    if (this.edgeBeat !== undefined) {
+      clearInterval(this.edgeBeat);
+      this.edgeBeat = undefined;
+    }
     this.cy?.destroy();
     this.cy = null;
     this.pending = null;
@@ -944,7 +1134,10 @@ export class GraphView {
 
     ensureFrames(cy, this.frames); // frame only folders that gained a box
     this.applyBoxVisibility();
+    // The open card's note may have just left the canvas — a finished issue folds away.
+    if (this.issue && cy.getElementById(this.issue.path).empty()) this.closeIssue();
     this.markActive(active);
+    this.applyMarks();
     this.drawOverlay();
     this.capture(); // notes added, moved or deleted since the cache was written
   }
@@ -1006,6 +1199,7 @@ export class GraphView {
     if (this.spatial.hasLayout()) this.restore(this.cy);
     else this.settle(); // solved straight away — there is no simulation to wait for
     this.markActive(active);
+    this.applyMarks();
   }
 
   /**
@@ -1250,6 +1444,13 @@ export class GraphView {
         this.handlers.onOpenClaude(node.id(), (node.data("csession") as string) || null);
         return;
       }
+      // A file/folder node stands for something on the disk: clicking it opens THAT —
+      // the note behind it is only the pointer, and stays reachable from the tree.
+      const ntype = node.data("ntype") as string;
+      if ((ntype === "file" || ntype === "folder") && this.settings.enabled("files")) {
+        this.handlers.onOpenPath(node.id(), (node.data("fspath") as string) || null, ntype);
+        return;
+      }
       // An issue node is a folded checklist: clicking unfolds it over the canvas
       // rather than opening the file, which is where the ticks live anyway.
       if (node.data("ntype") === "linear" && this.settings.enabled("linear")) {
@@ -1295,7 +1496,18 @@ export class GraphView {
         return;
       }
       const client = clientPoint(event);
-      const node = event.target === cy ? null : (event.target as NodeSingular);
+      const hit = event.target === cy ? null : (event.target as NodeSingular | EdgeSingular);
+      if (hit && hit.isEdge()) {
+        const edge = hit as EdgeSingular;
+        this.handlers.onEdgeMenu(
+          edge.source().id(),
+          edge.target().id(),
+          ((edge.data("label") as string | undefined) ?? null),
+          client,
+        );
+        return;
+      }
+      const node = hit as NodeSingular | null;
       if (node && node.data("kind") === "file") this.handlers.onNodeMenu(node.id(), client);
       else {
         const folder =
@@ -1635,6 +1847,7 @@ export class GraphView {
 
   /** Re-applies the feature toggles to everything drawn above the canvas. */
   refreshOverlay(): void {
+    this.applyMarks(); // the marks follow the same toggle as the pulses
     this.drawOverlay();
   }
 
@@ -1690,22 +1903,86 @@ export class GraphView {
     }
   }
 
-  /** Whether a note is radiating, as the live graph has it — what the menu offers to flip. */
-  isRadiating(path: string): boolean {
+  /** The mark a note wears, as the live graph has it — what the menu offers to change. */
+  nodeMark(path: string): Mark | null {
     const node = this.cy?.getElementById(path);
-    return !!(node && node.nonempty() && node.data("radiating"));
+    if (!node || node.empty()) return null;
+    if (node.data("radiating")) return "radiate";
+    return node.data("ghost") ? "ghost" : null;
   }
 
   /**
-   * Starts or stops a note radiating on the live graph, so the ring answers the
-   * right-click that asked for it rather than waiting for the next rebuild. The mark
-   * itself is a line in the note's markdown — `setActive` in `links.ts`.
+   * Sets (or clears) a note's mark on the live graph, so the look answers the
+   * right-click that asked for it rather than waiting for the next rebuild. Marks are
+   * exclusive — a note cannot be the live end of the vault and on ice at once. The mark
+   * itself is a line in the note's markdown — `setActive` / `setGhost` in `links.ts`.
    */
-  setRadiating(path: string, on: boolean): void {
+  setNodeMark(path: string, mark: Mark | null): void {
     const node = this.cy?.getElementById(path);
     if (!node || node.empty()) return;
-    node.data("radiating", on ? 1 : 0);
+    node.data("radiating", mark === "radiate" ? 1 : 0);
+    node.data("ghost", mark === "ghost" ? 1 : 0);
     this.drawPulses();
+    this.applyMarks();
+  }
+
+  /** The mark a connection wears. */
+  edgeMark(source: string, target: string): Mark | null {
+    return this.edgeMarks[edgeId(source, target)] ?? null;
+  }
+
+  /** Sets (or clears) a connection's mark, and keeps it for the next session. */
+  setEdgeMark(source: string, target: string, mark: Mark | null): void {
+    const id = edgeId(source, target);
+    if (mark) this.edgeMarks[id] = mark;
+    else delete this.edgeMarks[id];
+    localStorage.setItem(MARKS_KEY, JSON.stringify(this.edgeMarks));
+    this.applyMarks();
+  }
+
+  /**
+   * Dresses every node and edge to its mark. Classes rather than data selectors, so the
+   * whole wardrobe comes off at once when the integration is toggled away — the marks
+   * themselves stay put, in the notes and in the store, for when it comes back.
+   */
+  private applyMarks(): void {
+    const cy = this.cy;
+    if (!cy) return;
+    const on = this.settings.enabled("active");
+    cy.batch(() => {
+      cy.nodes().forEach((node) => {
+        // Radiating wins a contradiction typed by hand; `nodeMark` reads it the same way.
+        node.toggleClass("ghost", on && !!node.data("ghost") && !node.data("radiating"));
+      });
+      cy.edges().forEach((edge) => {
+        const mark = on ? this.edgeMarks[edge.id()] : undefined;
+        edge.toggleClass("ghost", mark === "ghost");
+        edge.toggleClass("radiate", mark === "radiate");
+      });
+    });
+    this.syncEdgeBeat();
+  }
+
+  /**
+   * Cytoscape has no notion of a repeating animation on an edge either, and there is no
+   * DOM element to hand this one to: the dashes are walked by hand instead — one timer
+   * for every radiating edge on the canvas, running only while there is one to move.
+   */
+  private syncEdgeBeat(): void {
+    const cy = this.cy;
+    const still = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const wanted = !!cy && !still && cy.edges(".radiate").length > 0;
+    if (wanted && this.edgeBeat === undefined) {
+      this.edgeBeat = window.setInterval(() => {
+        // The dash pattern is 12 long, so an offset cycling through 12 loops seamlessly;
+        // the shared clock keeps every radiating edge flowing in step, like the rings.
+        const clock = Number(document.timeline.currentTime ?? performance.now());
+        this.cy?.edges(".radiate").style("line-dash-offset", -((clock / 40) % 12));
+      }, 50);
+    } else if (!wanted && this.edgeBeat !== undefined) {
+      clearInterval(this.edgeBeat);
+      this.edgeBeat = undefined;
+    }
   }
 
   /* --------------------------------------------------------------- stickies --- */
@@ -2462,6 +2739,12 @@ export class GraphView {
     if (node && node.nonempty()) node.data("gurl", url);
   }
 
+  /** Likewise for a re-picked disk path — the node opens the new location at once. */
+  setFsPath(path: string, target: string): void {
+    const node = this.cy?.getElementById(path);
+    if (node && node.nonempty()) node.data("fspath", target);
+  }
+
   /** Likewise for the session id the Claude app has just minted — it is no longer pending. */
   setClaudeSession(path: string, session: string, folder?: string): void {
     const node = this.cy?.getElementById(path);
@@ -2614,6 +2897,7 @@ export class GraphView {
     at: cytoscape.Position,
     type?: string,
     url?: string,
+    fspath?: string,
   ): void {
     if (!this.cy || this.cy.getElementById(path).nonempty()) return;
     this.cy.add({
@@ -2627,6 +2911,7 @@ export class GraphView {
         size: nodeSize(0),
         ntype: type ?? "",
         ...(url ? { gurl: url } : {}),
+        ...(fspath ? { fspath } : {}),
       },
       position: this.freeSpot(parent, at),
     });
@@ -2687,7 +2972,14 @@ export class GraphView {
   commitLink(
     source: string,
     target: string,
-    newNode?: { label: string; parent?: string; at: cytoscape.Position; type?: string; url?: string },
+    newNode?: {
+      label: string;
+      parent?: string;
+      at: cytoscape.Position;
+      type?: string;
+      url?: string;
+      fspath?: string;
+    },
   ): void {
     if (!this.cy) return;
     if (newNode && this.cy.getElementById(target).empty()) {
@@ -2701,6 +2993,7 @@ export class GraphView {
           size: nodeSize(0), // resized off the live graph the moment its edge is in
           ntype: newNode.type ?? "",
           ...(newNode.url ? { gurl: newNode.url } : {}),
+          ...(newNode.fspath ? { fspath: newNode.fspath } : {}),
         },
         position: this.freeSpot(newNode.parent, newNode.at),
       });

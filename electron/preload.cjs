@@ -11,6 +11,8 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("bedrock", {
   gitCommit: (root) => ipcRenderer.invoke("git-commit", root),
+  pickPath: (kind) => ipcRenderer.invoke("fs-pick", kind),
+  openPath: (target) => ipcRenderer.invoke("fs-open", target),
   geminiChat: (url) => ipcRenderer.invoke("gemini-chat", url),
   claudeFolder: () => ipcRenderer.invoke("claude-folder"),
   claudeFolders: (limit) => ipcRenderer.invoke("claude-folders", limit),

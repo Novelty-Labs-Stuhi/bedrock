@@ -1,6 +1,6 @@
 import "./style.css";
-import { GraphView, type Doc, type SessionState } from "./graph";
-import { LinkResolver, labelledLink, parseField, relinkText, setActive, setField } from "./links";
+import { GraphView, type Doc, type Mark, type SessionState } from "./graph";
+import { LinkResolver, labelledLink, parseField, relinkText, setActive, setField, setGhost } from "./links";
 import { askChoice, askConfirm, askText } from "./dialog";
 import { EDGE_DIR, edgeNotePath, edgeNoteTemplate, edgeTitle, isEdgeNote, renamedEdgeNote } from "./edges";
 import { showMenu, type MenuItem } from "./menu";
@@ -171,6 +171,7 @@ const graphView = new GraphView(ui.cy, {
   onOpen: (path) => void openFile(path),
   onOpenGemini: (path, url) => openGeminiNode(path, url),
   onOpenClaude: (path, session) => void openClaudeSession(path, session),
+  onOpenPath: (path, target, kind) => void openFsNode(path, target, kind),
   onIssueEdit: (path, text, change) => editIssue(path, text, change),
   onOpenIssue: (url) => {
     if (!window.open(url, "_blank", "noopener")) ui.status.textContent = `the browser blocked ${url}`;
@@ -180,6 +181,7 @@ const graphView = new GraphView(ui.cy, {
   onLinkNew: (source, at, folder, kind) => {
     if (kind === "gemini") void createGeminiAt(at, folder, source);
     else if (kind === "claude") void createClaudeAt(at, folder, source);
+    else if (kind === "file" || kind === "folder") void createFsAt(at, folder, kind, source);
     else void linkToNewNote(source, at, folder);
   },
   onReparent: (path, folder) => void moveEntry(path, "file", folder, true),
@@ -196,17 +198,51 @@ const graphView = new GraphView(ui.cy, {
         items.push({ label: "Plug in a session…", run: () => void plugInSession(path) });
       }
     }
+    if (settings.enabled("files")) {
+      items.push(
+        { label: "Link to a file…", run: () => graphView.startLink(path, "file") },
+        { label: "Link to a folder…", run: () => graphView.startLink(path, "folder") },
+      );
+    }
     if (settings.enabled("active")) {
-      const on = graphView.isRadiating(path);
-      items.push({
-        label: on ? "Stop radiating" : "Make it radiate",
-        run: () => void setRadiating(path, !on),
-      });
+      const mark = graphView.nodeMark(path);
+      items.push(
+        {
+          label: mark === "radiate" ? "Stop radiating" : "Make it radiate",
+          run: () => void markNode(path, mark === "radiate" ? null : "radiate"),
+        },
+        {
+          label: mark === "ghost" ? "Bring it back" : "Make it a ghost",
+          run: () => void markNode(path, mark === "ghost" ? null : "ghost"),
+        },
+      );
     }
     items.push(
       { label: `Rename "${noteName(path)}"`, run: () => renameOnGraph(path) },
       { label: `Delete "${noteName(path)}"`, run: () => void deleteEntry(path, "file") },
     );
+    showMenu(client, items);
+  },
+  onEdgeMenu: (source, target, label, client) => {
+    // The same statuses a note can wear, on the line between two of them. Opening the
+    // connection's own note stays a click on the line; the menu offers it too, so the
+    // right button is never a dead end.
+    const items: MenuItem[] = [
+      { label: `Open "${edgeTitle(source, target)}"`, run: () => void openEdgeNote(source, target, label) },
+    ];
+    if (settings.enabled("active")) {
+      const mark = graphView.edgeMark(source, target);
+      items.push(
+        {
+          label: mark === "radiate" ? "Stop radiating" : "Make it radiate",
+          run: () => graphView.setEdgeMark(source, target, mark === "radiate" ? null : "radiate"),
+        },
+        {
+          label: mark === "ghost" ? "Bring it back" : "Make it a ghost",
+          run: () => graphView.setEdgeMark(source, target, mark === "ghost" ? null : "ghost"),
+        },
+      );
+    }
     showMenu(client, items);
   },
   onCanvasMenu: (at, client, folder) => {
@@ -227,6 +263,12 @@ const graphView = new GraphView(ui.cy, {
     }
     if (settings.enabled("claude")) {
       items.push({ label: "New Claude session", run: () => void createClaudeAt(at, folder) });
+    }
+    if (settings.enabled("files")) {
+      items.push(
+        { label: "Link a file…", run: () => void createFsAt(at, folder, "file") },
+        { label: "Link a folder…", run: () => void createFsAt(at, folder, "folder") },
+      );
     }
     showMenu(client, items);
   },
@@ -1128,6 +1170,12 @@ async function applyIssueEdit(path: string, text: string, change: IssueChange): 
   await vault.write(path, text);
   syncOpenPanes(path, text);
   graphStale = true;
+  // A tick may have just melted an arrow — or finished the whole issue, which takes its
+  // node down. That disappearing IS the feedback, so it happens now, not when the graph
+  // tab is next opened. Typing changes nothing an arrow shows; it waits like before.
+  if (change.ticked !== undefined || change.issueState !== undefined) {
+    if (panes.some((p) => tabOf(p)?.kind === "graph")) await drawGraph();
+  }
   await pushIssue(path, text, change);
 }
 
@@ -1231,28 +1279,34 @@ async function createIssueAt(at: { x: number; y: number }, folder: string | null
 /* ---------------------------------------------------------------- active --- */
 
 /**
- * Right-click → "Make it radiate": the note becomes one of the live ends of the vault and
- * its node pulses green. The mark is a line in the note's own markdown (`active:: true`),
- * so it travels with the folder and can be typed or deleted by hand like any other field.
- * The node is switched first, so the ring answers the click, and the file follows behind.
+ * Right-click → "Make it radiate" / "Make it a ghost": the note's standing on the canvas.
+ * Radiating is one of the live ends of the vault, pulsing green; a ghost is parked — grey,
+ * dimmed and dotted. Either mark is a line in the note's own markdown (`active:: true` /
+ * `ghost:: true`), so it travels with the folder and can be typed or deleted by hand like
+ * any other field. The node is switched first, so the look answers the click, and the
+ * file follows behind.
  */
-async function setRadiating(path: string, on: boolean): Promise<void> {
-  graphView.setRadiating(path, on);
+async function markNode(path: string, mark: Mark | null): Promise<void> {
+  const before = graphView.nodeMark(path);
+  graphView.setNodeMark(path, mark);
   await flushAll(); // the note may be open and mid-edit — don't write over its own buffer
   const text = await vault.read(path);
-  const next = setActive(text, on);
+  const next = setGhost(setActive(text, mark === "radiate"), mark === "ghost");
   if (next !== text) {
     if (!(await tryVault(`could not mark ${noteName(path)}`, () => vault.write(path, next)))) {
-      graphView.setRadiating(path, !on); // the vault refused; the ring must not claim otherwise
+      graphView.setNodeMark(path, before); // the vault refused; the look must not claim otherwise
       return;
     }
     // Open in a pane: the field appears in the editor too, caret and undo history intact.
     for (let i = 0; i < panes.length; i++) if (pathOf(panes[i]) === path) editors[i].sync(next);
   }
   graphStale = true;
-  ui.status.textContent = on
-    ? `${noteName(path)} is radiating — right-click it again to stop`
-    : `${noteName(path)} stopped radiating`;
+  ui.status.textContent =
+    mark === "radiate"
+      ? `${noteName(path)} is radiating — right-click it again to stop`
+      : mark === "ghost"
+        ? `${noteName(path)} is a ghost — right-click it to bring it back`
+        : `${noteName(path)} is back to itself`;
 }
 
 /* ---------------------------------------------------------------- gemini --- */
@@ -1423,6 +1477,104 @@ async function createGeminiAt(
     })();
   });
   await refreshSidebar();
+}
+
+/* ----------------------------------------------------------------- files --- */
+
+/**
+ * A file/folder note is a pointer in the session note's mould: no prose, just what it
+ * points at. `path::` is the disk path exactly as the picker handed it over — absolute,
+ * in whichever slash flavour this machine writes.
+ */
+const fsTemplate = (kind: "file" | "folder", target: string): string =>
+  `type:: ${kind}\n\npath:: ${target}\n`;
+
+/** The last path segment, either slash flavour — what the node is named after. */
+const fsBasename = (target: string): string =>
+  target.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || target;
+
+/**
+ * "Link a file/folder…" — from the canvas menu, or from a link draft released on empty
+ * space (`source` is then the note the arrow came from). The OS picker does the choosing,
+ * and for a folder its own New Folder button is how one that does not exist yet gets
+ * made — no in-app naming step. The node is named after what was picked; dismissing the
+ * picker makes nothing.
+ */
+async function createFsAt(
+  at: { x: number; y: number },
+  folder: string | null,
+  kind: "file" | "folder",
+  source: string | null = null,
+): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) {
+    ui.status.textContent = "File and folder links need the desktop app — npm start";
+    return;
+  }
+  const target = await bridge.pickPath(kind);
+  if (!target) return; // the picker was dismissed — nothing made
+  const dir = folder ?? "";
+  const path = uniquePath(filePaths(), dir, fsBasename(target), ".md");
+  await vault.createFile(path, fsTemplate(kind, target));
+  entries = [...entries, { path, kind: "file" }];
+  if (source) {
+    graphView.commitLink(source, path, {
+      label: noteName(path),
+      parent: dir || undefined,
+      at,
+      type: kind,
+      fspath: target,
+    });
+    // The connection can be named like any drawn link. The note itself is not renamed
+    // here: its name came off the disk, which is the whole point of it.
+    graphView.promptConnection(source, path, (label) => void finishLink(source, path, label));
+  } else {
+    graphView.commitNode(path, noteName(path), dir || undefined, at, kind, undefined, target);
+  }
+  graphStale = true;
+  ui.status.textContent = `${noteName(path)} → ${target}`;
+  await refreshSidebar();
+}
+
+/**
+ * Opens a file/folder node's target the OS way — the default app for a file, a
+ * Finder/Explorer window for a folder. A target that has gone missing (or a note whose
+ * `path::` line was stripped) is offered the picker again, and the new choice is written
+ * back into the note — the node heals itself rather than just complaining.
+ */
+async function openFsNode(path: string, target: string | null, kind: "file" | "folder"): Promise<void> {
+  const bridge = window.bedrock;
+  // One tick later: a click is also a grab+free to cytoscape, and the free handler
+  // clears the hint right after this — the message has to land after that reset.
+  const say = (message: string): void => {
+    window.setTimeout(() => {
+      ui.status.textContent = message;
+    }, 0);
+  };
+  if (!bridge) {
+    say("Opening files needs the desktop app — npm start");
+    return;
+  }
+  const opened = target ? await bridge.openPath(target) : "missing";
+  if (opened === "opened") {
+    say(`${noteName(path)} → ${target}`);
+    return;
+  }
+  if (opened !== "missing") {
+    say(`the OS could not open ${target} — ${opened}`);
+    return;
+  }
+  say(`${target ? `${target} is gone` : "the note carries no path"} — pick where the ${kind} lives now`);
+  const next = await bridge.pickPath(kind);
+  if (!next) return; // declined — the note keeps saying what it said
+  await flushAll(); // the note may be open and mid-edit; the rewrite must not clobber
+  const text = await vault.read(path);
+  await vault.write(path, setField(text, "path", next));
+  graphView.setFsPath(path, next);
+  graphStale = true;
+  for (let i = 0; i < panes.length; i++) if (pathOf(panes[i]) === path) await renderPage(i);
+  const retry = await bridge.openPath(next);
+  say(retry === "opened" ? `${noteName(path)} → ${next}` : `the OS could not open ${next} — ${retry}`);
 }
 
 /* ---------------------------------------------------------------- claude --- */
@@ -1727,12 +1879,15 @@ async function pollSessions(): Promise<void> {
   if (!status) return; // the shell is unhappy; the dots keep saying what they last said
   for (const { path, session, seen } of sessions) {
     const found = status[session];
-    // A finished turn is only worth a badge if nobody has read it — which the note knows
-    // and the shell cannot. Everything else the shell says stands as it is.
+    // A finished turn is only worth a badge if nobody has read it. The note knows about
+    // the readings that went through the graph (`seen::`); the Claude app knows about
+    // the ones that did not (`focus` is when it last had the session on screen) — a
+    // session opened straight in the app must not wear a blue dot forever.
+    const read = found ? Math.max(seen, found.focus) : 0;
     const state: SessionState = !found
       ? "idle"
       : found.state === "done"
-        ? found.at > seen
+        ? found.at > read
           ? "unseen"
           : "idle"
         : found.state;

@@ -10,6 +10,12 @@ interface Window {
   /** The desktop shell's bridge (electron/preload.cjs); absent in a plain browser. */
   bedrock?: {
     gitCommit(root: string): Promise<string>;
+    /** The OS's own picker; a folder pick can create the folder right in the dialog.
+        Null when the dialog was dismissed. */
+    pickPath(kind: "file" | "folder"): Promise<string | null>;
+    /** Opens a path the OS way — default app for a file, Finder/Explorer for a folder.
+        Resolves "opened", "missing", or whatever the OS said went wrong. */
+    openPath(target: string): Promise<string>;
     /** Opens a chat in a watched window; resolves with the conversation's URL once
         Google mints one, or null if the window closes first. */
     geminiChat(url: string): Promise<string | null>;
@@ -38,10 +44,14 @@ interface Window {
     claudeAdopt(folder: string, since: string): Promise<{ id: string | null; candidates: string[] }>;
     /** What each session is doing, read off its transcript: `running` while Claude has the
         floor, `waiting` on an unanswered question or permission prompt, `done` when the
-        turn is over, `idle` for one that was interrupted. `at` is its last turn. */
+        turn is over, `idle` for one that was interrupted. `at` is its last turn; `focus`
+        is when the Claude app last had the session on its own screen (0 if never) — how
+        a turn read in the app, rather than through the graph, still counts as read. */
     claudeStatus(
       sessions: string[],
-    ): Promise<Record<string, { state: "running" | "waiting" | "done" | "idle"; at: number }>>;
+    ): Promise<
+      Record<string, { state: "running" | "waiting" | "done" | "idle"; at: number; focus: number }>
+    >;
     /** Proves an API key against Linear and keeps it in the OS keychain. Rejects
         with what Linear said if the key is no good. */
     linearConnect(key: string): Promise<{ user: string }>;

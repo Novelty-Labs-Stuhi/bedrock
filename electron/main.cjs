@@ -2,7 +2,7 @@
 // rather than file:// — a real origin is what makes localStorage and the File
 // System Access API ("Open folder…") work.
 
-const { app, BrowserWindow, ipcMain, protocol, net, safeStorage, session, shell } = require("electron");
+const { app, BrowserWindow, Menu, dialog, ipcMain, protocol, net, safeStorage, session, shell } = require("electron");
 const { execFile } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -49,6 +49,30 @@ function createWindow() {
   void win.loadURL("app://-/");
 }
 
+/*
+ * The standard menus, plus File > New Window: one bedrock window per project. A new
+ * window comes up on the local vault like a first launch does — "Open folder…" then
+ * points it at whichever project it is for, and each folder keeps its own arrangement,
+ * settings and integrations (they live in the vault, not the window).
+ */
+function buildMenu() {
+  Menu.setApplicationMenu(
+    Menu.buildFromTemplate([
+      ...(process.platform === "darwin" ? [{ role: "appMenu" }] : []),
+      {
+        label: "File",
+        submenu: [
+          { label: "New Window", accelerator: "CmdOrCtrl+N", click: () => createWindow() },
+          { role: process.platform === "darwin" ? "close" : "quit" },
+        ],
+      },
+      { role: "editMenu" },
+      { role: "viewMenu" },
+      { role: "windowMenu" },
+    ]),
+  );
+}
+
 /** Runs one git command in `cwd`; a non-zero exit rejects with whatever git said. */
 const git = (cwd, ...args) =>
   new Promise((resolve, reject) => {
@@ -83,6 +107,38 @@ ipcMain.handle("git-commit", async (_event, root) => {
     throw err;
   }
   return `committed ${await git(dir, "log", "-1", "--format=%h — %s")}`;
+});
+
+/*
+ * Files and folders on this machine. The renderer names nothing itself: the OS's own
+ * picker chooses (its New Folder button covers creating one), and the OS's own opener
+ * opens — the default app for a file, Finder/Explorer for a folder. Both dialogs and
+ * both openers behave the same on macOS and Windows, which is the whole point of
+ * going through the shell for this.
+ */
+ipcMain.handle("fs-pick", async (event, kind) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const result = await dialog.showOpenDialog(win, {
+    properties:
+      kind === "folder"
+        ? // `createDirectory` puts the New Folder button in the macOS sheet; Windows'
+          // folder picker has one of its own without being asked.
+          ["openDirectory", "createDirectory"]
+        : ["openFile"],
+  });
+  return result.canceled || !result.filePaths.length ? null : result.filePaths[0];
+});
+
+/**
+ * "opened", "missing", or whatever the OS said went wrong (shell.openPath resolves
+ * with an error STRING, empty on success — it never rejects). Missing is its own
+ * answer because the renderer's response to it is different: offer to re-pick.
+ */
+ipcMain.handle("fs-open", async (_event, target) => {
+  const expanded = String(target).replace(/^~(?=$|\/)/, os.homedir());
+  if (!fs.existsSync(expanded)) return "missing";
+  const error = await shell.openPath(expanded);
+  return error ? error : "opened";
 });
 
 /*
@@ -573,14 +629,14 @@ const appSessionsDir = () => path.join(app.getPath("appData"), "Claude", "claude
  * pointed anywhere. Among the records for one transcript (an import leaves a second,
  * hollow one behind), the one with the newest activity is the session as the user knows it.
  */
-function appSessionId(id) {
+/** Walks every session record the Claude app keeps, calling `fn` on each. */
+function eachAppRecord(fn) {
   const root = appSessionsDir();
-  let best = null;
   let accounts = [];
   try {
     accounts = fs.readdirSync(root, { withFileTypes: true });
   } catch {
-    return null; // the app has never kept a session here
+    return; // the app has never kept a session here
   }
   for (const account of accounts) {
     if (!account.isDirectory()) continue;
@@ -608,14 +664,38 @@ function appSessionId(id) {
         } catch {
           continue;
         }
-        if (record.cliSessionId !== id || record.isArchived) continue;
-        if (typeof record.sessionId !== "string") continue;
-        const at = Number(record.lastActivityAt) || 0;
-        if (!best || at > best.at) best = { sessionId: record.sessionId, at };
+        fn(record);
       }
     }
   }
+}
+
+function appSessionId(id) {
+  let best = null;
+  eachAppRecord((record) => {
+    if (record.cliSessionId !== id || record.isArchived) return;
+    if (typeof record.sessionId !== "string") return;
+    const at = Number(record.lastActivityAt) || 0;
+    if (!best || at > best.at) best = { sessionId: record.sessionId, at };
+  });
   return best && best.sessionId;
+}
+
+/**
+ * When the Claude app last had each session on its own screen — `lastFocusedAt`, the
+ * stamp the app writes on a record whenever its view comes up. This is how the graph
+ * learns that a finished turn HAS been read even though it was read in the app rather
+ * than through a node: the note's `seen::` only moves when the graph does the opening.
+ */
+function appFocus(wanted) {
+  const out = new Map();
+  eachAppRecord((record) => {
+    const id = record.cliSessionId;
+    if (typeof id !== "string" || !wanted.has(id)) return;
+    const at = Number(record.lastFocusedAt) || 0;
+    if (at > (out.get(id) || 0)) out.set(id, at);
+  });
+  return out;
 }
 
 /*
@@ -723,17 +803,19 @@ function sessionState(file) {
 }
 
 /**
- * The state of each session asked about, keyed by id: `{ state, at }`, where `at` is when
- * its last turn was. Whether "done" is worth a badge is the renderer's call — only the
- * note knows how much of the session has been looked at.
+ * The state of each session asked about, keyed by id: `{ state, at, focus }`, where `at`
+ * is when its last turn was and `focus` is when the Claude app last showed it (0 if
+ * never). Whether "done" is worth a badge is the renderer's call — between the note's
+ * own `seen::` and `focus`, it knows how much of the session has been looked at.
  */
 ipcMain.handle("claude-status", (_event, ids) => {
   const wanted = new Set((Array.isArray(ids) ? ids : []).map(String));
   const out = {};
   if (!wanted.size) return out;
+  const focus = appFocus(wanted);
   for (const session of transcripts()) {
     if (!wanted.has(session.id) || out[session.id]) continue;
-    out[session.id] = sessionState(session.file);
+    out[session.id] = { ...sessionState(session.file), focus: focus.get(session.id) || 0 };
   }
   return out;
 });
@@ -749,11 +831,12 @@ app.whenReady().then(() => {
       .replace(/\sElectron\/\S+/, "")
       .replace(new RegExp(`\\s${app.getName()}/\\S+`), ""),
   );
+  buildMenu();
   createWindow();
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
 });
 
-// Single-window app: closing the window quits, so "off" is unambiguous.
+// Closing the LAST window quits, so "off" stays unambiguous however many projects were up.
 app.on("window-all-closed", () => app.quit());
