@@ -1,12 +1,15 @@
 #!/bin/zsh
-# bedrock launcher — usage: <name> [start|stop|restart|status|build|dev]
-# Reports itself by whatever name it was invoked as, so aliasing it to `notes`,
-# `bedrock` or anything else gives messages that match what you typed.
+# bedrock launcher — usage: bedrock [start|stop|restart|status|build|dev]
+# npm installs this as `bedrock` (package.json "bin"), so it runs from any
+# directory. It still reports itself by whatever name it was invoked as, so an
+# alias gives messages that match what you typed.
 # Rebuilds only when sources changed, then opens the Electron window detached
 # so the terminal is free and closing it does not kill the app.
 set -e
 
-# The checkout this script lives in, so a fresh clone needs no configuration.
+# The app this script belongs to, so nothing needs configuring — `:A` resolves
+# symlinks, which is what makes an npm install work: the thing on your PATH is a
+# link into node_modules, and only the resolved path leads back to the app.
 # BEDROCK_DIR (or the older MYOBSIDIAN_DIR) still wins if the app is kept elsewhere.
 SELF="${0:t}"
 APP_DIR="${BEDROCK_DIR:-${MYOBSIDIAN_DIR:-${0:A:h:h}}}"
@@ -16,10 +19,21 @@ MATCH="MacOS/Electron $APP_DIR"
 die() { print -u2 "$SELF: $1"; exit 1 }
 running() { pgrep -f "$MATCH" >/dev/null 2>&1 }
 
+# Whether the sources are here. They are in a checkout and are not in an npm
+# install, which ships dist/ and nothing to rebuild it from — so this doubles as
+# the test for "is this a checkout", and it is what build and dev want.
+sources() { [[ -d $APP_DIR/src ]] }
+
 build_if_stale() {
   [[ -d $APP_DIR ]] || die "app not found at $APP_DIR (set BEDROCK_DIR)"
   [[ -d $ELECTRON ]] || die "electron missing — run: npm install --prefix '$APP_DIR'"
   local stamp="$APP_DIR/dist/index.html"
+  # An installed copy was built during `npm install` and has nothing to rebuild
+  # from; a missing dist/ there means the install itself went wrong.
+  if ! sources; then
+    [[ -f $stamp ]] || die "no built app at $APP_DIR/dist — reinstall bedrock"
+    return
+  fi
   local -a watch=("$APP_DIR/src" "$APP_DIR/index.html" "$APP_DIR/vite.config.ts" "$APP_DIR/tsconfig.json")
   if [[ ! -f $stamp ]] || [[ -n $(find "${watch[@]}" -newer "$stamp" -print -quit 2>/dev/null) ]]; then
     print "$SELF: building…"
@@ -54,9 +68,11 @@ case "${1:-start}" in
     running && print "$SELF: running" || print "$SELF: stopped"
     ;;
   build)
+    sources || die "no sources at $APP_DIR — 'build' needs a checkout"
     ( cd "$APP_DIR" && npm run build )
     ;;
   dev)
+    sources || die "no sources at $APP_DIR — 'dev' needs a checkout"
     print "$SELF: dev server on http://localhost:5183 (ctrl-c to stop)"
     ( cd "$APP_DIR" && npm run dev -- --port 5183 )
     ;;

@@ -5,23 +5,32 @@
   "type": "module",
   "description": "A markdown vault whose graph is the place you work — spatial, durable, plain files.",
   "main": "electron/main.cjs",
+  "bin": {
+    "bedrock": "bin/bedrock"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "electron"
+  ],
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "start": "npm run build && electron .",
-    "app": "electron ."
+    "app": "electron .",
+    "prepare": "npm run build"
   },
   "dependencies": {
     "@codemirror/commands": "^6.10.4",
     "@codemirror/state": "^6.7.1",
     "@codemirror/view": "^6.43.7",
     "cytoscape": "^3.30.2",
-    "cytoscape-cola": "^2.5.1"
+    "cytoscape-cola": "^2.5.1",
+    "electron": "^43.2.0"
   },
   "devDependencies": {
     "@types/cytoscape": "^3.21.9",
-    "electron": "^43.2.0",
     "typescript": "^5.6.3",
     "vite": "^5.4.10"
   }
