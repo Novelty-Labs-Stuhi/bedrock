@@ -19,6 +19,10 @@ interface Window {
     /** Opens a chat in a watched window; resolves with the conversation's URL once
         Google mints one, or null if the window closes first. */
     geminiChat(url: string): Promise<string | null>;
+    /** What a webpage says about itself: its `<title>`, and the biggest icon it offers as a
+        data URI (both empty strings when the site gives nothing). Answers are cached in the
+        app's own folder, so the same address costs one scrape, not one per launch. */
+    webPage(url: string): Promise<{ url: string; title: string; icon: string }>;
     /** The folder Claude Code last worked in, or null if it has never run here. */
     claudeFolder(): Promise<string | null>;
     /** The folders Claude Code has worked in lately, most recent first. */

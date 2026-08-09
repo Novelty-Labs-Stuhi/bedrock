@@ -9,6 +9,10 @@ src/*.js
 # vault state, if a vault ever lives inside the checkout
 .notes
 
+# build output + signing/notarization secrets
+release
+.env
+
 # editors / OS
 .DS_Store
 .vscode

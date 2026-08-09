@@ -5,11 +5,15 @@
 
 import type { Vault } from "./vault";
 
-export type Feature = "stickies" | "linear" | "git" | "gemini" | "claude" | "files" | "active";
+export type Feature = "stickies" | "linear" | "git" | "gemini" | "claude" | "files" | "web" | "active";
 
 export const CONFIG_FILE = ".notes/config.json";
 
-/** Stickies default on — they predate the switch, so an old vault keeps what it had. */
+/**
+ * Stickies default on — they predate the switch, so an old vault keeps what it had. Node
+ * styles too, now that the switch governs how a note LOOKS rather than one integration:
+ * a sign and a colour are the canvas's own, not somebody else's service plugged into it.
+ */
 const DEFAULTS: Record<Feature, boolean> = {
   stickies: true,
   linear: false,
@@ -17,7 +21,8 @@ const DEFAULTS: Record<Feature, boolean> = {
   gemini: false,
   claude: false,
   files: false,
-  active: false,
+  web: false,
+  active: true,
 };
 
 /** Linear took the todos' place, so a vault that had todos on keeps its checklists. */
@@ -110,7 +115,16 @@ const ROWS: Array<{ feature: Feature; name: string; what: string }> = [
     name: "Files",
     what: "file and folder nodes — a click opens the default app or Finder (desktop app)",
   },
-  { feature: "active", name: "Active", what: "right-click a note to make it radiate a green pulse" },
+  {
+    feature: "web",
+    name: "Web",
+    what: "webpage nodes — paste an address, the node wears the site's own icon and opens it",
+  },
+  {
+    feature: "active",
+    name: "Node styles",
+    what: "right-click a note to give it a sign, a colour and a pulse — or park it as a ghost",
+  },
 ];
 
 /**

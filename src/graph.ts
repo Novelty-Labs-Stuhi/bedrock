@@ -6,6 +6,7 @@ import cytoscape from "cytoscape";
 import type { Core, EdgeSingular, ElementDefinition, NodeSingular } from "cytoscape";
 import {
   FrameStore,
+  type FolderStyle,
   centreOf,
   clampInto,
   ensureFrames,
@@ -19,7 +20,17 @@ import {
 import { edgeNotePath, edgeTitle, isEdgeNote } from "./edges";
 import { inlineEdit, type InlineEditor } from "./inline";
 import { layoutGraph } from "./apply-layout";
-import { LinkResolver, parseActive, parseField, parseGhost, parseLinks, parseTags, parseType } from "./links";
+import {
+  LinkResolver,
+  parseField,
+  parseGhost,
+  parseLinks,
+  parseStyle,
+  parseTags,
+  parseType,
+  type NodeStyle,
+} from "./links";
+import { NO_FENCE, PULSE_DEFAULT, paint, signIcon } from "./node-style";
 import { ancestors, basename, dirname, noteName } from "./vault";
 import type { SettingsStore } from "./settings";
 import type { SpatialStore } from "./spatial";
@@ -81,6 +92,21 @@ function pieData(tags: string[]): Record<string, string | number> {
     data[`pie${i + 1}size`] = slices[i] ? share : 0;
   }
   return data;
+}
+
+/**
+ * A note's chosen look, as the node carries it: the sign as the picture to engrave (a key
+ * means nothing to cytoscape), the colours as they will be painted, and `radiating` as the
+ * one thing the overlay asks about — whether there is a ring to beat.
+ */
+function styleData(style: NodeStyle): Record<string, string | number> {
+  return {
+    sign: signIcon(style.icon),
+    scolour: paint(style.colour),
+    anim: style.anim,
+    acolour: paint(style.animColour) || PULSE_DEFAULT,
+    radiating: style.anim === "pulse" ? 1 : 0,
+  };
 }
 
 /**
@@ -235,6 +261,26 @@ const FILE_NODE_ICON =
   );
 
 /**
+ * What a webpage node wears until the site's own icon has been fetched — and what it
+ * keeps if the site offers none at all. A globe: equator, axis, one meridian and two
+ * latitudes, which is the least drawing that still reads as "somewhere on the web" at
+ * twenty pixels. 256px of raster for the reason the icons above are.
+ */
+const GLOBE_ICON =
+  "data:image/svg+xml;utf8," +
+  encodeURIComponent(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 64 64">` +
+      `<circle cx="32" cy="32" r="26" fill="#4c8dff"/>` +
+      `<g fill="none" stroke="#eaf1ff" stroke-width="2.6" stroke-linecap="round">` +
+      `<line x1="6" y1="32" x2="58" y2="32"/>` +
+      `<line x1="32" y1="6" x2="32" y2="58"/>` +
+      `<ellipse cx="32" cy="32" rx="12.5" ry="26"/>` +
+      `<path d="M12.5 19c11 5.6 28 5.6 39 0"/>` +
+      `<path d="M12.5 45c11-5.6 28-5.6 39 0"/>` +
+      `</g></svg>`,
+  );
+
+/**
  * The ghost a parked note wears: the classic sheet — rounded head, two eye slots, three
  * drips of uneven length trailing off the bottom — floating over its own little shadow.
  * Darker grey on the grey the node turns, so a ghosted note reads as a shape with the
@@ -315,6 +361,18 @@ const TYPE_STYLES: Record<string, Record<string, unknown>> = {
     "background-opacity": 0,
     "pie-size": "0%",
   },
+  // Somewhere on the web. Unlike every type above, the picture is not one this app
+  // drew: it is the site's own icon, scraped once and carried on the node (`wicon`,
+  // a globe until it arrives). It sits on a pale tile because half the favicons in
+  // the world are a dark glyph on nothing, and nothing is what this canvas is.
+  web: {
+    shape: "round-rectangle",
+    "background-image": "data(wicon)",
+    "background-fit": "contain",
+    "background-color": "#eef1f5",
+    "background-opacity": 1,
+    "pie-size": "0%",
+  },
 };
 
 /*
@@ -357,6 +415,37 @@ const STYLE: cytoscape.StylesheetJson = [
   },
   // Typed notes wear their type — a Gemini conversation is the Gemini icon.
   ...typeShapeStyles(),
+  /*
+   * A note's own look, chosen on the canvas (right-click → "Style…") and kept in its
+   * markdown. Above the type styles, so a chosen colour or sign beats the one a type
+   * would have given it — the note was styled by hand, and by hand wins — and below the
+   * ghost, which is a statement about the note rather than a decoration on it.
+   *
+   * `[?key]` — has a truthy value — and never `[key != ""]`, which also matches every
+   * node that has no such key at all, and paints the whole graph with an undefined.
+   *
+   * A colour of its own replaces the tag pie: a note cannot be two colours at once, and
+   * whoever painted it meant that colour rather than the ones its tags worked out to.
+   */
+  {
+    selector: "node[?scolour]",
+    style: { "background-color": "data(scolour)", "background-opacity": 1, "pie-size": "0%" },
+  },
+  // The sign is engraved on the node, not fitted to it: a fraction of the circle, centred,
+  // with the node's colour left showing all round it.
+  {
+    selector: "node[?sign]",
+    style: {
+      "background-image": "data(sign)",
+      "background-fit": "none",
+      "background-width": "58%",
+      "background-height": "58%",
+      "background-position-x": "50%",
+      "background-position-y": "50%",
+      "background-image-opacity": 1,
+      "background-opacity": 1,
+    },
+  },
   {
     selector: "node:parent",
     style: {
@@ -380,8 +469,40 @@ const STYLE: cytoscape.StylesheetJson = [
       // would shove the border outwards as soon as a note was dragged near the edge —
       // the frame is the anchors, and only the anchors.
       "compound-sizing-wrt-labels": "exclude",
+      /*
+       * A box is not something the mouse can land on at all: it is a boundary drawn
+       * round notes, and the ground inside it belongs to the canvas. So a drag started
+       * in the middle of a folder pans the view exactly as it would out in the open, and
+       * a rectangle can be drawn from inside one — navigation is never fenced in by a
+       * folder that happens to be under the cursor.
+       *
+       * What the box still answers to is all elsewhere: the fence strips and corner
+       * grips are in the overlay above the canvas (`drawHandles`), and every question of
+       * the form "which folder is this point in?" is answered from the frames themselves
+       * (`folderAt`) rather than by asking cytoscape what was hit.
+       */
+      events: "no",
     },
   },
+  /*
+   * A folder's own two colours, when it has been given them (right-click a box → "Style
+   * folder…"). After the rule above, because they overrule it — a coloured box is still
+   * a box in every other respect. The fill is lifted a little off the 7% every box gets:
+   * a hue chosen on purpose should read as chosen, while still letting what is under the
+   * box show through it. The fence can also be taken off altogether, leaving a patch of
+   * coloured ground with a name on it — a grouping that is felt rather than drawn.
+   *
+   * The label is painted last and on its own key (`flabel`), because which colour it
+   * should take depends: normally the fence's, so a box does not read as two things at
+   * once, but the fill's when there is no fence to follow.
+   */
+  {
+    selector: "node[?fbg]",
+    style: { "background-color": "data(fbg)", "background-opacity": 0.13 },
+  },
+  { selector: "node[?ffence]", style: { "border-color": "data(ffence)" } },
+  { selector: "node[?fenceoff]", style: { "border-width": 0 } },
+  { selector: "node[?flabel]", style: { color: "data(flabel)" } },
   /*
    * A link has a direction — the note that points and the note pointed at — and a bare line
    * says nothing about which is which. So every edge carries a head at its target end.
@@ -511,13 +632,6 @@ const STYLE: cytoscape.StylesheetJson = [
     selector: "node.drop-leaving",
     style: { "border-width": 3, "border-color": "#ffd166", "border-style": "dashed" },
   },
-  // Folder boxes toggled off. NOT `visibility: hidden` -- on a compound parent
-  // that cascades and hides the notes inside it too. Leaving the box unpainted
-  // hides only the box itself.
-  {
-    selector: "node.box-hidden",
-    style: { "background-opacity": 0, "border-width": 0, label: "", events: "no" },
-  },
   // The invisible corner children that hold a folder box at a constant size.
   {
     selector: "node.frame-anchor",
@@ -525,15 +639,13 @@ const STYLE: cytoscape.StylesheetJson = [
   },
 ];
 
-const BOXES_KEY = "obsidian-lite:boxes";
-
 /* ------------------------------------------------------------------- marks --- */
 
 /**
  * The statuses a right-click can set: radiating (the live end of the vault) or ghost
  * (parked). A node's mark lives in its own markdown — `active:: true` / `ghost:: true` —
  * so it travels with the folder. An edge has no file of its own unless it has been
- * described, so edge marks live beside the boxes toggle instead, keyed by edge id.
+ * described, so edge marks live in this window's own storage instead, keyed by edge id.
  */
 export type Mark = "radiate" | "ghost";
 
@@ -600,7 +712,7 @@ const clientPoint = (event: cytoscape.EventObject): { x: number; y: number } => 
 };
 
 /** Nearest point on a box's border to `point` — where a resisted drag is held. */
-function rimPoint(point: cytoscape.Position, bb: cytoscape.BoundingBox12 & cytoscape.BoundingBoxWH): cytoscape.Position {
+function rimPoint(point: cytoscape.Position, bb: cytoscape.BoundingBox12): cytoscape.Position {
   const gaps = [
     { d: point.x - bb.x1, p: { x: bb.x1, y: point.y } },
     { d: bb.x2 - point.x, p: { x: bb.x2, y: point.y } },
@@ -753,9 +865,9 @@ export function buildElements(docs: Doc[], described: ReadonlySet<string> = new 
         // An issue node carries its own markdown, so the card it opens into can be
         // built (and rewritten) without a read going back to the vault first.
         ...(issue ? { raw: doc.text, istate: issue.state } : {}),
-        // Likewise always present: `sync` patches the keys a definition carries, so a
-        // 0 is what stops a note that has just been quietened from pulsing forever.
-        radiating: parseActive(doc.text) ? 1 : 0,
+        // Likewise always present: `sync` patches the keys a definition carries, so an
+        // empty string is what takes a sign back off a note that has just lost one.
+        ...styleData(parseStyle(doc.text)),
         // Its grey twin, same bargain: `ghost:: true` in the note, 0 when the line goes.
         ghost: parseGhost(doc.text) ? 1 : 0,
         // A conversation node opens its link directly, so the URL rides on the node —
@@ -763,6 +875,15 @@ export function buildElements(docs: Doc[], described: ReadonlySet<string> = new 
         ...(type === "gemini" ? { gurl: URL_RE.exec(doc.text)?.[0] ?? "" } : {}),
         // A file/folder node opens what its `path::` points at, riding along the same way.
         ...(type === "file" || type === "folder" ? { fspath: parseField(doc.text, "path") ?? "" } : {}),
+        // A webpage node opens its address the same way. The ICON is not in the file and
+        // never will be: a scraped logo is cache, and what a vault of plain files keeps
+        // is facts. It comes back on the node afterwards — see `paintWebIcons`.
+        ...(type === "web"
+          ? {
+              wurl: parseField(doc.text, "url") ?? URL_RE.exec(doc.text)?.[0] ?? "",
+              wicon: GLOBE_ICON,
+            }
+          : {}),
         // Same bargain for a session note: its id rides the node, so a click can go
         // straight to `claude://resume` without a read first. Empty until the Claude app
         // has minted one — that is a note that has never been run.
@@ -813,7 +934,7 @@ export type Client = { x: number; y: number };
  * What a link draft is aimed at making when it lands on empty space: an ordinary note, or
  * one of the typed notes that stand for something outside the vault.
  */
-export type DraftKind = "note" | "gemini" | "claude" | "file" | "folder";
+export type DraftKind = "note" | "gemini" | "claude" | "file" | "folder" | "web";
 
 /**
  * What a Claude session is doing, as the corner of its node reports it. `unseen` is the
@@ -834,6 +955,7 @@ const DRAFT_NAMES: Record<DraftKind, string> = {
   note: "note",
   gemini: "Gemini conversation",
   claude: "Claude session",
+  web: "webpage",
   file: "file link",
   folder: "folder link",
 };
@@ -857,6 +979,11 @@ export type GraphHandlers = {
    * app, a folder opens in Finder/Explorer.
    */
   onOpenPath: (path: string, target: string | null, kind: "file" | "folder") => void;
+  /**
+   * Click on a webpage node: hand over the address stored on the node (null when the
+   * note carries none) — it opens in the real browser, like every other web link here.
+   */
+  onOpenWeb: (path: string, url: string | null) => void;
   /**
    * An edit made in an issue card: the note's new markdown, and what (if anything) of
    * it Linear should be told about. The graph has already redrawn — this is the write.
@@ -887,10 +1014,17 @@ export type GraphHandlers = {
   /** A note was dragged deep enough into a folder box to move it there. */
   onReparent: (path: string, folder: string) => void;
   /**
-   * A rectangle was drawn around `paths`: put them in a new folder. `frame` is the
-   * rectangle in model units, so the box can appear exactly as it was drawn.
+   * A whole folder box was dragged by its fence into another one — or out of the one it
+   * was in, in which case `folder` is where it lands ("" for the vault root). Folders
+   * nest exactly as notes do; this is the same gesture on a bigger thing.
    */
-  onGroup: (paths: string[], frame: Frame) => void;
+  onRefolder: (path: string, folder: string) => void;
+  /**
+   * A rectangle was drawn around `picked`: put them in a new folder. Notes and whole
+   * folder boxes alike — a rectangle round a box takes the box, not the notes out of it.
+   * `frame` is the rectangle in model units, so the box appears exactly as it was drawn.
+   */
+  onGroup: (picked: Array<{ path: string; kind: "file" | "dir" }>, frame: Frame) => void;
   /** Transient instruction for the status bar (null clears it). */
   onHint: (hint: string | null) => void;
 };
@@ -922,6 +1056,18 @@ const CORNERS: readonly Corner[] = [
   { sx: 1, sy: 1, cursor: "nwse-resize" },
 ];
 
+/**
+ * A folder is held by its fence, never by its inside. The inside of a box is where its
+ * notes live and where the canvas is read; grabbing there used to pick the whole folder
+ * up, so a drag meant to pan the view — or to draw a rectangle — moved a folder instead.
+ * Now the border is the box's handle: these four strips lie along it, and everything
+ * inside belongs to whatever is drawn there.
+ */
+const SIDES = ["top", "right", "bottom", "left"] as const;
+
+/** How thick the grabbable border is, in screen pixels either side of the line. */
+const FENCE = 11;
+
 export class GraphView {
   private cy: Core | null = null;
   private pending: { docs: Doc[]; active: string | null; described: ReadonlySet<string> } | null = null;
@@ -931,7 +1077,6 @@ export class GraphView {
   private draftKind: DraftKind = "note";
   private drag: DragState | null = null;
   private frames: FrameStore;
-  private boxesVisible = localStorage.getItem(BOXES_KEY) !== "off";
   private handles = new Map<string, HTMLElement>();
   private rename: { path: string; editor: InlineEditor } | null = null;
   /** The open "name this connection" field, if any (step two of drawing a link). */
@@ -954,6 +1099,13 @@ export class GraphView {
   private badgeEls = new Map<string, HTMLElement>();
   /** Note path -> the dot on its corner saying what its Claude session is doing. */
   private sessionEls = new Map<string, HTMLElement>();
+  /**
+   * Address -> the site's icon, for as long as the app is open. Keyed by the address
+   * rather than by the note, because that is what the icon belongs to: two notes about
+   * the same page wear the same face, and a rebuild — which reverts every node's data
+   * to what the FILES say, and the files do not say this — repaints from here.
+   */
+  private webIcons = new Map<string, string>();
   /** The open issue card, if any — one at a time, like a popover. */
   private issue: { path: string; el: HTMLElement } | null = null;
   /** Which row of it is waiting for an arrow, while one is being aimed. */
@@ -1133,9 +1285,10 @@ export class GraphView {
     });
 
     ensureFrames(cy, this.frames); // frame only folders that gained a box
-    this.applyBoxVisibility();
+    this.paintFolders();
     // The open card's note may have just left the canvas — a finished issue folds away.
     if (this.issue && cy.getElementById(this.issue.path).empty()) this.closeIssue();
+    this.paintWebIcons(); // the definitions above carry a globe; the sites' own faces live here
     this.markActive(active);
     this.applyMarks();
     this.drawOverlay();
@@ -1198,6 +1351,8 @@ export class GraphView {
     // the graph feel like it forgot everything the moment the app closed.
     if (this.spatial.hasLayout()) this.restore(this.cy);
     else this.settle(); // solved straight away — there is no simulation to wait for
+    this.paintFolders();
+    this.paintWebIcons(); // a rebuild within one session keeps the faces already fetched
     this.markActive(active);
     this.applyMarks();
   }
@@ -1233,7 +1388,6 @@ export class GraphView {
         node.position(this.freeSpot(folder, this.spawnPoint(folder)));
       });
     });
-    this.applyBoxVisibility();
     this.fit();
     this.drawOverlay();
     this.ready = true; // restored — from here on, changes are worth saving
@@ -1243,7 +1397,6 @@ export class GraphView {
   private settle(): void {
     if (!this.cy) return;
     layoutGraph(this.cy, this.frames);
-    this.applyBoxVisibility();
     this.fit();
     this.drawOverlay();
     this.ready = true;
@@ -1276,25 +1429,39 @@ export class GraphView {
     });
   }
 
-  /** Whether folder boxes are currently drawn. */
-  boxesShown(): boolean {
-    return this.boxesVisible;
+  /**
+   * Paints each folder box in the colours it has been given. Like the web icons, this is
+   * not in any file the vault holds — a folder has no note of its own — so it is put back
+   * on the nodes after every build and every sync, from the layout cache.
+   */
+  private paintFolders(): void {
+    const cy = this.cy;
+    if (!cy) return;
+    cy.batch(() => {
+      cy.nodes().forEach((node) => {
+        if (node.data("kind") !== "dir") return;
+        const style = this.frames.style(node.id());
+        const off = style.fence === NO_FENCE;
+        const bg = paint(style.bg);
+        const fence = off ? "" : paint(style.fence);
+        node.data("fbg", bg);
+        node.data("ffence", fence);
+        node.data("fenceoff", off ? 1 : 0);
+        // With a fence, the name goes with it; without one, with the ground it sits on.
+        node.data("flabel", off ? bg : fence);
+      });
+    });
   }
 
-  /** Shows or hides the folder boxes. Grouping and positions are untouched. */
-  setBoxesVisible(visible: boolean): void {
-    this.boxesVisible = visible;
-    localStorage.setItem(BOXES_KEY, visible ? "on" : "off");
-    this.applyBoxVisibility();
-    this.drawOverlay();
+  /** A folder's colours, as the layout cache has them — what the panel opens showing. */
+  folderStyle(folder: string): FolderStyle {
+    return this.frames.style(folder);
   }
 
-  private applyBoxVisibility(): void {
-    if (!this.cy) return;
-    this.cy
-      .nodes(":parent")
-      .filter((node) => !isAnchor(node.id()))
-      .toggleClass("box-hidden", !this.boxesVisible);
+  /** Colours a folder box, and remembers it beside the box's size. */
+  setFolderStyle(folder: string, style: FolderStyle): void {
+    this.frames.setStyle(folder, style);
+    this.paintFolders();
   }
 
   /**
@@ -1423,7 +1590,7 @@ export class GraphView {
           const source = this.draftSource;
           const kind = this.draftKind;
           const at = { ...event.position };
-          const folder = this.folderAt(cy, at, null)?.id() ?? node.id();
+          const folder = this.folderAt(cy, at)?.id() ?? node.id();
           this.clearDraft();
           this.handlers.onLinkNew(source, at, folder, kind);
           return;
@@ -1449,6 +1616,13 @@ export class GraphView {
       const ntype = node.data("ntype") as string;
       if ((ntype === "file" || ntype === "folder") && this.settings.enabled("files")) {
         this.handlers.onOpenPath(node.id(), (node.data("fspath") as string) || null, ntype);
+        return;
+      }
+      // A webpage node is a bookmark wearing the site's face: clicking it goes to the
+      // page. Whatever you have to say about the page goes in the note behind it, which
+      // stays reachable from the tree.
+      if (ntype === "web" && this.settings.enabled("web")) {
+        this.handlers.onOpenWeb(node.id(), (node.data("wurl") as string) || null);
         return;
       }
       // An issue node is a folded checklist: clicking unfolds it over the canvas
@@ -1588,8 +1762,6 @@ export class GraphView {
       this.drawOverlay();
     });
 
-    // Dragging a whole folder box carries its frame (and notes) along.
-    cy.on("drag", "node:parent", () => this.drawOverlay());
     cy.on("pan zoom", () => {
       // A pan/zoom the app did itself (fit) must not count as the user taking over the view.
       if (!this.fitting) this.userMoved = true;
@@ -1632,9 +1804,9 @@ export class GraphView {
     if (!drag) return;
     this.clearDropMarks(cy);
 
-    const entering = this.folderAt(cy, pointer, drag.parent);
+    const entering = this.folderAt(cy, pointer, (id) => id === drag.parent);
     if (entering) {
-      const bb = entering.boundingBox();
+      const bb = this.frameRect(cy, entering.id());
       const depth = Math.min(pointer.x - bb.x1, bb.x2 - pointer.x, pointer.y - bb.y1, bb.y2 - pointer.y);
       drag.target = entering.id();
       drag.armed = depth >= DROP_DEPTH;
@@ -1662,7 +1834,10 @@ export class GraphView {
     // Notes are clamped to the interior, but the *threshold* is the visible
     // border — otherwise resistance would start well inside the box.
     const rect = interior(centre, this.frames.get(drag.parent), node.width() / 2);
-    const bb = box.boundingBox();
+    // The frame, not `box.boundingBox()`: a parent's measured box takes in its children
+    // and their labels, so the border a note is being pulled through would sit some way
+    // outside the one that is drawn — and further out on the side the labels hang off.
+    const bb = this.frameRect(cy, drag.parent);
     const outside = Math.max(bb.x1 - pointer.x, pointer.x - bb.x2, bb.y1 - pointer.y, pointer.y - bb.y2);
 
     if (outside <= 0) {
@@ -1691,16 +1866,39 @@ export class GraphView {
    * a click in the middle of a big box otherwise reads as empty canvas.
    */
   private enclosingFolder(cy: Core, point: cytoscape.Position): string | null {
-    if (!this.boxesVisible) return null;
-    return this.folderAt(cy, point, null)?.id() ?? null;
+    return this.folderAt(cy, point)?.id() ?? null;
   }
 
   /** Deepest folder box containing `point`, ignoring the node's current folder. */
-  private folderAt(cy: Core, point: cytoscape.Position, exclude: string | null): NodeSingular | null {
+  /**
+   * A folder's rectangle as it is DRAWN — its frame — rather than as cytoscape measures
+   * it. The two part company exactly when it matters: a compound parent's bounding box is
+   * the union of everything inside it, so a note (or a nested box) being dragged towards
+   * the border stretches the box it is leaving, and the border it is being measured
+   * against runs away ahead of it. The frame does not move until it is moved.
+   */
+  private frameRect(cy: Core, folder: string): cytoscape.BoundingBox12 {
+    const box = cy.getElementById(folder) as NodeSingular;
+    const centre = frameCentre(cy, folder);
+    if (!centre) return box.boundingBox();
+    const frame = this.frames.get(folder);
+    return {
+      x1: centre.x - frame.w / 2,
+      x2: centre.x + frame.w / 2,
+      y1: centre.y - frame.h / 2,
+      y2: centre.y + frame.h / 2,
+    };
+  }
+
+  private folderAt(
+    cy: Core,
+    point: cytoscape.Position,
+    skip: (folder: string) => boolean = () => false,
+  ): NodeSingular | null {
     let best: NodeSingular | null = null;
     cy.nodes(":parent").forEach((box) => {
-      if (box.id() === exclude || isAnchor(box.id())) return;
-      const bb = box.boundingBox();
+      if (isAnchor(box.id()) || skip(box.id())) return;
+      const bb = this.frameRect(cy, box.id());
       if (point.x < bb.x1 || point.x > bb.x2 || point.y < bb.y1 || point.y > bb.y2) return;
       // Deeper folders win, so nested boxes are reachable.
       if (!best || box.ancestors().length > best.ancestors().length) best = box as NodeSingular;
@@ -1733,7 +1931,7 @@ export class GraphView {
     this.overlay.appendChild(sheet);
     this.lasso = sheet;
     this.handlers.onHint(
-      "Drag a rectangle around the notes to put them in a new folder — Esc to cancel (shift+drag does this any time)",
+      "Drag a rectangle around the notes (or whole folders) to put them in a new folder — Esc to cancel (shift+drag does this any time)",
     );
   }
 
@@ -1775,20 +1973,20 @@ export class GraphView {
     const onMove = (move: MouseEvent): void => {
       area = place({ x: move.clientX - container.left, y: move.clientY - container.top });
       const count = this.notesIn(area).length;
-      this.handlers.onHint(count === 1 ? "1 note — release to group it" : `${count} notes — release to group them`);
+      this.handlers.onHint(count === 1 ? "1 thing — release to group it" : `${count} things — release to group them`);
     };
     const onUp = (): void => {
       document.removeEventListener("mousemove", onMove);
       document.removeEventListener("mouseup", onUp);
       rect.remove();
-      const paths = this.notesIn(area);
+      const picked = this.notesIn(area);
       this.cancelGroup();
-      if (!paths.length) {
-        this.handlers.onHint("no notes in that rectangle — nothing grouped");
+      if (!picked.length) {
+        this.handlers.onHint("nothing in that rectangle — nothing grouped");
         return;
       }
       const zoom = cy.zoom();
-      this.handlers.onGroup(paths, {
+      this.handlers.onGroup(picked, {
         w: Math.max(160, (area.x2 - area.x1) / zoom),
         h: Math.max(120, (area.y2 - area.y1) / zoom),
       });
@@ -1797,18 +1995,36 @@ export class GraphView {
     document.addEventListener("mouseup", onUp);
   }
 
-  /** Notes whose centre falls inside a rectangle, in rendered (screen) coordinates. */
-  private notesIn(area: Area): string[] {
+  /**
+   * What a rectangle drawn in rendered (screen) coordinates has caught.
+   *
+   * A note counts when its centre is inside; a folder box only when the WHOLE box is,
+   * because half a box inside a rectangle means the rectangle was drawn around some of
+   * its notes, not around it. A box that is caught takes its notes with it as its own
+   * children, so they drop out of the list — grouping `ideas` must produce a folder
+   * holding `ideas`, not one holding `ideas` and a loose copy of everything in it.
+   */
+  private notesIn(area: Area): Array<{ path: string; kind: "file" | "dir" }> {
     const cy = this.cy;
     if (!cy) return [];
-    return cy
-      .nodes()
-      .filter((node) => node.data("kind") === "file" && !isAnchor(node.id()))
-      .filter((node) => {
-        const at = (node as NodeSingular).renderedPosition();
-        return at.x >= area.x1 && at.x <= area.x2 && at.y >= area.y1 && at.y <= area.y2;
-      })
-      .map((node) => node.id());
+    const boxes: string[] = [];
+    cy.nodes(":parent").forEach((node) => {
+      if (isAnchor(node.id())) return;
+      const bb = (node as NodeSingular).renderedBoundingBox();
+      if (bb.x1 >= area.x1 && bb.x2 <= area.x2 && bb.y1 >= area.y1 && bb.y2 <= area.y2) boxes.push(node.id());
+    });
+    const inside = (path: string): boolean => boxes.some((box) => path.startsWith(box + "/"));
+    const picked: Array<{ path: string; kind: "file" | "dir" }> = boxes
+      .filter((box) => !inside(box))
+      .map((path) => ({ path, kind: "dir" as const }));
+    cy.nodes().forEach((node) => {
+      if (node.data("kind") !== "file" || isAnchor(node.id()) || inside(node.id())) return;
+      const at = (node as NodeSingular).renderedPosition();
+      if (at.x >= area.x1 && at.x <= area.x2 && at.y >= area.y1 && at.y <= area.y2) {
+        picked.push({ path: node.id(), kind: "file" });
+      }
+    });
+    return picked;
   }
 
   /** Sizes a folder's box before it first appears — used to box a group as drawn. */
@@ -1816,9 +2032,23 @@ export class GraphView {
     this.frames.set(folder, frame);
   }
 
-  /** Frames are keyed by path, so a renamed folder has to be handed its size. */
+  /**
+   * Frames are keyed by path, so a folder that is renamed — or filed inside another one —
+   * has to be handed its size and its colours under the new name. Every box nested under
+   * it too: their paths change with their parent's, and a frame left behind under the old
+   * name is a box that comes back the default size in the default blue.
+   */
   carryFrame(from: string, to: string): void {
-    this.frames.set(to, this.frames.get(from), this.frames.isPinned(from));
+    const carry = (was: string, now: string): void => {
+      this.frames.set(now, this.frames.get(was), this.frames.isPinned(was));
+      this.frames.setStyle(now, this.frames.style(was));
+    };
+    carry(from, to);
+    this.cy?.nodes(":parent").forEach((node) => {
+      const id = node.id();
+      if (isAnchor(id) || !id.startsWith(from + "/")) return;
+      carry(id, to + id.slice(from.length));
+    });
   }
 
   /**
@@ -1884,6 +2114,9 @@ export class GraphView {
           this.overlay.appendChild(el);
           this.pulseEls.set(dot.id(), el);
         }
+        // The ring's colour is the note's own choice, handed to CSS as a variable so the
+        // animation stays one rule rather than one per colour anybody might pick.
+        el.style.setProperty("--pulse", String(dot.data("acolour") || PULSE_DEFAULT));
         // Model units and a transform: the ring rides the zoom with the note it belongs
         // to, and so do its rim and its glow — a size in rendered pixels would shrink the
         // circle while leaving a 1.5px border to thicken around it.
@@ -1920,8 +2153,23 @@ export class GraphView {
   setNodeMark(path: string, mark: Mark | null): void {
     const node = this.cy?.getElementById(path);
     if (!node || node.empty()) return;
+    node.data("anim", mark === "radiate" ? "pulse" : "");
     node.data("radiating", mark === "radiate" ? 1 : 0);
     node.data("ghost", mark === "ghost" ? 1 : 0);
+    this.drawPulses();
+    this.applyMarks();
+  }
+
+  /**
+   * Dresses a note on the live graph, so the canvas answers the pick in the panel rather
+   * than waiting for the write to the vault behind it to come back round. A note being
+   * animated is no longer parked, so the ghost comes off — the two say opposite things.
+   */
+  setNodeStyle(path: string, style: NodeStyle): void {
+    const node = this.cy?.getElementById(path);
+    if (!node || node.empty()) return;
+    for (const [key, value] of Object.entries(styleData(style))) node.data(key, value);
+    if (style.anim) node.data("ghost", 0);
     this.drawPulses();
     this.applyMarks();
   }
@@ -2433,17 +2681,39 @@ export class GraphView {
   }
 
   /**
-   * A grip on each of a box's four corners — invisible, so nothing is drawn on the
-   * canvas; the cursor changing on approach is the whole affordance.
+   * A box's handles: a grip on each of its four corners to resize it, and a strip along
+   * each of its four sides to move it by. All invisible, so nothing is drawn on the
+   * canvas; the box's own border is the thing being aimed at, and the cursor changing on
+   * approach is the whole affordance.
    */
   private drawHandles(): void {
     const cy = this.cy;
     if (!cy) return;
     const wanted = new Set<string>();
-    if (this.boxesVisible) cy.nodes(":parent").forEach((node) => {
+    cy.nodes(":parent").forEach((node) => {
       const box = node as NodeSingular;
       if (isAnchor(box.id())) return;
       const bb = box.renderedBoundingBox();
+      // The fence first, the corners after: they overlap at the four ends, and a corner
+      // has to win there, or a box could never be resized from anywhere but its sides.
+      for (const side of SIDES) {
+        const key = `${box.id()} !${side}`;
+        wanted.add(key);
+        let strip = this.handles.get(key);
+        if (!strip) {
+          strip = document.createElement("div");
+          strip.className = "frame-fence";
+          strip.title = `Drag to move "${box.id()}"`;
+          strip.addEventListener("mousedown", (event) => this.beginMove(event, box.id()));
+          this.overlay.appendChild(strip);
+          this.handles.set(key, strip);
+        }
+        const across = side === "top" || side === "bottom";
+        strip.style.left = `${across || side === "left" ? bb.x1 : bb.x2}px`;
+        strip.style.top = `${!across || side === "top" ? bb.y1 : bb.y2}px`;
+        strip.style.width = `${across ? Math.max(0, bb.x2 - bb.x1) : FENCE}px`;
+        strip.style.height = `${across ? FENCE : Math.max(0, bb.y2 - bb.y1)}px`;
+      }
       for (const corner of CORNERS) {
         const key = `${box.id()} ${corner.sx}${corner.sy}`;
         wanted.add(key);
@@ -2468,6 +2738,98 @@ export class GraphView {
     }
   }
 
+  /**
+   * Drags a whole folder by its fence: the box, the notes in it, and any folder nested
+   * inside it, all as one thing. Everything with a position of its own moves by the same
+   * delta — the anchors that ARE the frame included — so nothing inside shifts relative
+   * to anything else and the arrangement travels intact.
+   *
+   * Where it is let go decides where it belongs. Dropped well inside another box, the
+   * folder is filed under it; pulled well clear of the one it was in, it moves out to
+   * that folder's own parent. "Well" is `DROP_DEPTH`, measured from the moving box's
+   * centre — brushing past a box on the way somewhere else must never refile anything.
+   */
+  private beginMove(event: MouseEvent, folder: string): void {
+    const cy = this.cy;
+    if (!cy) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const box = cy.getElementById(folder) as NodeSingular;
+    const home = frameCentre(cy, folder);
+    if (box.empty() || !home) return;
+
+    const start = { x: event.clientX, y: event.clientY };
+    const zoom = cy.zoom();
+    const parent = box.parent().first();
+    const from = parent.nonempty() ? parent.id() : null;
+    // Anchors included: they are the frame, so they have to travel with what they frame.
+    const riders = box
+      .descendants()
+      .filter((node) => !node.isParent())
+      .map((node) => ({ node: node as NodeSingular, from: { ...(node as NodeSingular).position() } }));
+
+    let target: string | null = null;
+    let armed = false;
+
+    const onMove = (move: MouseEvent): void => {
+      const dx = (move.clientX - start.x) / zoom;
+      const dy = (move.clientY - start.y) / zoom;
+      cy.batch(() => {
+        for (const rider of riders) rider.node.position({ x: rider.from.x + dx, y: rider.from.y + dy });
+      });
+      this.clearDropMarks(cy);
+      const centre = { x: home.x + dx, y: home.y + dy };
+      // Ids are paths, so a folder's own subtree is skipped: nothing may be filed inside
+      // something it already contains.
+      const into = this.folderAt(cy, centre, (id) => id === folder || id.startsWith(folder + "/"));
+      target = null;
+      armed = false;
+      if (into && into.id() !== from) {
+        const bb = this.frameRect(cy, into.id());
+        const depth = Math.min(centre.x - bb.x1, bb.x2 - centre.x, centre.y - bb.y1, bb.y2 - centre.y);
+        target = into.id();
+        armed = depth >= DROP_DEPTH;
+        into.addClass(armed ? "drop-armed" : "drop-hover");
+        this.handlers.onHint(
+          armed
+            ? `Release to file ${basename(folder)} under ${into.id()}`
+            : `Push further in to file ${basename(folder)} under ${into.id()}`,
+        );
+      } else if (from !== null) {
+        // Either out in the open, or still over the box it belongs to: both are the same
+        // question — has it been pulled far enough clear of that box to leave it?
+        const out = cy.getElementById(from) as NodeSingular;
+        const bb = this.frameRect(cy, from);
+        const outside = Math.max(bb.x1 - centre.x, centre.x - bb.x2, bb.y1 - centre.y, centre.y - bb.y2);
+        target = dirname(from); // "" == the vault root
+        armed = outside >= DROP_DEPTH;
+        if (outside > 0) out.addClass(armed ? "drop-armed" : "drop-leaving");
+        this.handlers.onHint(
+          armed
+            ? `Release to move ${basename(folder)} out to ${target || "the vault root"}`
+            : outside > 0
+              ? `Keep pulling to move ${basename(folder)} out of ${from}`
+              : null,
+        );
+      } else {
+        this.handlers.onHint(null);
+      }
+      this.drawOverlay();
+    };
+
+    const onUp = (): void => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      this.clearDropMarks(cy);
+      this.capture(); // wherever the box came to rest is where it should be next time
+      if (armed && target !== null && target !== from) this.handlers.onRefolder(folder, target);
+      else this.handlers.onHint(null);
+      this.drawOverlay();
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  }
+
   private beginResize(event: MouseEvent, folder: string, corner: Corner): void {
     const cy = this.cy;
     if (!cy) return;
@@ -2479,16 +2841,15 @@ export class GraphView {
 
     const from0 = frameCentre(cy, folder);
     if (!from0) return;
-    // Notes ride along with the frame: their offsets from the centre scale with
-    // it, so shrinking the box packs them in rather than piling them on the rim.
-    const box = cy.getElementById(folder) as NodeSingular;
-    const riders = box
-      .children()
-      .filter((child) => !isAnchor(child.id()))
-      .map((child) => {
-        const kid = child as NodeSingular;
-        return { id: kid.id(), dx: kid.position("x") - from0.x, dy: kid.position("y") - from0.y };
-      });
+    /*
+     * What is inside stays exactly where it is. Notes used to be scaled with the frame,
+     * which meant enlarging a box spread its notes across the new width — and enlarging a
+     * box is what somebody does when they want ROOM: space to put the next note in, or
+     * space around the ones already there. So the box grows away from the corner opposite
+     * the one being dragged, and the notes hold their ground. Shrinking is the one case
+     * where they move, and only the ones that would end up outside — `setFrame` clamps
+     * them back inside the border rather than letting them push it open.
+     */
 
     const onMove = (move: MouseEvent): void => {
       // Signed by which corner is held: dragging the left edge leftwards widens the
@@ -2502,18 +2863,8 @@ export class GraphView {
         x: from0.x + ((next.w - from.w) / 2) * corner.sx,
         y: from0.y + ((next.h - from.h) / 2) * corner.sy,
       };
-      const scaleX = next.w / from.w;
-      const scaleY = next.h / from.h;
-      cy.batch(() => {
-        for (const rider of riders) {
-          cy.getElementById(rider.id).position({
-            x: centre.x + rider.dx * scaleX,
-            y: centre.y + rider.dy * scaleY,
-          });
-        }
-      });
       this.frames.set(folder, next, true); // dragging a corner pins the size
-      setFrame(cy, folder, centre, next); // also clamps, as a backstop
+      setFrame(cy, folder, centre, next); // moves the anchors, and clamps what falls out
       this.drawOverlay();
       this.handlers.onHint(`${folder}: ${Math.round(next.w)} × ${Math.round(next.h)}`);
     };
@@ -2521,7 +2872,7 @@ export class GraphView {
       document.removeEventListener("mousemove", onMove);
       document.removeEventListener("mouseup", onUp);
       this.handlers.onHint(null);
-      this.capture(); // the riders moved with the frame
+      this.capture(); // the frame changed, and anything it clamped moved with it
     };
     document.addEventListener("mousemove", onMove);
     document.addEventListener("mouseup", onUp);
@@ -2745,6 +3096,52 @@ export class GraphView {
     if (node && node.nonempty()) node.data("fspath", target);
   }
 
+  /** Likewise for a re-typed address, when the note was left without one. */
+  setWebUrl(path: string, url: string): void {
+    const node = this.cy?.getElementById(path);
+    if (!node || node.empty()) return;
+    node.data("wurl", url);
+    node.data("wicon", this.webIcons.get(url) ?? GLOBE_ICON);
+  }
+
+  /**
+   * The site's icon has come back. Kept against the address, so every node pointing at
+   * that page puts it on at once — and so does any node built later.
+   */
+  setWebIcon(url: string, icon: string): void {
+    if (!url || !icon) return;
+    this.webIcons.set(url, icon);
+    this.paintWebIcons();
+  }
+
+  /** Every webpage node on the canvas, and whether it is still wearing the globe. */
+  webNodes(): Array<{ path: string; url: string; fetched: boolean }> {
+    const cy = this.cy;
+    if (!cy) return [];
+    const out: ReturnType<GraphView["webNodes"]> = [];
+    cy.nodes().forEach((node) => {
+      if (node.data("ntype") !== "web") return;
+      const url = (node.data("wurl") as string) || "";
+      out.push({ path: node.id(), url, fetched: this.webIcons.has(url) });
+    });
+    return out;
+  }
+
+  /**
+   * Puts the remembered icons back on. Runs after every build and every sync, because
+   * both take a node's data from the note's own markdown — where the icon deliberately
+   * is not — and would otherwise blank a fetched face back to a globe on every edit.
+   */
+  private paintWebIcons(): void {
+    const cy = this.cy;
+    if (!cy || !this.webIcons.size) return;
+    cy.nodes().forEach((node) => {
+      if (node.data("ntype") !== "web") return;
+      const icon = this.webIcons.get((node.data("wurl") as string) || "");
+      if (icon && node.data("wicon") !== icon) node.data("wicon", icon);
+    });
+  }
+
   /** Likewise for the session id the Claude app has just minted — it is no longer pending. */
   setClaudeSession(path: string, session: string, folder?: string): void {
     const node = this.cy?.getElementById(path);
@@ -2910,7 +3307,8 @@ export class GraphView {
         kind: "file",
         size: nodeSize(0),
         ntype: type ?? "",
-        ...(url ? { gurl: url } : {}),
+        // `url` is whatever the node opens; which key it rides on is the type's business.
+        ...(url ? (type === "web" ? { wurl: url, wicon: this.webIcons.get(url) ?? GLOBE_ICON } : { gurl: url }) : {}),
         ...(fspath ? { fspath } : {}),
       },
       position: this.freeSpot(parent, at),
@@ -2992,7 +3390,11 @@ export class GraphView {
           kind: "file",
           size: nodeSize(0), // resized off the live graph the moment its edge is in
           ntype: newNode.type ?? "",
-          ...(newNode.url ? { gurl: newNode.url } : {}),
+          ...(newNode.url
+            ? newNode.type === "web"
+              ? { wurl: newNode.url, wicon: this.webIcons.get(newNode.url) ?? GLOBE_ICON }
+              : { gurl: newNode.url }
+            : {}),
           ...(newNode.fspath ? { fspath: newNode.fspath } : {}),
         },
         position: this.freeSpot(newNode.parent, newNode.at),

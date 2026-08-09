@@ -10,6 +10,8 @@ const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 
 const DIST = path.join(__dirname, "..", "dist");
+// Packaged builds carry the icon in the bundle; this covers running from the repo.
+const DEV_ICON = path.join(__dirname, "..", "build", "icon.png");
 
 protocol.registerSchemesAsPrivileged([
   { scheme: "app", privileges: { standard: true, secure: true, supportFetchAPI: true } },
@@ -33,6 +35,7 @@ function createWindow() {
     minHeight: 460,
     title: "bedrock",
     backgroundColor: "#1e1e1e",
+    ...(process.platform !== "darwin" && !app.isPackaged ? { icon: DEV_ICON } : {}),
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -139,6 +142,278 @@ ipcMain.handle("fs-open", async (_event, target) => {
   if (!fs.existsSync(expanded)) return "missing";
   const error = await shell.openPath(expanded);
   return error ? error : "opened";
+});
+
+/*
+ * A webpage on the graph. The renderer hands over an address and gets back what a
+ * bookmark needs to draw itself: the page's own <title>, and the biggest icon the
+ * site offers, as data.
+ *
+ * It happens here rather than in the renderer for two reasons. The app's origin is
+ * `app://`, and a page fetched from there is a cross-origin read every site is free
+ * to refuse — the shell has no origin to be refused for. And only here can the answer
+ * be KEPT: a graph of thirty links must not re-scrape thirty sites at every launch.
+ * The cache is in userData, deliberately NOT in the vault: the git button snapshots
+ * the vault wholesale, and a folder of other people's logos is not something anybody
+ * meant to commit.
+ */
+const WEB_UA =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) " +
+  "Chrome/124.0.0.0 Safari/537.36";
+/** Enough of the HTML to be well past </head>, which is all this reads. */
+const PAGE_LIMIT = 512 * 1024;
+const ICON_LIMIT = 2 * 1024 * 1024;
+const WEB_TIMEOUT = 9000;
+/** How long a scraped icon is trusted before the site is asked again. */
+const ICON_TTL = 14 * 24 * 60 * 60 * 1000;
+/** Pages remembered; the least recently looked up fall off the end. */
+const ICON_KEEP = 300;
+
+const iconFile = () => path.join(app.getPath("userData"), "webicons.json");
+
+function readIcons() {
+  try {
+    const stored = JSON.parse(fs.readFileSync(iconFile(), "utf8"));
+    return stored && typeof stored.pages === "object" && stored.pages ? stored.pages : {};
+  } catch {
+    return {}; // nothing scraped yet, or a cache somebody broke — both mean "ask the site"
+  }
+}
+
+function writeIcons(pages) {
+  const kept = Object.entries(pages)
+    .sort((a, b) => (b[1].at ?? 0) - (a[1].at ?? 0))
+    .slice(0, ICON_KEEP);
+  try {
+    fs.mkdirSync(path.dirname(iconFile()), { recursive: true });
+    fs.writeFileSync(iconFile(), JSON.stringify({ version: 1, pages: Object.fromEntries(kept) }));
+  } catch {
+    /* an unwritable cache costs a re-fetch and nothing else */
+  }
+}
+
+/** One GET, capped and with a deadline — a site that hangs must not hang the node. */
+async function fetchBytes(url, limit) {
+  const response = await net.fetch(url, {
+    headers: { "user-agent": WEB_UA, accept: "*/*" },
+    signal: AbortSignal.timeout(WEB_TIMEOUT),
+  });
+  if (!response.ok) throw new Error(`${response.status}`);
+  const body = Buffer.from(await response.arrayBuffer());
+  return {
+    bytes: body.subarray(0, limit),
+    url: response.url || url, // where the redirects actually landed — relative hrefs hang off this
+    type: (response.headers.get("content-type") || "").toLowerCase(),
+  };
+}
+
+/** One attribute out of one tag, in any of the three quoting styles HTML allows. */
+function attr(tag, name) {
+  const found = new RegExp(`\\b${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s"'>]+))`, "i").exec(tag);
+  return found ? (found[1] ?? found[2] ?? found[3] ?? "") : null;
+}
+
+const ENTITIES = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " };
+
+/** Titles come entity-encoded far too often for "&amp;" to be left standing in a node label. */
+const decodeEntities = (text) =>
+  text.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (whole, body) => {
+    if (body[0] !== "#") return ENTITIES[body.toLowerCase()] ?? whole;
+    const code = body[1] === "x" || body[1] === "X" ? parseInt(body.slice(2), 16) : Number(body.slice(1));
+    return Number.isFinite(code) && code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : whole;
+  });
+
+function pageTitle(html) {
+  const found = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html);
+  return found ? decodeEntities(found[1]).replace(/\s+/g, " ").trim().slice(0, 90) : "";
+}
+
+/**
+ * How big a candidate CLAIMS to be, from its `sizes` attribute or from the size baked
+ * into its file name. Only a claim — it decides what is worth fetching, and the bytes
+ * decide what actually wins.
+ */
+function sizeHint(sizes, href) {
+  if (/\.svg(?:[?#]|$)/i.test(href)) return 9000; // scalable: nothing raster beats it
+  if (sizes && /^\s*any\s*$/i.test(sizes)) return 9000;
+  let best = 0;
+  for (const found of String(sizes || "").matchAll(/(\d+)\s*[x×]\s*(\d+)/gi)) {
+    best = Math.max(best, Number(found[1]));
+  }
+  if (best) return best;
+  const named = /(\d{2,4})x\1/.exec(href); // apple-touch-icon-180x180.png
+  return named ? Number(named[1]) : 0;
+}
+
+/** Every icon the page offers, best claim first — plus the two every site has anyway. */
+async function iconCandidates(html, base) {
+  const found = new Map();
+  const add = (href, hint) => {
+    if (!href) return;
+    let absolute;
+    try {
+      absolute = new URL(href, base).toString();
+    } catch {
+      return;
+    }
+    if (!/^https?:/i.test(absolute)) return; // data: and friends are not worth the round trip
+    found.set(absolute, Math.max(found.get(absolute) ?? 0, hint));
+  };
+
+  let manifest = null;
+  for (const tag of html.match(/<link\b[^>]*>/gi) ?? []) {
+    const rel = (attr(tag, "rel") || "").toLowerCase();
+    const href = attr(tag, "href");
+    if (/\bmanifest\b/.test(rel)) {
+      manifest = href;
+      continue;
+    }
+    // `mask-icon` is deliberately not among these: Safari's pinned-tab icon is a
+    // one-colour silhouette meant to be tinted by the browser, and taken at face
+    // value it puts a black blob where the site's actual mark should be.
+    if (!/\b(?:icon|apple-touch-icon|apple-touch-icon-precomposed|fluid-icon)\b/.test(rel)) {
+      continue;
+    }
+    add(href, sizeHint(attr(tag, "sizes"), href || ""));
+  }
+  // The web app manifest is where the big ones live — 192 and 512 square, drawn for
+  // exactly this job: the site standing on somebody else's screen as an icon.
+  if (manifest) {
+    try {
+      const body = await fetchBytes(new URL(manifest, base).toString(), PAGE_LIMIT);
+      for (const icon of JSON.parse(body.bytes.toString("utf8")).icons ?? []) {
+        add(new URL(icon.src, body.url).toString(), sizeHint(icon.sizes, icon.src || ""));
+      }
+    } catch {
+      /* no manifest, or nonsense in it — the <link> icons stand on their own */
+    }
+  }
+  // The conventions, for the many sites that declare nothing at all.
+  add(new URL("/favicon.ico", base).toString(), 0);
+  add(new URL("/apple-touch-icon.png", base).toString(), 180);
+
+  return [...found]
+    .map(([url, hint]) => ({ url, hint }))
+    .sort((a, b) => b.hint - a.hint)
+    .slice(0, 6);
+}
+
+/**
+ * What the bytes ACTUALLY are. Servers hand back an HTML error page under a 200 and an
+ * image content-type often enough that the header cannot be believed; the magic bytes
+ * can. Anything unrecognised is not an icon as far as this is concerned.
+ */
+function imageType(bytes) {
+  if (bytes.length < 12) return null;
+  if (bytes[0] === 0x89 && bytes.toString("latin1", 1, 4) === "PNG") return "image/png";
+  if (bytes[0] === 0xff && bytes[1] === 0xd8) return "image/jpeg";
+  if (bytes.toString("latin1", 0, 3) === "GIF") return "image/gif";
+  if (bytes.toString("latin1", 0, 4) === "RIFF" && bytes.toString("latin1", 8, 12) === "WEBP") {
+    return "image/webp";
+  }
+  if (bytes[0] === 0 && bytes[1] === 0 && bytes[2] === 1 && bytes[3] === 0) return "image/x-icon";
+  const head = bytes.toString("utf8", 0, 400).trim().toLowerCase();
+  if (head.startsWith("<svg") || (head.startsWith("<?xml") && head.includes("<svg"))) {
+    return "image/svg+xml";
+  }
+  return null;
+}
+
+/**
+ * The width the bytes really have, read off the header — "best resolution" decided by
+ * measurement rather than by what the page claimed. Unmeasurable is 0, which loses to
+ * anything measurable and falls back to the claim.
+ */
+function imageWidth(bytes, type) {
+  try {
+    if (type === "image/svg+xml") return 9000; // draws sharp at whatever size the node is
+    if (type === "image/png") return bytes.readUInt32BE(16);
+    if (type === "image/gif") return bytes.readUInt16LE(6);
+    if (type === "image/x-icon") {
+      // An .ico is a directory of images; the one that matters is its biggest. A width
+      // byte of 0 means 256 — the format has nowhere else to put a number that big.
+      let best = 0;
+      const count = bytes.readUInt16LE(4);
+      for (let i = 0; i < count && 6 + i * 16 < bytes.length; i++) best = Math.max(best, bytes[6 + i * 16] || 256);
+      return best;
+    }
+    if (type === "image/webp") {
+      const chunk = bytes.toString("latin1", 12, 16);
+      if (chunk === "VP8X") return bytes.readUIntLE(24, 3) + 1;
+      if (chunk === "VP8 ") return bytes.readUInt16LE(26) & 0x3fff;
+      if (chunk === "VP8L") return (bytes.readUInt32LE(21) & 0x3fff) + 1;
+      return 0;
+    }
+    if (type === "image/jpeg") {
+      for (let at = 2; at + 9 < bytes.length; ) {
+        if (bytes[at] !== 0xff) {
+          at++;
+          continue;
+        }
+        const marker = bytes[at + 1];
+        // Every SOF marker carries the dimensions; the four in the gaps do not.
+        if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+          return bytes.readUInt16BE(at + 7);
+        }
+        at += 2 + bytes.readUInt16BE(at + 2);
+      }
+    }
+  } catch {
+    /* a truncated or lying header is simply not measurable */
+  }
+  return 0;
+}
+
+async function scrapePage(target) {
+  let html = "";
+  let base = target;
+  try {
+    const page = await fetchBytes(target, PAGE_LIMIT);
+    base = page.url;
+    if (!page.type || /html|xml/.test(page.type)) html = page.bytes.toString("utf8");
+  } catch {
+    /* a page that will not be read still has an origin worth guessing at */
+  }
+  const candidates = await iconCandidates(html, base);
+  // All at once: six small GETs against one host, and the slowest of them is the wait
+  // rather than the sum. Every one of them is allowed to fail on its own.
+  const fetched = await Promise.all(
+    candidates.map(async (candidate) => {
+      try {
+        const got = await fetchBytes(candidate.url, ICON_LIMIT);
+        const type = imageType(got.bytes);
+        if (!type) return null;
+        return { bytes: got.bytes, type, width: imageWidth(got.bytes, type) || candidate.hint };
+      } catch {
+        return null;
+      }
+    }),
+  );
+  const best = fetched.filter(Boolean).sort((a, b) => b.width - a.width)[0];
+  return {
+    url: base,
+    title: pageTitle(html),
+    icon: best ? `data:${best.type};base64,${best.bytes.toString("base64")}` : "",
+  };
+}
+
+ipcMain.handle("web-page", async (_event, rawUrl) => {
+  const target = String(rawUrl || "").trim();
+  if (!/^https?:\/\//i.test(target)) throw new Error("that is not a web address");
+  const pages = readIcons();
+  const known = pages[target];
+  const remembered = known && { url: known.url || target, title: known.title || "", icon: known.icon || "" };
+  if (remembered && Date.now() - (known.at ?? 0) < ICON_TTL) return remembered;
+
+  const found = await scrapePage(target);
+  // A site that is down (or has just started refusing us) must not cost the node the
+  // icon it has been wearing all along: nothing found leaves the old answer standing.
+  if (!found.icon && !found.title && remembered) return remembered;
+  if (found.icon || found.title) {
+    pages[target] = { ...found, at: Date.now() };
+    writeIcons(pages);
+  }
+  return found;
 });
 
 /*
@@ -822,6 +1097,9 @@ ipcMain.handle("claude-status", (_event, ids) => {
 
 app.whenReady().then(() => {
   protocol.handle("app", serve);
+  if (process.platform === "darwin" && !app.isPackaged && fs.existsSync(DEV_ICON)) {
+    app.dock.setIcon(DEV_ICON);
+  }
   // Session-wide user agent for the gemini partition: every request — first page,
   // redirects, sign-in popups — reads as plain Chrome, or Google blocks the login.
   const gemini = session.fromPartition(GEMINI_PARTITION);

@@ -1,6 +1,17 @@
 import "./style.css";
-import { GraphView, type Doc, type Mark, type SessionState } from "./graph";
-import { LinkResolver, labelledLink, parseField, relinkText, setActive, setField, setGhost } from "./links";
+import { GraphView, type Client, type Doc, type Mark, type SessionState } from "./graph";
+import {
+  LinkResolver,
+  labelledLink,
+  parseField,
+  parseStyle,
+  relinkText,
+  setField,
+  setGhost,
+  setStyle,
+  type NodeStyle,
+} from "./links";
+import { showFolderStylePicker, showStylePicker } from "./node-style";
 import { askChoice, askConfirm, askText } from "./dialog";
 import { EDGE_DIR, edgeNotePath, edgeNoteTemplate, edgeTitle, isEdgeNote, renamedEdgeNote } from "./edges";
 import { showMenu, type MenuItem } from "./menu";
@@ -168,10 +179,11 @@ const sidebar = new Sidebar(ui.tree, {
 });
 
 const graphView = new GraphView(ui.cy, {
-  onOpen: (path) => void openFile(path),
+  onOpen: (path) => void openFile(path, graphPane()),
   onOpenGemini: (path, url) => openGeminiNode(path, url),
   onOpenClaude: (path, session) => void openClaudeSession(path, session),
   onOpenPath: (path, target, kind) => void openFsNode(path, target, kind),
+  onOpenWeb: (path, url) => void openWebNode(path, url),
   onIssueEdit: (path, text, change) => editIssue(path, text, change),
   onOpenIssue: (url) => {
     if (!window.open(url, "_blank", "noopener")) ui.status.textContent = `the browser blocked ${url}`;
@@ -182,10 +194,12 @@ const graphView = new GraphView(ui.cy, {
     if (kind === "gemini") void createGeminiAt(at, folder, source);
     else if (kind === "claude") void createClaudeAt(at, folder, source);
     else if (kind === "file" || kind === "folder") void createFsAt(at, folder, kind, source);
+    else if (kind === "web") void createWebAt(at, folder, source);
     else void linkToNewNote(source, at, folder);
   },
   onReparent: (path, folder) => void moveEntry(path, "file", folder, true),
-  onGroup: (paths, frame) => void groupIntoFolder(paths, frame),
+  onRefolder: (path, folder) => void moveEntry(path, "dir", folder, true),
+  onGroup: (picked, frame) => void groupIntoFolder(picked, frame),
   onNodeMenu: (path, client) => {
     const items: MenuItem[] = [{ label: "Link to a note…", run: () => graphView.startLink(path) }];
     if (settings.enabled("gemini")) {
@@ -204,13 +218,13 @@ const graphView = new GraphView(ui.cy, {
         { label: "Link to a folder…", run: () => graphView.startLink(path, "folder") },
       );
     }
+    if (settings.enabled("web")) {
+      items.push({ label: "Link to a webpage…", run: () => graphView.startLink(path, "web") });
+    }
     if (settings.enabled("active")) {
       const mark = graphView.nodeMark(path);
       items.push(
-        {
-          label: mark === "radiate" ? "Stop radiating" : "Make it radiate",
-          run: () => void markNode(path, mark === "radiate" ? null : "radiate"),
-        },
+        { label: "Style…", run: () => void styleNode(path, client) },
         {
           label: mark === "ghost" ? "Bring it back" : "Make it a ghost",
           run: () => void markNode(path, mark === "ghost" ? null : "ghost"),
@@ -253,6 +267,17 @@ const graphView = new GraphView(ui.cy, {
       { label: "New folder", run: () => graphView.startGroup() },
       { label: "Unstack notes", run: () => unstackNotes() },
     ];
+    // Right-clicked inside a box: that box can be coloured, and told apart from the
+    // others at a glance — which is most of what a folder is for on a canvas.
+    if (folder) {
+      items.push({
+        label: `Style "${basename(folder)}"…`,
+        run: () =>
+          showFolderStylePicker(client, graphView.folderStyle(folder), (style) =>
+            graphView.setFolderStyle(folder, style),
+          ),
+      });
+    }
     // Switched-off integrations do not appear anywhere, the menu included.
     if (settings.enabled("stickies")) items.push({ label: "New sticky", run: () => graphView.addSticky(at) });
     if (settings.enabled("linear")) {
@@ -269,6 +294,9 @@ const graphView = new GraphView(ui.cy, {
         { label: "Link a file…", run: () => void createFsAt(at, folder, "file") },
         { label: "Link a folder…", run: () => void createFsAt(at, folder, "folder") },
       );
+    }
+    if (settings.enabled("web")) {
+      items.push({ label: "Link a webpage…", run: () => void createWebAt(at, folder) });
     }
     showMenu(client, items);
   },
@@ -387,7 +415,7 @@ function renderPane(index: number, v: PaneUI): void {
       );
     })
     .join("");
-  v.actions.innerHTML = actionsHtml(index, tab);
+  v.actions.innerHTML = actionsHtml(index);
 
   const graphOpen = tab?.kind === "graph";
   if (index === 0) ui.cy.classList.toggle("hidden", !graphOpen);
@@ -410,14 +438,8 @@ const ONE_PANE_ICON = paneIcon(false);
  * Pane controls live outside the scrolling tab strip — with enough tabs open they
  * used to be pushed off the end of it and out of reach.
  */
-function actionsHtml(index: number, tab: Tab | undefined): string {
+function actionsHtml(index: number): string {
   const bits: string[] = [];
-  if (tab?.kind === "graph") {
-    bits.push(
-      `<label class="toggle" title="Show or hide the folder boxes">` +
-        `<input data-act="boxes" type="checkbox"${graphView.boxesShown() ? " checked" : ""} /> Boxes</label>`,
-    );
-  }
   if (panes.length < MAX_PANES) {
     bits.push(`<button data-act="split" title="Open a second pane">${SPLIT_ICON} Split</button>`);
   } else if (index === 1) {
@@ -445,6 +467,7 @@ async function drawGraph(): Promise<void> {
   graphStale = false;
   graphView.render(await readDocs(), lastFile, await describedEdges());
   void pollSessions(); // the dots belong to the graph that has just gone up
+  refreshWebIcons(); // likewise the faces: a page linked in another window is scraped here too
 }
 
 /** Brings one pane's visible content back in line with its active tab. */
@@ -530,6 +553,14 @@ async function closeTab(index: number, tab: number): Promise<void> {
 }
 
 /* --------------------------------------------------------------- actions --- */
+
+/**
+ * Where a note opened FROM the graph lands. The graph is pinned to the left pane, so with
+ * a split open the note belongs on the other side: the whole point of the split is to keep
+ * the canvas in view while you write, and opening over it would close the thing you split
+ * to watch. With one pane there is nowhere else to put it.
+ */
+const graphPane = (): number => (panes.length > 1 ? 1 : focused);
 
 async function openFile(path: string, where = focused): Promise<void> {
   await flushAll();
@@ -703,7 +734,16 @@ async function moveEntry(path: string, kind: "file" | "dir", dir: string, carry 
   }
   await flushAll();
   const moves = movesFor(path, next, kind);
-  if (carry && kind === "file") graphView.carryPosition(path, next);
+  if (carry) {
+    if (kind === "file") graphView.carryPosition(path, next);
+    else {
+      // Filing a folder changes the id of the box and of everything under it. Without
+      // this the whole box would be re-placed from scratch the moment it was dropped —
+      // the arrangement inside it is the point of dragging it there in one piece.
+      graphView.carryFrame(path, next);
+      graphView.carrySubtree(path, next);
+    }
+  }
   if (!(await tryVault(`could not move ${basename(path)}`, () => vault.rename(path, next, kind)))) return;
   retargetTabs(path, next);
   const count = await relinkVault(moves);
@@ -742,37 +782,45 @@ function commonDir(paths: string[]): string {
 }
 
 /**
- * A rectangle drawn on the graph becomes a folder holding the notes inside it.
- * This is the only way to get a folder onto the graph: a box is drawn from the notes
- * it holds, so an empty folder has nothing to draw and creating one first gets you
- * nowhere. The notes keep their positions and the box is sized to the rectangle, so
- * the folder appears exactly where it was drawn.
+ * A rectangle drawn on the graph becomes a folder holding whatever was inside it —
+ * loose notes, whole folder boxes, or both. This is the only way to get a folder onto
+ * the graph: a box is drawn from what it holds, so an empty folder has nothing to draw
+ * and creating one first gets you nowhere. Everything keeps its position and the box is
+ * sized to the rectangle, so the folder appears exactly where it was drawn.
  */
-async function groupIntoFolder(paths: string[], frame: { w: number; h: number }): Promise<void> {
-  const taken = new Set(filePaths());
+async function groupIntoFolder(
+  picked: Array<{ path: string; kind: "file" | "dir" }>,
+  frame: { w: number; h: number },
+): Promise<void> {
+  const taken = new Set([...filePaths(), ...entries.filter((e) => e.kind === "dir").map((e) => e.path)]);
   const dirs = entries.filter((e) => e.kind === "dir").map((e) => e.path);
-  const folder = uniquePath(dirs, commonDir(paths), "New folder", "");
+  const folder = uniquePath(dirs, commonDir(picked.map((one) => one.path)), "New folder", "");
   await flushAll();
   await vault.createDir(folder);
 
   const moves = new Map<string, string>();
   const moved: string[] = [];
   const clashed: string[] = [];
-  for (const path of paths) {
+  for (const { path, kind } of picked) {
     const next = join(folder, basename(path));
-    // Two notes of the same name from different folders: the second one stays put.
+    // Two things of the same name from different folders: the second one stays put.
     if (taken.has(next)) {
       clashed.push(basename(path));
       continue;
     }
-    graphView.carryPosition(path, next); // the box forms around the notes, where they are
-    if (!(await tryVault(`could not move ${basename(path)}`, () => vault.rename(path, next, "file")))) {
+    // The box forms around what it holds, where it already is.
+    if (kind === "file") graphView.carryPosition(path, next);
+    else {
+      graphView.carryFrame(path, next);
+      graphView.carrySubtree(path, next);
+    }
+    if (!(await tryVault(`could not move ${basename(path)}`, () => vault.rename(path, next, kind)))) {
       break; // the vault is unhappy — stop rather than half-group the selection
     }
     taken.delete(path);
     taken.add(next);
     retargetTabs(path, next);
-    moves.set(path, next);
+    for (const [from, to] of movesFor(path, next, kind)) moves.set(from, to);
     moved.push(next);
   }
 
@@ -782,8 +830,8 @@ async function groupIntoFolder(paths: string[], frame: { w: number; h: number })
   sidebar.reveal(folder);
   ui.crumb.textContent = "/" + folder;
   ui.status.textContent = clashed.length
-    ? `${moved.length} notes → ${folder}${relinked(count)}; left ${clashed.join(", ")} (name already taken)`
-    : `${moved.length} notes → ${folder}${relinked(count)} — type a name`;
+    ? `${moved.length} → ${folder}${relinked(count)}; left ${clashed.join(", ")} (name already taken)`
+    : `${moved.length} → ${folder}${relinked(count)} — type a name`;
   // Name it on the box itself, so the whole gesture stays on the graph.
   graphView.renameNode(folder, (name) => {
     if (name) void applyRename(folder, "dir", name);
@@ -1024,7 +1072,7 @@ async function openEdgeNote(source: string, target: string, label: string | null
     graphView.setEdgeDescribed(source, target); // thicken the line now, not at the next rebuild
     graphStale = true;
   }
-  await openFile(path);
+  await openFile(path, graphPane());
   // A brand-new connection note is empty apart from its heading — put the caret in it.
   if (fresh) {
     editors[focused].focus();
@@ -1279,19 +1327,59 @@ async function createIssueAt(at: { x: number; y: number }, folder: string | null
 /* ---------------------------------------------------------------- active --- */
 
 /**
- * Right-click → "Make it radiate" / "Make it a ghost": the note's standing on the canvas.
- * Radiating is one of the live ends of the vault, pulsing green; a ghost is parked — grey,
- * dimmed and dotted. Either mark is a line in the note's own markdown (`active:: true` /
- * `ghost:: true`), so it travels with the folder and can be typed or deleted by hand like
- * any other field. The node is switched first, so the look answers the click, and the
- * file follows behind.
+ * Right-click → "Style…": the note's own look on the canvas — a sign engraved on its
+ * node, a colour, an animation and the animation's colour. The panel confirms nothing;
+ * every click in it lands here, so the canvas answers the pick immediately and the vault
+ * catches up behind. What is chosen is four lines in the note's own markdown (`sign::`,
+ * `color::`, `anim::`, `anim-color::`), so a look travels with the folder and can be
+ * typed or deleted by hand like any other field.
+ */
+async function styleNode(path: string, at: Client): Promise<void> {
+  await flushAll(); // the note may be open and mid-edit — don't read behind its own buffer
+  const text = await vault.read(path);
+  showStylePicker(at, parseStyle(text), (style) => writeStyle(path, style));
+}
+
+/**
+ * One write at a time, in the order the panel asked for them. Each pick reads the note
+ * afresh: a style write must not carry a copy of the file taken before the pick before
+ * it, or the last two clicks in the panel would undo each other.
+ */
+let styling: Promise<void> = Promise.resolve();
+
+function writeStyle(path: string, style: NodeStyle): void {
+  graphView.setNodeStyle(path, style); // the look answers the click; the file follows
+  styling = styling.then(async () => {
+    await flushAll();
+    const text = await vault.read(path);
+    // Animating a note un-parks it, in the file as well as on the canvas: a ghost left
+    // behind in the markdown would put the note back on ice at the next rebuild.
+    const next = style.anim ? setGhost(setStyle(text, style), false) : setStyle(text, style);
+    if (next !== text) {
+      if (!(await tryVault(`could not style ${noteName(path)}`, () => vault.write(path, next)))) return;
+      // Open in a pane: the fields appear in the editor too, caret and undo history intact.
+      for (let i = 0; i < panes.length; i++) if (pathOf(panes[i]) === path) editors[i].sync(next);
+    }
+    graphStale = true;
+  });
+}
+
+/**
+ * Right-click → "Make it a ghost": the note is parked — grey, dimmed and dotted. A line
+ * in the note's own markdown (`ghost:: true`) like everything else the canvas knows about
+ * it. A ghost does not animate: being on ice and being the live end of the vault are
+ * opposite statements, so the pulse comes off with the same write.
  */
 async function markNode(path: string, mark: Mark | null): Promise<void> {
   const before = graphView.nodeMark(path);
   graphView.setNodeMark(path, mark);
   await flushAll(); // the note may be open and mid-edit — don't write over its own buffer
   const text = await vault.read(path);
-  const next = setGhost(setActive(text, mark === "radiate"), mark === "ghost");
+  const style = parseStyle(text);
+  const next = setGhost(
+    setStyle(text, { ...style, anim: mark === "ghost" ? "" : style.anim }),
+    mark === "ghost",
+  );
   if (next !== text) {
     if (!(await tryVault(`could not mark ${noteName(path)}`, () => vault.write(path, next)))) {
       graphView.setNodeMark(path, before); // the vault refused; the look must not claim otherwise
@@ -1302,11 +1390,9 @@ async function markNode(path: string, mark: Mark | null): Promise<void> {
   }
   graphStale = true;
   ui.status.textContent =
-    mark === "radiate"
-      ? `${noteName(path)} is radiating — right-click it again to stop`
-      : mark === "ghost"
-        ? `${noteName(path)} is a ghost — right-click it to bring it back`
-        : `${noteName(path)} is back to itself`;
+    mark === "ghost"
+      ? `${noteName(path)} is a ghost — right-click it to bring it back`
+      : `${noteName(path)} is back to itself`;
 }
 
 /* ---------------------------------------------------------------- gemini --- */
@@ -1575,6 +1661,200 @@ async function openFsNode(path: string, target: string | null, kind: "file" | "f
   for (let i = 0; i < panes.length; i++) if (pathOf(panes[i]) === path) await renderPage(i);
   const retry = await bridge.openPath(next);
   say(retry === "opened" ? `${noteName(path)} → ${next}` : `the OS could not open ${next} — ${retry}`);
+}
+
+/* ------------------------------------------------------------------- web --- */
+
+/**
+ * A webpage note is a pointer, in the file/folder note's mould: the address it stands
+ * for, and nothing said on its behalf. `url::` is the address after the shell has
+ * followed whatever redirects the site felt like — the one that actually answered.
+ * The icon is deliberately NOT in here: a scraped logo is cache, it lives in the app's
+ * own folder, and a vault of plain files keeps facts.
+ */
+const webTemplate = (url: string): string => `type:: web\n\nurl:: ${url}\n`;
+
+/**
+ * What somebody pasted, made into an address. A bare `stripe.com/docs` is what people
+ * actually paste, so it is read as https; anything that is not a web address at all
+ * (a file path, a sentence) comes back null and the node is never made.
+ */
+function readUrl(typed: string): string | null {
+  const text = typed.trim();
+  if (!text || /\s/.test(text)) return null;
+  const guessed = /^[a-z][\w+.-]*:/i.test(text) ? text : `https://${text}`;
+  try {
+    const url = new URL(guessed);
+    // Only the web: `file:` and friends are the Files integration's business, not this one.
+    if (!/^https?:$/.test(url.protocol) || !url.hostname.includes(".")) return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+/** The host, minus the `www.` nobody reads — the name a page wears until it has told us its own. */
+const webHost = (url: string): string => {
+  try {
+    return new URL(url).hostname.replace(/^www\./i, "");
+  } catch {
+    return "webpage";
+  }
+};
+
+/** A page title is somebody else's text: it has to survive being used as a file name. */
+const asFileName = (title: string): string =>
+  title.replace(/[\\/:*?"<>|[\]#^]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 60);
+
+/**
+ * "Link a webpage…" — from the canvas menu, or from a link draft released on empty space
+ * (`source` is then the note the arrow came from). Paste an address and the node is there
+ * at once, named after the host and wearing a globe; the site is asked for its title and
+ * its icon behind that, and the node takes both on as soon as they arrive.
+ */
+async function createWebAt(
+  at: { x: number; y: number },
+  folder: string | null,
+  source: string | null = null,
+): Promise<void> {
+  const typed = await askText("Paste the webpage's address", "", "Add");
+  if (typed === null) return; // dismissed — nothing made
+  const url = readUrl(typed);
+  if (!url) {
+    ui.status.textContent = `${typed} is not a web address`;
+    return;
+  }
+  const dir = folder ?? "";
+  const path = uniquePath(filePaths(), dir, webHost(url), ".md");
+  await vault.createFile(path, webTemplate(url));
+  entries = [...entries, { path, kind: "file" }];
+  if (source) {
+    graphView.commitLink(source, path, {
+      label: noteName(path),
+      parent: dir || undefined,
+      at,
+      type: "web",
+      url,
+    });
+  } else {
+    graphView.commitNode(path, noteName(path), dir || undefined, at, "web", url);
+  }
+  graphStale = true;
+  ui.status.textContent = `${noteName(path)} → ${url}`;
+  await refreshSidebar();
+  // The site is asked BEFORE the connection is named, because its answer can rename the
+  // note — and a link written against the name it had a moment ago points at nothing.
+  // Same order as naming a new note by hand: the note settles, then the line does.
+  const settled = await adoptWebPage(path, url, noteName(path));
+  if (source) {
+    graphView.promptConnection(source, settled, (label) => void finishLink(source, settled, label));
+  }
+}
+
+/**
+ * Asks the site who it is, and lets the node say so: the icon goes on, and the note takes
+ * the page's own title for a name — `Hacker News` rather than `news.ycombinator.com`. The
+ * host stands in until then, and stays if the site says nothing, so this failing costs the
+ * node nothing it had. `born` is the name the note was made with: anything else means
+ * somebody has named it themselves while the site was thinking, and that name wins.
+ *
+ * Returns where the note ended up — which is what anything written afterwards has to
+ * point at.
+ */
+async function adoptWebPage(path: string, url: string, born: string): Promise<string> {
+  const found = await fetchWebPage(url);
+  if (!found) return path;
+  if (!(await vault.exists(path))) return path; // deleted while the site was thinking
+  const wanted = asFileName(found.title);
+  if (!wanted || wanted === born || noteName(path) !== born) return path;
+  // A second bookmark on the same page is "Hacker News 2", not the host it started as.
+  const free = uniquePath(
+    filePaths().filter((other) => other !== path),
+    dirname(path),
+    wanted,
+    ".md",
+  );
+  return (await applyRename(path, "file", noteName(free))) ?? path;
+}
+
+/**
+ * One scrape, shared: several nodes pointing at the same page ask once between them, and
+ * the icon is handed to the graph the moment it lands. Answers are remembered here for the
+ * session and in the shell across launches, so a graph of bookmarks costs one scrape each,
+ * ever. Without the desktop shell there is nothing to ask — the nodes keep their globes.
+ */
+const webPages = new Map<string, Promise<{ title: string; icon: string } | null>>();
+
+function fetchWebPage(url: string): Promise<{ title: string; icon: string } | null> {
+  const known = webPages.get(url);
+  if (known) return known;
+  const bridge = window.bedrock;
+  const job: Promise<{ title: string; icon: string } | null> = bridge
+    ? bridge.webPage(url).then(
+        (found) => {
+          graphView.setWebIcon(url, found.icon);
+          return { title: found.title, icon: found.icon };
+        },
+        () => {
+          // A site that is unreachable now may not be later: forget the refusal rather
+          // than remember it, so the next draw of the graph tries again.
+          webPages.delete(url);
+          return null;
+        },
+      )
+    : Promise.resolve(null);
+  webPages.set(url, job);
+  return job;
+}
+
+/**
+ * The faces of every webpage node on the canvas, fetched once each. Runs after a draw
+ * rather than during one: a node must appear the instant it is made, wearing a globe if
+ * that is all it has yet.
+ */
+function refreshWebIcons(): void {
+  if (!settings.enabled("web") || !window.bedrock) return;
+  for (const node of graphView.webNodes()) {
+    if (node.url && !node.fetched) void fetchWebPage(node.url);
+  }
+}
+
+/**
+ * Click on a webpage node: the page opens in the real browser — the shell sends http(s)
+ * links there, and that is where somebody's actual session with that site lives. A note
+ * whose `url::` line has been stripped asks for the address again and writes it back,
+ * the way a file node offers the picker when its target has moved.
+ */
+async function openWebNode(path: string, url: string | null): Promise<void> {
+  // One tick later: a click is also a grab+free to cytoscape, and the free handler
+  // clears the hint right after this — the message has to land after that reset.
+  const say = (message: string): void => {
+    window.setTimeout(() => {
+      ui.status.textContent = message;
+    }, 0);
+  };
+  if (!url) {
+    say(`${noteName(path)} carries no address — paste the one it stands for`);
+    const typed = await askText("Paste the webpage's address", "", "Use this");
+    const next = typed === null ? null : readUrl(typed);
+    if (!next) {
+      if (typed !== null) say(`${typed} is not a web address`);
+      return;
+    }
+    await flushAll(); // the note may be open and mid-edit; the rewrite must not clobber
+    await vault.write(path, setField(await vault.read(path), "url", next));
+    graphView.setWebUrl(path, next);
+    graphStale = true;
+    for (let i = 0; i < panes.length; i++) if (pathOf(panes[i]) === path) await renderPage(i);
+    void fetchWebPage(next);
+    say(`${noteName(path)} → ${next} — click it again to open the page`);
+    return;
+  }
+  // In the desktop app this ALWAYS comes back null: the shell denies the popup and hands
+  // the address to the system browser instead, which is the whole arrangement for links
+  // here. Only a plain browser returning null means a popup was actually blocked.
+  const opened = window.open(url, "_blank", "noopener");
+  say(opened || window.bedrock ? `${noteName(path)} → ${url}` : `the browser blocked ${url}`);
 }
 
 /* ---------------------------------------------------------------- claude --- */
@@ -2098,11 +2378,6 @@ view.forEach((v, index) => {
         void unsplit();
         break;
     }
-  });
-
-  v.actions.addEventListener("change", (event) => {
-    const node = event.target as HTMLInputElement;
-    if (node.dataset.act === "boxes") graphView.setBoxesVisible(node.checked);
   });
 
   // Typing, Escape, ⌘-click on a link and pasted screenshots all arrive through the editor's

@@ -50,13 +50,23 @@ const TAG_RE = /(?<![\w#/-])#([\w/-]*[A-Za-z][\w/-]*)/g;
 /* A heading is `# Title`: a hash, then a space. `#Title` is a tag. The two never collide. */
 const CODE_RE = /```[\s\S]*?```|`[^`\n]*`/g;
 
+/*
+ * `#4c8dff` is a colour somebody wrote down, not a tag — and taken for one it would put a
+ * slice of its own hue in the note's pie, which is the note quietly recolouring itself for
+ * having mentioned a colour. Six or eight hex digits with a digit among them: long enough
+ * and mixed enough that a word tag will not be mistaken for one.
+ */
+const HEX_RE = /^(?:[0-9a-f]{6}|[0-9a-f]{8})$/i;
+const isHex = (word: string): boolean => HEX_RE.test(word) && /\d/.test(word);
+
 /**
  * Every distinct tag in a document, in order of first appearance. Code is stripped
  * first: a shell `#!/bin/sh` or a C `#include` is not somebody tagging a note.
  */
 export function parseTags(text: string): string[] {
   const prose = text.replace(CODE_RE, " ");
-  return [...new Set([...prose.matchAll(TAG_RE)].map((match) => match[1]))];
+  const words = [...prose.matchAll(TAG_RE)].map((match) => match[1]).filter((word) => !isHex(word));
+  return [...new Set(words)];
 }
 
 /*
@@ -138,6 +148,65 @@ export function parseGhost(text: string): boolean {
 
 export const setGhost = (text: string, on: boolean): string =>
   setField(text, "ghost", on ? "true" : null);
+
+/**
+ * A note's LOOK on the canvas, four independent choices, each an inline field of its own:
+ *
+ *     sign:: star
+ *     color:: blue
+ *     anim:: pulse
+ *     anim-color:: pink
+ *
+ * Names, not codes — what the words mean is `node-style.ts`'s business, and a name is what
+ * somebody editing the file by hand can write without looking anything up. A hex typed in
+ * by hand is honoured all the same, and is the reason a value may start with a `#`.
+ *
+ * Empty strings throughout rather than nulls — "no sign" and "no colour of its own" are
+ * answers a note can hold, and the same shape goes onto the node as data (see `graph.ts`),
+ * where a key that comes and goes would leave the last one painted on.
+ *
+ * Both spellings of colour are read, because half the world types one and half the other;
+ * `setStyle` writes the American one and clears the British, so a note never carries two.
+ */
+export type NodeStyle = { icon: string; colour: string; anim: string; animColour: string };
+
+export const NO_STYLE: NodeStyle = { icon: "", colour: "", anim: "", animColour: "" };
+
+const KEY_RE = /^#?[\w-]+$/;
+
+export function parseStyle(text: string): NodeStyle {
+  const key = (...names: string[]): string => {
+    for (const name of names) {
+      const value = parseField(text, name)?.trim() ?? "";
+      if (KEY_RE.test(value)) return value.toLowerCase();
+    }
+    return "";
+  };
+  return {
+    icon: key("sign"),
+    colour: key("color", "colour"),
+    // `active:: true` was how a note asked to pulse before there was anything else to
+    // ask for; it still is, for every note written back then.
+    anim: key("anim") || (parseActive(text) ? "pulse" : ""),
+    animColour: key("anim-color", "anim-colour"),
+  };
+}
+
+export function setStyle(text: string, style: NodeStyle): string {
+  let out = text;
+  out = setField(out, "sign", style.icon || null);
+  out = setField(out, "colour", null);
+  out = setField(out, "color", style.colour || null);
+  out = setField(out, "anim", style.anim || null);
+  out = setField(out, "anim-colour", null);
+  // No animation, nothing to colour: the line would sit in the file saying something
+  // about a ring that is not there, and read as one that is.
+  out = setField(out, "anim-color", (style.anim && style.animColour) || null);
+  // A note that has been styled says what it does in `anim::`, so the old spelling comes
+  // off — left behind it would go on meaning "pulse" after the pulse was switched off.
+  if (parseField(out, "active") !== null) out = setActive(out, false);
+  return out;
+}
 
 /** Same shape as LINK_RE, but keeping the `|alias` tail so a rewrite can put it back. */
 const REWRITE_RE = /(?<!!)\[\[([^\][|]+)(\|[^\][]*)?\]\]/g;

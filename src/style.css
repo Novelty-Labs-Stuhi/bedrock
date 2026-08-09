@@ -946,6 +946,104 @@ button.twisty:hover {
   background: var(--bg-hover);
 }
 
+/* -------------------------------------------------------------- node style --- */
+/* The panel a node opens for its own look. Same card as the menu it comes out of, wider,
+   and laid out as rows of swatches: what a note can look like is a thing to look at, so
+   the choices are the pictures themselves rather than a list of their names. */
+
+#style-pop {
+  position: fixed;
+  z-index: 60;
+  display: none;
+  flex-direction: column;
+  gap: 10px;
+  width: 268px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg-side);
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.5);
+}
+
+#style-pop.open {
+  display: flex;
+}
+
+.style-row h5 {
+  margin: 0 0 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* Nothing to colour until there is an animation to colour — greyed rather than gone, so
+   switching the animation on and off does not shuffle the panel under the cursor. */
+.style-row.off {
+  opacity: 0.35;
+  pointer-events: none;
+}
+
+.style-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.style-swatch {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background-color: var(--bg);
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: 62%;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+/* A sign is a cut, not a colour: black and white on whatever it is cut into. So its
+   swatch is a mid grey — the panel shows the engraving on something to engrave, the way
+   a node will wear it, rather than a black mark on a black button. */
+.style-swatch[data-sign]:not([data-sign=""]) {
+  background-color: #7f868f;
+}
+
+.style-swatch:hover {
+  border-color: var(--text);
+}
+
+/* The chosen one wears a ring held off the swatch itself, so a colour is never read
+   through a border drawn on top of it. */
+.style-swatch.on {
+  border-color: var(--bg-side);
+  box-shadow: 0 0 0 2px var(--text);
+}
+
+.style-pick {
+  padding: 5px 11px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.style-pick:hover {
+  border-color: var(--text);
+}
+
+.style-pick.on {
+  border-color: var(--text);
+  background: var(--bg-hover);
+}
+
 /* ------------------------------------------- graph overlay (handles, names) --- */
 /* Sibling of #cy, because cytoscape empties its own container on destroy(). */
 
@@ -1351,17 +1449,21 @@ button.issue-id:hover {
   height: 1.2em;
 }
 
-/* An active note radiates: a faint green halo on its rim at all times, and one ring
-   travelling out of it every three seconds. The halo is what says "active" when the
-   canvas is glanced at between beats; the ring is what catches the eye across the room.
-   Both sit in the overlay, so the pulse keeps time without the canvas redrawing. */
+/* A pulsing note radiates: a faint halo on its rim at all times, and one ring travelling
+   out of it every three seconds. The halo is what says "active" when the canvas is
+   glanced at between beats; the ring is what catches the eye across the room. Both sit in
+   the overlay, so the pulse keeps time without the canvas redrawing.
+
+   The colour is the note's own — `drawPulses` sets `--pulse` on the element from what was
+   picked in the style panel, and green is what a note that never picked one gets. */
 .node-pulse {
   position: absolute;
   width: 20px;
   height: 20px;
-  border: 1.5px solid rgba(63, 185, 80, 0.5);
+  --pulse: #3fb950;
+  border: 1.5px solid color-mix(in srgb, var(--pulse) 50%, transparent);
   border-radius: 50%;
-  box-shadow: 0 0 8px rgba(63, 185, 80, 0.3);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--pulse) 30%, transparent);
   transform: translate(-50%, -50%);
   pointer-events: none;
 }
@@ -1370,7 +1472,7 @@ button.issue-id:hover {
   content: "";
   position: absolute;
   inset: -1.5px;
-  border: 2px solid #3fb950;
+  border: 2px solid var(--pulse);
   border-radius: 50%;
   /* Inherited, not declared: `drawPulses` sets the delay on the element itself so
      every ring on the canvas beats on the same clock. */
@@ -1401,13 +1503,28 @@ button.issue-id:hover {
   }
 }
 
-/* Corner grips: nothing is drawn, the cursor is the only sign they are there. */
+/* Corner grips: nothing is drawn, the cursor is the only sign they are there. Above the
+   fence strips, which they overlap at the four ends — the corner has to win there. */
 .frame-handle {
   position: absolute;
+  z-index: 2;
   width: 18px;
   height: 18px;
   margin: -9px 0 0 -9px;
   background: transparent;
+  pointer-events: auto;
+}
+
+/* The fence itself: four strips lying along a box's border, and the only place a folder
+   can be picked up from. Drawn nothing, like the corners — the box's own border is
+   already there to be aimed at, and the cursor says what will happen. Straddling the
+   line, so it can be grabbed from just outside the box as readily as from just in. */
+.frame-fence {
+  position: absolute;
+  z-index: 1;
+  margin: -5.5px 0 0 -5.5px;
+  background: transparent;
+  cursor: move;
   pointer-events: auto;
 }
 
@@ -1444,24 +1561,4 @@ button.issue-id:hover {
   width: 12px;
   height: 12px;
   vertical-align: -2px;
-}
-
-.tab-actions .toggle {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 12px;
-  color: var(--muted);
-  cursor: pointer;
-  user-select: none;
-}
-
-.tab-actions .toggle:hover {
-  color: var(--text);
-}
-
-.tab-actions .toggle input {
-  margin: 0;
-  accent-color: var(--accent);
-  cursor: pointer;
 }

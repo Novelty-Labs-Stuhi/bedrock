@@ -1,0 +1,1350 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Bedrock — the graph is the app</title>
+    <style>
+      :root {
+        --bg: #1e1f22;
+        --bg-side: #252526;
+        --bg-hover: #2f3033;
+        --line: #37383b;
+        --text: #dcddde;
+        --muted: #8b8d90;
+        --accent: #f92411;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+        font-size: 14px;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        height: 100vh;
+        overflow: hidden;
+        background: var(--bg);
+        color: var(--text);
+      }
+
+      #wrap { position: relative; width: 100vw; height: 100vh; }
+      #cy { position: absolute; inset: 0; }
+
+      .graph-overlay {
+        position: absolute;
+        inset: 0;
+        z-index: 5;
+        pointer-events: none;
+      }
+
+      /* ------------------------------------------------------ context menu --- */
+      #menu {
+        position: fixed;
+        z-index: 60;
+        display: none;
+        flex-direction: column;
+        min-width: 180px;
+        padding: 4px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: var(--bg-side);
+        box-shadow: 0 10px 26px rgba(0, 0, 0, 0.5);
+      }
+
+      #menu.open { display: flex; }
+
+      .menu-item {
+        border: 0;
+        background: transparent;
+        color: var(--text);
+        text-align: left;
+        padding: 6px 10px;
+        border-radius: 4px;
+        font-size: 13px;
+        white-space: nowrap;
+        font: inherit;
+        font-size: 13px;
+        cursor: pointer;
+      }
+
+      .menu-item:hover { background: var(--bg-hover); }
+
+      /* -------------------------------------------------------- inline edit --- */
+      .inline-edit {
+        position: absolute;
+        width: 150px;
+        transform: translate(-50%, -50%);
+        padding: 3px 6px;
+        border: 1px solid var(--accent);
+        border-radius: 4px;
+        background: var(--bg);
+        color: var(--text);
+        font: inherit;
+        font-size: 12px;
+        outline: none;
+        pointer-events: auto;
+        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
+        z-index: 20;
+      }
+
+      /* ---------------------------------------------------------- group tool --- */
+      .lasso-sheet {
+        position: absolute;
+        inset: 0;
+        pointer-events: auto;
+        cursor: crosshair;
+        z-index: 10;
+      }
+
+      .lasso-rect {
+        position: absolute;
+        border: 1px dashed var(--accent);
+        border-radius: 3px;
+        background: rgba(249, 36, 17, 0.12);
+        pointer-events: none;
+      }
+
+      /* ----------------------------------------------------------- note card --- */
+      .note-card {
+        position: absolute;
+        z-index: 30;
+        max-width: 260px;
+        padding: 10px 12px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: var(--bg-side);
+        box-shadow: 0 10px 26px rgba(0, 0, 0, 0.5);
+        pointer-events: auto;
+        font-size: 13px;
+        line-height: 1.45;
+      }
+
+      .note-card h3 {
+        margin: 0 0 6px;
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--text);
+      }
+
+      .note-card p { margin: 0; color: var(--muted); }
+
+      /* ------------------------------------------------------------- pulse --- */
+      .node-pulse {
+        --pc: #3fb950;
+        position: absolute;
+        width: 20px;
+        height: 20px;
+        border: 1.5px solid color-mix(in srgb, var(--pc) 50%, transparent);
+        border-radius: 50%;
+        box-shadow: 0 0 8px color-mix(in srgb, var(--pc) 30%, transparent);
+        transform: translate(-50%, -50%);
+        pointer-events: none;
+      }
+
+      .node-pulse::after {
+        content: "";
+        position: absolute;
+        inset: -1.5px;
+        border: 2px solid var(--pc);
+        border-radius: 50%;
+        animation: node-pulse 3s cubic-bezier(0.2, 0.65, 0.35, 1) infinite;
+        animation-delay: inherit;
+      }
+
+      @keyframes node-pulse {
+        0% { transform: scale(1); opacity: 0.7; }
+        60% { transform: scale(2.9); opacity: 0; }
+        100% { transform: scale(2.9); opacity: 0; }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .node-pulse::after { animation: none; }
+      }
+
+      /* What a Claude session is doing, on the corner of its tile — blue is a
+         finished turn nobody has looked at. Ringed in the canvas colour so the
+         dot reads as sitting ON the tile. */
+      .session-badge {
+        position: absolute;
+        border-radius: 50%;
+        box-shadow: 0 0 0 2px var(--bg);
+        transform: translate(-50%, -50%);
+        pointer-events: none;
+      }
+
+      .session-badge.unseen {
+        background: #58a6ff;
+      }
+
+      /* ---------------------------------------------------------------- demo --- */
+      /* The looping vignette in the corner: a ghost cursor doing the gestures. */
+      #demo {
+        position: fixed;
+        top: 12px;
+        right: 12px;
+        width: 320px;
+        height: 240px;
+        z-index: 45;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: rgba(37, 37, 38, 0.55);
+        overflow: hidden;
+        pointer-events: none;
+      }
+
+      #demo-canvas,
+      #demo-overlay {
+        position: absolute;
+        inset: 0;
+      }
+
+      #demo-tag {
+        position: absolute;
+        left: 10px;
+        bottom: 6px;
+        font-size: 11px;
+        color: var(--muted);
+        user-select: none;
+      }
+
+      .demo-cursor {
+        position: absolute;
+        z-index: 9;
+        width: 18px;
+        height: 18px;
+      }
+
+      .demo-menu {
+        position: absolute;
+        z-index: 4;
+        display: flex;
+        flex-direction: column;
+        min-width: 130px;
+        padding: 3px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: var(--bg-side);
+        box-shadow: 0 10px 26px rgba(0, 0, 0, 0.5);
+      }
+
+      .demo-menu .demo-item {
+        padding: 4px 8px;
+        border-radius: 4px;
+        font-size: 11px;
+        color: var(--text);
+        text-align: left;
+        white-space: nowrap;
+      }
+
+      .demo-menu .demo-item.hover {
+        background: var(--bg-hover);
+      }
+
+      .demo-input {
+        position: absolute;
+        transform: translate(-50%, -50%);
+        padding: 2px 6px;
+        min-width: 70px;
+        min-height: 17px;
+        border: 1px solid var(--accent);
+        border-radius: 4px;
+        background: var(--bg);
+        color: var(--text);
+        font-size: 11px;
+        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
+        white-space: nowrap;
+      }
+
+      .demo-input::after {
+        content: "";
+        display: inline-block;
+        width: 1px;
+        height: 11px;
+        margin-left: 1px;
+        vertical-align: -1px;
+        background: var(--text);
+        animation: demo-caret 1s steps(1) infinite;
+      }
+
+      @keyframes demo-caret {
+        50% { opacity: 0; }
+      }
+
+      .demo-click {
+        position: absolute;
+        width: 14px;
+        height: 14px;
+        border: 2px solid #ffffff;
+        border-radius: 50%;
+        transform: translate(-50%, -50%);
+        opacity: 0.8;
+        animation: demo-click 0.45s ease-out forwards;
+      }
+
+      @keyframes demo-click {
+        to {
+          transform: translate(-50%, -50%) scale(2.1);
+          opacity: 0;
+        }
+      }
+
+      #demo-close {
+        position: absolute;
+        top: 2px;
+        right: 4px;
+        padding: 2px 6px;
+        border: 0;
+        background: transparent;
+        color: var(--muted);
+        font-size: 14px;
+        line-height: 1;
+        cursor: pointer;
+        pointer-events: auto;
+      }
+
+      #demo-close:hover { color: var(--text); }
+
+      #demo-open {
+        position: fixed;
+        top: 12px;
+        right: 12px;
+        z-index: 45;
+        display: none;
+        padding: 4px 10px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: var(--bg-side);
+        color: var(--muted);
+        font-size: 11px;
+        cursor: pointer;
+      }
+
+      #demo-open:hover { color: var(--text); }
+
+      @media (max-width: 900px) {
+        #demo, #demo-open { display: none !important; }
+      }
+
+      /* -------------------------------------------------------------- status --- */
+      #status {
+        position: fixed;
+        left: 12px;
+        bottom: 10px;
+        z-index: 40;
+        font-size: 12px;
+        color: var(--muted);
+        pointer-events: none;
+        user-select: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="wrap">
+      <div id="cy"></div>
+      <div class="graph-overlay" id="overlay"></div>
+    </div>
+    <div id="status">drag notes · click the icons · right-click for new notes, links and folders</div>
+
+    <div id="demo">
+      <div id="demo-canvas"></div>
+      <div id="demo-overlay"></div>
+      <span id="demo-tag">how it works</span>
+      <button id="demo-close" title="collapse the demo">×</button>
+    </div>
+    <button id="demo-open" title="bring the demo back">how it works ▸</button>
+
+    <script src="cytoscape.min.js"></script>
+    <script>
+      /* ============================================================ icons === */
+      /* Lifted verbatim from the app's graph.ts, so the tiles are pixel-same. */
+
+      const GEMINI_ICON =
+        "data:image/svg+xml;utf8," +
+        encodeURIComponent(
+          '<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 64 64">' +
+            "<defs>" +
+            '<radialGradient id="r" cx="32" cy="5" r="36" gradientUnits="userSpaceOnUse">' +
+            '<stop offset="0" stop-color="#ff4641"/><stop offset="1" stop-color="#ff4641" stop-opacity="0"/></radialGradient>' +
+            '<radialGradient id="y" cx="5" cy="32" r="36" gradientUnits="userSpaceOnUse">' +
+            '<stop offset="0" stop-color="#ffc300"/><stop offset="1" stop-color="#ffc300" stop-opacity="0"/></radialGradient>' +
+            '<radialGradient id="g" cx="32" cy="59" r="36" gradientUnits="userSpaceOnUse">' +
+            '<stop offset="0" stop-color="#00a94f"/><stop offset="1" stop-color="#00a94f" stop-opacity="0"/></radialGradient>' +
+            '<clipPath id="s"><path d="M32 6 C34.6 20.5 43.5 29.4 58 32 C43.5 34.6 34.6 43.5 32 58 C29.4 43.5 20.5 34.6 6 32 C20.5 29.4 29.4 20.5 32 6 Z"/></clipPath>' +
+            "</defs>" +
+            '<rect width="64" height="64" rx="14" fill="#ffffff"/>' +
+            '<g clip-path="url(#s)">' +
+            '<rect width="64" height="64" fill="#3086ff"/>' +
+            '<rect width="64" height="64" fill="url(#r)"/>' +
+            '<rect width="64" height="64" fill="url(#y)"/>' +
+            '<rect width="64" height="64" fill="url(#g)"/>' +
+            "</g>" +
+            "</svg>",
+        );
+
+      const CLAUDE_SPOKES = [
+        [14.5, 23.7], [42.25, 24.1], [59, 23.3], [94, 23.9], [123.5, 24], [146, 23],
+        [180.25, 24.2], [212.75, 24.5], [243, 26.1], [279, 23.1], [310.5, 23.8], [350.75, 23.2],
+      ];
+
+      const CLAUDE_ICON =
+        "data:image/svg+xml;utf8," +
+        encodeURIComponent(
+          '<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 64 64">' +
+            '<rect width="64" height="64" rx="14" fill="#da704d"/>' +
+            '<g transform="translate(32 32)" stroke="#fefcfb" stroke-width="4" stroke-linecap="round">' +
+            CLAUDE_SPOKES.map(([angle, reach]) => {
+              const radians = (angle * Math.PI) / 180;
+              const x = (Math.cos(radians) * reach).toFixed(2);
+              const y = (Math.sin(radians) * reach).toFixed(2);
+              return '<line x1="0" y1="0" x2="' + x + '" y2="' + y + '"/>';
+            }).join("") +
+            "</g>" +
+            "</svg>",
+        );
+
+      /* ============================================================= state === */
+
+      const STORE_KEY = "bedrock-site:v5";
+
+      /* The download glyph the two big nodes wear: the emoji, centred, about a
+         third of the node so it reads as a mark rather than a sticker. */
+      const DOWNLOAD_ICON =
+        "data:image/svg+xml;utf8," +
+        encodeURIComponent(
+          '<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 64 64">' +
+            '<text x="32" y="34" font-size="46" text-anchor="middle" dominant-baseline="central">⬇️</text>' +
+            "</svg>",
+        );
+      const nodeSize = (links) => Math.min(68, Math.round(20 + 16 * Math.sqrt(links)));
+
+      /* The screenshot, as data. Positions are model units; fit() frames them. */
+      function seedState() {
+        return {
+          nodes: [
+            { id: "homemade", label: "Homemade", folder: true },
+            { id: "anchor:homemade:1", anchor: true, parent: "homemade", x: 55, y: 30, size: 1 },
+            { id: "anchor:homemade:2", anchor: true, parent: "homemade", x: 500, y: 430, size: 1 },
+            { id: "need", label: "Need a notetaking app", x: 315, y: 95, size: nodeSize(3), parent: "homemade",
+              text: "Where it all started. Obsidian was right there. But where's the fun in that." },
+            { id: "buildme", label: "BUILD ME ...", x: 125, y: 360, size: nodeSize(2), ntype: "claude", parent: "homemade",
+              url: "https://claude.ai" },
+            { id: "gemini", label: "Obsidian Alternatives", x: 565, y: 230, size: nodeSize(3), ntype: "gemini",
+              url: "https://gemini.google.com/app" },
+            { id: "notion", label: "Notion 🤓", x: 820, y: 145, size: nodeSize(1),
+              text: "Recommended by Gemini. Respectfully declined." },
+            { id: "bedrock", label: "Bedrock (wtf)", x: 635, y: 435, size: nodeSize(2),
+              text: "A markdown vault whose graph is the place you work — spatial, durable, plain files. You are inside it right now." },
+            { id: "getbedrock", label: "usebedrock.dev", x: 865, y: 515, size: nodeSize(3), active: true,
+              text: "You're already here. Grab a build below ↓" },
+            { id: "dlwin", label: "DOWNLOAD FOR WINDOWS", x: 658, y: 660, size: 48, radiate: true, dl: true,
+              pulse: "#58a6ff", url: "/download/windows" },
+            { id: "dlmac", label: "DOWNLOAD FOR MAC", x: 1115, y: 655, size: 48, radiate: true, dl: true,
+              pulse: "#e3b341", url: "/download/mac" },
+          ],
+          edges: [
+            { source: "buildme", target: "need", label: "doesn't f**** work" },
+            { source: "need", target: "buildme", label: "(tried building with claude)" },
+            { source: "need", target: "gemini", label: "ask fo advice" },
+            { source: "gemini", target: "notion", label: "reccomends" },
+            { source: "gemini", target: "bedrock", label: "mentions" },
+            { source: "bedrock", target: "getbedrock", label: "found on" },
+            { source: "getbedrock", target: "dlwin", label: "exe" },
+            { source: "getbedrock", target: "dlmac", label: "dmg" },
+          ],
+        };
+      }
+
+      function loadState() {
+        try {
+          const kept = JSON.parse(localStorage.getItem(STORE_KEY) || "null");
+          if (kept && Array.isArray(kept.nodes) && Array.isArray(kept.edges)) return kept;
+        } catch {}
+        return seedState();
+      }
+
+      const edgeId = (source, target) => source + " " + target;
+      const isAnchor = (id) => id.startsWith("anchor:");
+
+      function elementsFrom(state) {
+        const els = [];
+        for (const n of state.nodes.filter((n) => n.folder)) {
+          els.push({ data: { id: n.id, label: n.label, folder: 1 } });
+        }
+        for (const n of state.nodes.filter((n) => !n.folder)) {
+          const classes = n.anchor
+            ? ["frame-anchor"]
+            : [n.active && "active", n.radiate && "radiate"].filter(Boolean);
+          els.push({
+            data: {
+              id: n.id,
+              label: n.anchor ? "" : n.label,
+              parent: n.parent || undefined,
+              size: n.size || 36,
+              ntype: n.ntype || "",
+              url: n.url || "",
+              text: n.text || "",
+              ...(n.dl ? { dl: 1 } : {}),
+              ...(n.pulse ? { pulse: n.pulse } : {}),
+            },
+            position: { x: n.x, y: n.y },
+            classes: classes.join(" "),
+          });
+        }
+        for (const e of state.edges) {
+          els.push({
+            data: {
+              id: edgeId(e.source, e.target),
+              source: e.source,
+              target: e.target,
+              ...(e.label ? { label: e.label } : {}),
+            },
+          });
+        }
+        return els;
+      }
+
+      function save() {
+        const nodes = [];
+        cy.nodes().forEach((node) => {
+          const id = node.id();
+          if (node.isParent()) {
+            nodes.push({ id, label: node.data("label"), folder: true });
+            return;
+          }
+          const pos = node.position();
+          nodes.push({
+            id,
+            label: node.data("label"),
+            x: Math.round(pos.x),
+            y: Math.round(pos.y),
+            size: node.data("size"),
+            ...(node.data("ntype") ? { ntype: node.data("ntype") } : {}),
+            ...(node.data("url") ? { url: node.data("url") } : {}),
+            ...(node.data("text") ? { text: node.data("text") } : {}),
+            ...(node.parent().nonempty() ? { parent: node.parent().first().id() } : {}),
+            ...(isAnchor(id) ? { anchor: true } : {}),
+            ...(node.hasClass("active") ? { active: true } : {}),
+            ...(node.hasClass("radiate") ? { radiate: true } : {}),
+            ...(node.data("dl") ? { dl: true } : {}),
+            ...(node.data("pulse") ? { pulse: node.data("pulse") } : {}),
+          });
+        });
+        const edges = cy.edges().map((edge) => ({
+          source: edge.data("source"),
+          target: edge.data("target"),
+          ...(edge.data("label") ? { label: edge.data("label") } : {}),
+        }));
+        localStorage.setItem(STORE_KEY, JSON.stringify({ nodes, edges }));
+      }
+
+      /* ============================================================= style === */
+      /* The app's own stylesheet, trimmed to what this canvas draws. */
+
+      const BOX = "#4c8dff";
+
+      const STYLE = [
+        {
+          selector: "node",
+          style: {
+            "background-color": "#f92411",
+            label: "data(label)",
+            color: "#dcddde",
+            "font-size": 10,
+            "text-valign": "center",
+            "text-halign": "right",
+            "text-margin-x": 4,
+            "min-zoomed-font-size": 8,
+            width: "data(size)",
+            height: "data(size)",
+          },
+        },
+        {
+          selector: 'node[ntype = "gemini"], node[ntype = "claude"]',
+          style: { shape: "round-rectangle", "background-fit": "cover", "background-opacity": 0 },
+        },
+        { selector: 'node[ntype = "gemini"]', style: { "background-image": GEMINI_ICON } },
+        { selector: 'node[ntype = "claude"]', style: { "background-image": CLAUDE_ICON } },
+        {
+          selector: "node:parent",
+          style: {
+            "background-color": BOX,
+            "background-opacity": 0.07,
+            "border-width": 1.5,
+            "border-color": BOX,
+            "border-opacity": 0.9,
+            "text-valign": "top",
+            "text-halign": "center",
+            "text-margin-x": 0,
+            "text-margin-y": -4,
+            "font-size": 12,
+            color: BOX,
+            padding: "0px",
+            "compound-sizing-wrt-labels": "exclude",
+          },
+        },
+        {
+          selector: "edge",
+          style: {
+            "line-color": "#f92411",
+            width: 1.4,
+            "curve-style": "bezier",
+            "target-arrow-shape": "triangle",
+            "target-arrow-color": "#f92411",
+            "arrow-scale": 1.3,
+            "target-distance-from-node": 2,
+          },
+        },
+        {
+          selector: "edge[label]",
+          style: {
+            label: "data(label)",
+            "font-size": 9,
+            color: "#dcddde",
+            "text-rotation": "autorotate",
+            "text-background-color": "#1e1f22",
+            "text-background-opacity": 0.85,
+            "text-background-padding": "2px",
+            "text-background-shape": "roundrectangle",
+          },
+        },
+        // The download nodes wear the glyph centred on the red — a mark, not a fill.
+        {
+          selector: "node[dl]",
+          style: {
+            "background-color": "#565b63",
+            "background-image": DOWNLOAD_ICON,
+            "background-fit": "none",
+            "background-width": "58%",
+            "background-height": "58%",
+          },
+        },
+        { selector: "node.active", style: { "border-width": 3, "border-color": "#dcddde" } },
+        {
+          selector: "node.frame-anchor",
+          style: { width: 1, height: 1, "background-opacity": 0, label: "", events: "no" },
+        },
+        // The link being drawn: an invisible cursor-following node plus an arrow to it.
+        {
+          selector: "node.draft",
+          style: { width: 1, height: 1, "background-opacity": 0, label: "", events: "no" },
+        },
+        {
+          selector: "edge.draft",
+          style: {
+            "line-color": "#ffffff",
+            "line-style": "dashed",
+            width: 2,
+            "target-arrow-shape": "triangle",
+            "target-arrow-color": "#ffffff",
+            "curve-style": "straight",
+            events: "no",
+          },
+        },
+        { selector: "node.draft-source", style: { "border-width": 3, "border-color": "#ffffff" } },
+      ];
+
+      /* ============================================================= graph === */
+
+      const wrap = document.getElementById("wrap");
+      const overlay = document.getElementById("overlay");
+      const status = document.getElementById("status");
+      const HINT = "drag notes · click the icons · right-click for new notes, links and folders";
+      status.textContent = HINT;
+
+      const cy = cytoscape({
+        container: document.getElementById("cy"),
+        elements: elementsFrom(loadState()),
+        style: STYLE,
+        layout: { name: "preset" },
+        wheelSensitivity: 0.2,
+        boxSelectionEnabled: false,
+        minZoom: 0.2,
+        maxZoom: 4,
+      });
+      // A fit before the container has real dimensions is a silent no-op, and an
+      // embedded/backgrounded tab can reach this line unsized. Refit whenever the
+      // container changes size, until the user takes the view over.
+      let userMoved = false;
+      cy.on("dragfree", () => { userMoved = true; });
+      wrap.addEventListener("wheel", () => { userMoved = true; }, { passive: true });
+      wrap.addEventListener("mousedown", () => { userMoved = true; });
+      const refit = () => {
+        cy.resize();
+        if (!userMoved) cy.fit(undefined, 70);
+        placePulses();
+      };
+
+      wrap.addEventListener("contextmenu", (event) => event.preventDefault());
+
+      /* ====================================================== context menu === */
+
+      let menuHost = null;
+      let menuDismiss = null;
+
+      function closeMenu() { menuDismiss?.(); }
+
+      function showMenu(at, items) {
+        closeMenu();
+        if (!menuHost) {
+          menuHost = document.createElement("div");
+          menuHost.id = "menu";
+          document.body.appendChild(menuHost);
+        }
+        const box = menuHost;
+        box.innerHTML = "";
+        box.classList.add("open");
+        for (const item of items) {
+          const button = document.createElement("button");
+          button.className = "menu-item";
+          button.textContent = item.label;
+          button.onclick = () => { closeMenu(); item.run(); };
+          box.appendChild(button);
+        }
+        box.style.left = "0px";
+        box.style.top = "0px";
+        const { width, height } = box.getBoundingClientRect();
+        box.style.left = Math.min(at.x, window.innerWidth - width - 8) + "px";
+        box.style.top = Math.min(at.y, window.innerHeight - height - 8) + "px";
+
+        const onPointerDown = (event) => { if (!box.contains(event.target)) closeMenu(); };
+        const onKeyDown = (event) => { if (event.key === "Escape") { event.stopPropagation(); closeMenu(); } };
+        menuDismiss = () => {
+          document.removeEventListener("mousedown", onPointerDown, true);
+          document.removeEventListener("keydown", onKeyDown, true);
+          box.classList.remove("open");
+          box.innerHTML = "";
+          menuDismiss = null;
+        };
+        document.addEventListener("mousedown", onPointerDown, true);
+        document.addEventListener("keydown", onKeyDown, true);
+      }
+
+      /* ======================================================== note cards === */
+
+      let card = null;
+
+      function closeCard() {
+        card?.remove();
+        card = null;
+      }
+
+      function showCard(node) {
+        closeCard();
+        const el = document.createElement("div");
+        el.className = "note-card";
+        const title = document.createElement("h3");
+        title.textContent = node.data("label") || "Untitled";
+        const body = document.createElement("p");
+        body.textContent = node.data("text") || "An empty note — right-click it to rename or delete.";
+        el.append(title, body);
+        overlay.appendChild(el);
+        const pos = node.renderedPosition();
+        const r = node.renderedWidth() / 2;
+        el.style.left = Math.min(pos.x + r + 12, wrap.clientWidth - el.offsetWidth - 10) + "px";
+        el.style.top = Math.max(8, Math.min(pos.y - el.offsetHeight / 2, wrap.clientHeight - el.offsetHeight - 10)) + "px";
+        card = el;
+      }
+
+      document.addEventListener("mousedown", (event) => {
+        if (card && !card.contains(event.target)) closeCard();
+      }, true);
+      cy.on("pan zoom", closeCard);
+
+      /* ======================================================= inline edit === */
+
+      function inlineEdit(client, initial, done) {
+        const input = document.createElement("input");
+        input.className = "inline-edit";
+        input.value = initial;
+        input.style.left = client.x + "px";
+        input.style.top = client.y + "px";
+        overlay.appendChild(input);
+        input.focus();
+        input.select();
+        let finished = false;
+        const finish = (commit) => {
+          if (finished) return;
+          finished = true;
+          const value = input.value.trim();
+          input.remove();
+          done(commit ? value : null);
+        };
+        input.addEventListener("keydown", (event) => {
+          if (event.key === "Enter" || event.key === "Return") finish(true);
+          if (event.key === "Escape") finish(false);
+          event.stopPropagation();
+        });
+        input.addEventListener("blur", () => finish(true));
+      }
+
+      /* ==================================================== node behaviour === */
+
+      /* ------------------------------------------------------------ linking --- */
+      /* Right-click a note → "Link to another note…": a dashed arrow follows the
+         cursor; landing on a note links to it, landing on empty canvas creates a
+         note there and links to that — the app's own gesture. */
+
+      const DRAFT_NODE = "__draft__";
+      const DRAFT_EDGE = "__draftedge__";
+      let draftFrom = null;
+
+      function cancelDraft() {
+        if (!draftFrom) return;
+        cy.getElementById(DRAFT_NODE).remove();
+        cy.getElementById(draftFrom).removeClass("draft-source");
+        draftFrom = null;
+        status.textContent = HINT;
+      }
+
+      function startLink(node) {
+        closeCard();
+        cancelDraft();
+        draftFrom = node.id();
+        node.addClass("draft-source");
+        cy.add({ data: { id: DRAFT_NODE, size: 1 }, position: { ...node.position() }, classes: "draft" });
+        cy.add({ data: { id: DRAFT_EDGE, source: node.id(), target: DRAFT_NODE }, classes: "draft" });
+        status.textContent = "click a note to link to it · click empty canvas to create one there · Esc cancels";
+      }
+
+      wrap.addEventListener("mousemove", (event) => {
+        if (!draftFrom) return;
+        const rect = wrap.getBoundingClientRect();
+        const pan = cy.pan();
+        const zoom = cy.zoom();
+        cy.getElementById(DRAFT_NODE).position({
+          x: (event.clientX - rect.left - pan.x) / zoom,
+          y: (event.clientY - rect.top - pan.y) / zoom,
+        });
+      });
+
+      function addLink(source, target) {
+        if (source === target) return null;
+        if (cy.getElementById(edgeId(source, target)).nonempty()) return null;
+        const edge = cy.add({ data: { id: edgeId(source, target), source, target } });
+        save();
+        return edge;
+      }
+
+      /* Step two of drawing a link, as in the app: the connection gets its name,
+         written along the line. Enter on an empty field keeps it a bare arrow. */
+      function nameEdge(edge) {
+        const mid = edge.renderedMidpoint();
+        const rect = wrap.getBoundingClientRect();
+        status.textContent = "name this connection — Enter keeps it, empty leaves a bare arrow";
+        inlineEdit({ x: mid.x + rect.left, y: mid.y + rect.top }, "", (value) => {
+          if (value) edge.data("label", value);
+          status.textContent = HINT;
+          save();
+        });
+      }
+
+      cy.on("tap", (event) => {
+        if (!draftFrom || event.target !== cy) return;
+        const from = draftFrom;
+        cancelDraft();
+        const id = "note:" + counter++;
+        const node = cy.add({
+          data: { id, label: "", size: 36, ntype: "", url: "", text: "" },
+          position: { ...event.position },
+        });
+        addLink(from, id);
+        renameNode(node, "Untitled");
+      });
+
+      cy.on("tap", "node", (event) => {
+        const node = event.target;
+        if (node.isParent() || isAnchor(node.id())) return;
+        if (draftFrom) {
+          const from = draftFrom;
+          cancelDraft();
+          const edge = addLink(from, node.id());
+          if (edge) nameEdge(edge);
+          return;
+        }
+        const url = node.data("url");
+        if (node.data("ntype") && url) {
+          window.open(url, "_blank", "noopener");
+          return;
+        }
+        // A plain node with a URL is a download: navigating to the file saves it
+        // without leaving the page, and without a popup blocker in the way.
+        if (url) {
+          window.location.href = url;
+          return;
+        }
+        showCard(node);
+      });
+
+      cy.on("dragfree", "node", save);
+
+      /* -------------------------------------------------------- right click --- */
+
+      const clientPoint = (event) => {
+        const orig = event.originalEvent;
+        return { x: orig?.clientX ?? 0, y: orig?.clientY ?? 0 };
+      };
+
+      cy.on("cxttap", (event) => {
+        const client = clientPoint(event);
+        if (event.target === cy) {
+          canvasMenu(event.position, client, null);
+          return;
+        }
+        const target = event.target;
+        if (target.isNode?.()) {
+          if (isAnchor(target.id())) return;
+          if (target.isParent()) folderMenu(target, event.position, client);
+          else nodeMenu(target, client);
+        }
+      });
+
+      function canvasMenu(at, client, folder) {
+        showMenu(client, [
+          {
+            label: folder ? 'New note in "' + folder.data("label") + '"' : "New note",
+            run: () => createNoteAt(at, folder),
+          },
+          { label: "New folder", run: () => startGroup() },
+          { label: "Reset demo", run: () => { localStorage.removeItem(STORE_KEY); location.reload(); } },
+        ]);
+      }
+
+      function nodeMenu(node, client) {
+        showMenu(client, [
+          { label: "Link to another note…", run: () => startLink(node) },
+          { label: 'Rename "' + (node.data("label") || "Untitled") + '"', run: () => renameNode(node) },
+          { label: 'Delete "' + (node.data("label") || "Untitled") + '"', run: () => { node.remove(); syncPulses(); syncBadges(); save(); } },
+        ]);
+      }
+
+      function folderMenu(folder, at, client) {
+        showMenu(client, [
+          { label: 'New note in "' + folder.data("label") + '"', run: () => createNoteAt(at, folder) },
+          { label: "Rename folder", run: () => renameFolder(folder) },
+          {
+            label: "Delete folder",
+            run: () => {
+              folder.children().forEach((child) => {
+                if (isAnchor(child.id())) child.remove();
+                else child.move({ parent: null });
+              });
+              folder.remove();
+              save();
+            },
+          },
+        ]);
+      }
+
+      /* ------------------------------------------------------ note creation --- */
+
+      let counter = Date.now();
+
+      function createNoteAt(at, folder) {
+        const id = "note:" + counter++;
+        const node = cy.add({
+          data: { id, label: "", size: 36, ntype: "", url: "", text: "", parent: folder ? folder.id() : undefined },
+          position: { x: at.x, y: at.y },
+        });
+        renameNode(node, "Untitled");
+        save();
+      }
+
+      function renameNode(node, fallback) {
+        const pos = node.renderedPosition();
+        const rect = wrap.getBoundingClientRect();
+        inlineEdit({ x: pos.x + rect.left, y: pos.y + rect.top }, node.data("label"), (value) => {
+          if (value !== null && value !== "") node.data("label", value);
+          else if (!node.data("label")) node.data("label", fallback || "Untitled");
+          save();
+        });
+      }
+
+      function renameFolder(folder) {
+        const bb = folder.renderedBoundingBox();
+        const rect = wrap.getBoundingClientRect();
+        inlineEdit({ x: (bb.x1 + bb.x2) / 2 + rect.left, y: bb.y1 + rect.top }, folder.data("label"), (value) => {
+          if (value !== null && value !== "") folder.data("label", value);
+          save();
+        });
+      }
+
+      /* ---------------------------------------------------- folder creation --- */
+      /* The app's group tool: a crosshair sheet takes the drag, the rectangle
+         you draw becomes the folder box, and the notes inside move into it. */
+
+      let lasso = null;
+
+      function cancelGroup() {
+        lasso?.remove();
+        lasso = null;
+        status.textContent = HINT;
+      }
+
+      function startGroup() {
+        cancelGroup();
+        status.textContent = "drag a rectangle around notes to box them into a folder — Esc cancels";
+        const sheet = document.createElement("div");
+        sheet.className = "lasso-sheet";
+        wrap.appendChild(sheet);
+        lasso = sheet;
+
+        let start = null;
+        let rectEl = null;
+
+        sheet.addEventListener("mousedown", (event) => {
+          start = { x: event.clientX, y: event.clientY };
+          rectEl = document.createElement("div");
+          rectEl.className = "lasso-rect";
+          sheet.appendChild(rectEl);
+        });
+        sheet.addEventListener("mousemove", (event) => {
+          if (!start || !rectEl) return;
+          const rect = wrap.getBoundingClientRect();
+          const x1 = Math.min(start.x, event.clientX) - rect.left;
+          const y1 = Math.min(start.y, event.clientY) - rect.top;
+          const x2 = Math.max(start.x, event.clientX) - rect.left;
+          const y2 = Math.max(start.y, event.clientY) - rect.top;
+          rectEl.style.left = x1 + "px";
+          rectEl.style.top = y1 + "px";
+          rectEl.style.width = x2 - x1 + "px";
+          rectEl.style.height = y2 - y1 + "px";
+        });
+        sheet.addEventListener("mouseup", (event) => {
+          if (!start) return;
+          const rect = wrap.getBoundingClientRect();
+          const pan = cy.pan();
+          const zoom = cy.zoom();
+          const toModel = (cx, cy_) => ({
+            x: (cx - rect.left - pan.x) / zoom,
+            y: (cy_ - rect.top - pan.y) / zoom,
+          });
+          const a = toModel(Math.min(start.x, event.clientX), Math.min(start.y, event.clientY));
+          const b = toModel(Math.max(start.x, event.clientX), Math.max(start.y, event.clientY));
+          cancelGroup();
+          if (Math.abs(b.x - a.x) < 20 || Math.abs(b.y - a.y) < 20) return;
+          makeFolder(a, b);
+        });
+      }
+
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") { cancelGroup(); cancelDraft(); closeCard(); }
+      });
+
+      function makeFolder(a, b) {
+        const id = "folder:" + counter++;
+        cy.add({ data: { id, label: "" } });
+        // Invisible corner anchors hold the box at the drawn size even when empty.
+        cy.add({
+          data: { id: "anchor:" + id + ":1", parent: id, size: 1 },
+          position: { x: a.x, y: a.y },
+          classes: "frame-anchor",
+        });
+        cy.add({
+          data: { id: "anchor:" + id + ":2", parent: id, size: 1 },
+          position: { x: b.x, y: b.y },
+          classes: "frame-anchor",
+        });
+        cy.nodes().forEach((node) => {
+          if (node.isParent() || isAnchor(node.id()) || node.parent().nonempty()) return;
+          const pos = node.position();
+          if (pos.x >= a.x && pos.x <= b.x && pos.y >= a.y && pos.y <= b.y) node.move({ parent: id });
+        });
+        const folder = cy.getElementById(id);
+        renameFolder(folder);
+        save();
+      }
+
+      /* ------------------------------------------------------------- pulses --- */
+      /* The radiating wave the app puts on active notes, kept in the overlay so
+         it beats without the canvas redrawing. */
+
+      const pulses = new Map();
+
+      function syncPulses() {
+        const want = new Set();
+        cy.nodes(".radiate").forEach((node) => {
+          want.add(node.id());
+          if (!pulses.has(node.id())) {
+            const el = document.createElement("div");
+            el.className = "node-pulse";
+            overlay.appendChild(el);
+            pulses.set(node.id(), el);
+          }
+          const colour = node.data("pulse");
+          if (colour) pulses.get(node.id()).style.setProperty("--pc", colour);
+        });
+        for (const [id, el] of pulses) {
+          if (!want.has(id)) { el.remove(); pulses.delete(id); }
+        }
+        placePulses();
+      }
+
+      function placePulses() {
+        for (const [id, el] of pulses) {
+          const node = cy.getElementById(id);
+          if (node.empty()) continue;
+          const pos = node.renderedPosition();
+          const d = node.renderedWidth() + 10;
+          el.style.left = pos.x + "px";
+          el.style.top = pos.y + "px";
+          el.style.width = d + "px";
+          el.style.height = d + "px";
+        }
+      }
+
+      /* The blue "finished — not looked at yet" dot on the Claude tile's top-left
+         corner, exactly where and how the app draws it. */
+      const badges = new Map();
+
+      function syncBadges() {
+        const want = new Set();
+        cy.nodes('[ntype = "claude"]').forEach((node) => {
+          want.add(node.id());
+          if (!badges.has(node.id())) {
+            const el = document.createElement("div");
+            el.className = "session-badge unseen";
+            el.title = "finished — not looked at yet";
+            overlay.appendChild(el);
+            badges.set(node.id(), el);
+          }
+        });
+        for (const [id, el] of badges) {
+          if (!want.has(id)) { el.remove(); badges.delete(id); }
+        }
+        placeBadges();
+      }
+
+      function placeBadges() {
+        for (const [id, el] of badges) {
+          const node = cy.getElementById(id);
+          if (node.empty()) continue;
+          const at = node.renderedPosition();
+          const half = node.renderedWidth() / 2;
+          el.style.left = at.x - half * 0.82 + "px";
+          el.style.top = at.y - half * 0.82 + "px";
+          el.style.width = node.renderedWidth() * 0.25 + "px";
+          el.style.height = node.renderedWidth() * 0.25 + "px";
+        }
+      }
+
+      const placeOverlay = () => { placePulses(); placeBadges(); };
+      cy.on("pan zoom resize", placeOverlay);
+      cy.on("position", "node.radiate", placePulses);
+      cy.on("position", 'node[ntype = "claude"]', placeBadges);
+      window.addEventListener("resize", placeOverlay);
+      syncPulses();
+      syncBadges();
+      refit();
+      new ResizeObserver(refit).observe(wrap);
+
+      /* ============================================================== demo === */
+      /* The corner vignette: a ghost cursor creates a note, names it, draws a
+         link out of it (which makes the second note), boxes the pair into a
+         folder and names that — then wipes the slate and does it again. Its own
+         little cytoscape instance, so nothing here touches the real canvas. */
+
+      const demoWrap = document.getElementById("demo");
+      const demoOverlay = document.getElementById("demo-overlay");
+
+      const demoCy = cytoscape({
+        container: document.getElementById("demo-canvas"),
+        style: STYLE,
+        layout: { name: "preset" },
+        userZoomingEnabled: false,
+        userPanningEnabled: false,
+        autoungrabify: true,
+        boxSelectionEnabled: false,
+      });
+      demoCy.zoom(1);
+      demoCy.pan({ x: 0, y: 0 });
+
+      const demoCursor = document.createElement("div");
+      demoCursor.className = "demo-cursor";
+      demoCursor.innerHTML =
+        '<svg width="18" height="18" viewBox="0 0 24 24">' +
+        '<path d="M4 2 L4 19 L9 15 L12 22 L15 20.5 L12 14 L18 13.5 Z" fill="#ffffff" stroke="#1e1f22" stroke-width="1.2"/></svg>';
+      demoOverlay.appendChild(demoCursor);
+
+      let demoAt = { x: 340, y: 40 };
+      const placeDemoCursor = () => {
+        demoCursor.style.left = demoAt.x + "px";
+        demoCursor.style.top = demoAt.y + "px";
+      };
+      placeDemoCursor();
+
+      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+      /** Ease the cursor to a point; `follow` rides along (the draft arrow uses it). */
+      function glide(to, ms, follow) {
+        return new Promise((resolve) => {
+          const from = { ...demoAt };
+          const t0 = performance.now();
+          const step = (t) => {
+            const k = Math.min(1, (t - t0) / ms);
+            const e = k < 0.5 ? 2 * k * k : 1 - (-2 * k + 2) ** 2 / 2;
+            demoAt = { x: from.x + (to.x - from.x) * e, y: from.y + (to.y - from.y) * e };
+            placeDemoCursor();
+            follow?.(demoAt);
+            if (k < 1) requestAnimationFrame(step);
+            else resolve();
+          };
+          requestAnimationFrame(step);
+        });
+      }
+
+      function demoClickFx() {
+        const el = document.createElement("div");
+        el.className = "demo-click";
+        el.style.left = demoAt.x + "px";
+        el.style.top = demoAt.y + "px";
+        demoOverlay.appendChild(el);
+        setTimeout(() => el.remove(), 500);
+      }
+
+      /** Show a fake menu at the cursor, glide onto `pick`, "click" it, close. */
+      async function demoMenu(items, pick) {
+        const menu = document.createElement("div");
+        menu.className = "demo-menu";
+        const rows = items.map((label) => {
+          const row = document.createElement("div");
+          row.className = "demo-item";
+          row.textContent = label;
+          menu.appendChild(row);
+          return row;
+        });
+        menu.style.left = Math.min(demoAt.x, 320 - 140) + "px";
+        menu.style.top = Math.min(demoAt.y, 240 - items.length * 24 - 10) + "px";
+        demoOverlay.appendChild(menu);
+        demoClickFx();
+        await sleep(420);
+        const row = rows[pick];
+        await glide(
+          { x: menu.offsetLeft + 20 + row.offsetLeft, y: menu.offsetTop + row.offsetTop + 11 },
+          380,
+        );
+        row.classList.add("hover");
+        await sleep(330);
+        demoClickFx();
+        await sleep(140);
+        menu.remove();
+      }
+
+      /** The fake rename field: types `text` a character at a time, then commits. */
+      async function demoType(at, text) {
+        const input = document.createElement("div");
+        input.className = "demo-input";
+        input.style.left = at.x + "px";
+        input.style.top = at.y + "px";
+        demoOverlay.appendChild(input);
+        await sleep(350);
+        for (const ch of text) {
+          input.textContent += ch;
+          await sleep(75);
+        }
+        await sleep(420);
+        input.remove();
+      }
+
+      async function demoScene() {
+        demoCy.elements().remove();
+
+        // A note is born: right-click, "New note", name it.
+        demoAt = { x: 345, y: 30 };
+        placeDemoCursor();
+        await glide({ x: 95, y: 118 }, 750);
+        await sleep(200);
+        await demoMenu(["New note", "New folder"], 0);
+        demoCy.add({ data: { id: "d1", label: "", size: 30, ntype: "", url: "", text: "" }, position: { x: 95, y: 118 } });
+        await demoType({ x: 100, y: 148 }, "an idea");
+        demoCy.getElementById("d1").data("label", "an idea");
+        await sleep(280);
+
+        // Link out of it: the dashed arrow follows the cursor to empty space,
+        // and landing there makes the second note.
+        await demoMenu(["Link to another note…", "Rename", "Delete"], 0);
+        demoCy.getElementById("d1").addClass("draft-source");
+        demoCy.add({ data: { id: "dd", size: 1 }, position: { x: 95, y: 118 }, classes: "draft" });
+        demoCy.add({ data: { id: "dde", source: "d1", target: "dd" }, classes: "draft" });
+        await glide({ x: 228, y: 92 }, 850, (at) => demoCy.getElementById("dd").position({ x: at.x, y: at.y }));
+        await sleep(150);
+        demoClickFx();
+        demoCy.getElementById("dd").remove();
+        demoCy.getElementById("d1").removeClass("draft-source");
+        demoCy.add({ data: { id: "d2", label: "", size: 30, ntype: "", url: "", text: "" }, position: { x: 228, y: 92 } });
+        demoCy.add({ data: { id: "d1 d2", source: "d1", target: "d2" } });
+        await demoType({ x: 233, y: 122 }, "next step");
+        demoCy.getElementById("d2").data("label", "next step");
+        await sleep(300);
+
+        // Box the pair into a folder and give it a name.
+        await glide({ x: 52, y: 58 }, 450);
+        await demoMenu(["New note", "New folder"], 1);
+        const rect = document.createElement("div");
+        rect.className = "lasso-rect";
+        rect.style.left = "52px";
+        rect.style.top = "58px";
+        demoOverlay.appendChild(rect);
+        await glide({ x: 288, y: 178 }, 850, (at) => {
+          rect.style.width = at.x - 52 + "px";
+          rect.style.height = at.y - 58 + "px";
+        });
+        await sleep(150);
+        rect.remove();
+        demoCy.add({ data: { id: "df", label: "" } });
+        demoCy.add({ data: { id: "dfa1", parent: "df", size: 1 }, position: { x: 52, y: 58 }, classes: "frame-anchor" });
+        demoCy.add({ data: { id: "dfa2", parent: "df", size: 1 }, position: { x: 288, y: 178 }, classes: "frame-anchor" });
+        demoCy.getElementById("d1").move({ parent: "df" });
+        demoCy.getElementById("d2").move({ parent: "df" });
+        await demoType({ x: 170, y: 48 }, "plans");
+        demoCy.getElementById("df").data("label", "plans");
+
+        // Admire it, then fade the slate clean for the next pass.
+        await sleep(2000);
+        const fade = demoWrap.animate([{ opacity: 1 }, { opacity: 0.15 }], { duration: 420, fill: "forwards" });
+        await fade.finished;
+        demoCy.elements().remove();
+        demoWrap.animate([{ opacity: 0.15 }, { opacity: 1 }], { duration: 320, fill: "forwards" });
+        await sleep(400);
+      }
+
+      /* Collapsing and bringing back the vignette; the choice is remembered. */
+      const DEMO_KEY = "bedrock-site:demo";
+      const demoOpenBtn = document.getElementById("demo-open");
+      let demoHidden = localStorage.getItem(DEMO_KEY) === "off";
+
+      function applyDemoVisibility() {
+        demoWrap.style.display = demoHidden ? "none" : "block";
+        demoOpenBtn.style.display = demoHidden ? "block" : "none";
+        if (!demoHidden) {
+          // The canvas was display:none, so cytoscape saw a 0x0 container.
+          demoCy.resize();
+          demoCy.zoom(1);
+          demoCy.pan({ x: 0, y: 0 });
+        }
+      }
+
+      document.getElementById("demo-close").onclick = () => {
+        demoHidden = true;
+        localStorage.setItem(DEMO_KEY, "off");
+        applyDemoVisibility();
+      };
+      demoOpenBtn.onclick = () => {
+        demoHidden = false;
+        localStorage.setItem(DEMO_KEY, "on");
+        applyDemoVisibility();
+      };
+      applyDemoVisibility();
+
+      (async function demoLoop() {
+        for (;;) {
+          try {
+            while (demoHidden) await sleep(600); // parked while collapsed
+            await demoScene();
+          } catch {
+            await sleep(1000);
+          }
+        }
+      })();
+    </script>
+  </body>
+</html>

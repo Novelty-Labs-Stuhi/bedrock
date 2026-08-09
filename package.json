@@ -10,7 +10,50 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "start": "npm run build && electron .",
-    "app": "electron ."
+    "app": "electron .",
+    "package": "npm run build && electron-builder --mac dmg --win nsis",
+    "package:mac": "npm run build && set -a && . ./.env && set +a && electron-builder --mac dmg"
+  },
+  "build": {
+    "appId": "dev.getbedrock.app",
+    "productName": "Bedrock",
+    "directories": {
+      "output": "release"
+    },
+    "afterAllArtifactBuild": "scripts/notarize-dmg.cjs",
+    "files": [
+      "dist/**",
+      "electron/**",
+      "package.json"
+    ],
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ],
+      "identity": "Parasition AB (4Q45TL2D7B)",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "notarize": true
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false
+    }
   },
   "dependencies": {
     "@codemirror/commands": "^6.10.4",
@@ -22,6 +65,7 @@
   "devDependencies": {
     "@types/cytoscape": "^3.21.9",
     "electron": "^43.2.0",
+    "electron-builder": "^26.15.3",
     "typescript": "^5.6.3",
     "vite": "^5.4.10"
   }
