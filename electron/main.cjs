@@ -903,7 +903,10 @@ ipcMain.handle("gemini-forget", async () => {
  * pretend otherwise: without it there is nothing to hand the session to.
  */
 
-const pty = require("@homebridge/node-pty-prebuilt-multiarch");
+// Upstream node-pty, not the prebuilt-multiarch fork: that one publishes
+// prebuilds for linux only and omits its C++ sources, so it cannot be built
+// for macOS at all.
+const pty = require("node-pty");
 
 /** A session's tmux name. The id is Claude's own, so the two never drift apart. */
 const tmuxName = (id) => `bedrock-${String(id)}`;

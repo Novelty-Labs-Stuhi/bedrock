@@ -54,11 +54,10 @@ jobs:
             --format 'value(status.url)')"
           echo "site: $URL" >> "$GITHUB_STEP_SUMMARY"
 
-          for target in mac windows; do
-            # A redirect to an object that 404s is the failure mode that matters:
-            # the page looks fine and the download is broken.
-            location="$(curl -sS -o /dev/null -w '%{redirect_url}' "$URL/download/$target")"
-            code="$(curl -sS -o /dev/null -w '%{http_code}' -I "$location")"
-            echo "$target -> $location [$code]" >> "$GITHUB_STEP_SUMMARY"
-            test "$code" = "200"
-          done
+          # macOS only — there is no Windows build. A redirect to an object that
+          # 404s is the failure mode that matters: the page looks fine and the
+          # download is broken.
+          location="$(curl -sS -o /dev/null -w '%{redirect_url}' "$URL/download/mac")"
+          code="$(curl -sS -o /dev/null -w '%{http_code}' -I "$location")"
+          echo "mac -> $location [$code]" >> "$GITHUB_STEP_SUMMARY"
+          test "$code" = "200"

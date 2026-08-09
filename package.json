@@ -19,7 +19,7 @@
     "preview": "vite preview",
     "start": "npm run build && electron .",
     "app": "electron .",
-    "package": "npm run build && electron-builder --mac dmg --win nsis",
+    "package": "npm run build && electron-builder --mac dmg",
     "package:mac": "npm run build && set -a && . ./.env && set +a && electron-builder --mac dmg",
     "prepare": "npm run build"
   },
@@ -34,10 +34,10 @@
       "dist/**",
       "electron/**",
       "package.json",
-      "node_modules/@homebridge/node-pty-prebuilt-multiarch/**"
+      "node_modules/node-pty/**"
     ],
     "asarUnpack": [
-      "node_modules/@homebridge/node-pty-prebuilt-multiarch/**"
+      "node_modules/node-pty/**"
     ],
     "mac": {
       "target": [
@@ -52,31 +52,17 @@
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
       "notarize": true
-    },
-    "win": {
-      "target": [
-        {
-          "target": "nsis",
-          "arch": [
-            "x64"
-          ]
-        }
-      ]
-    },
-    "nsis": {
-      "oneClick": true,
-      "perMachine": false
     }
   },
   "dependencies": {
     "@codemirror/commands": "^6.10.4",
     "@codemirror/state": "^6.7.1",
     "@codemirror/view": "^6.43.7",
-    "@homebridge/node-pty-prebuilt-multiarch": "^0.14.1",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
     "cytoscape": "^3.30.2",
-    "cytoscape-cola": "^2.5.1"
+    "cytoscape-cola": "^2.5.1",
+    "node-pty": "^1.1.0"
   },
   "devDependencies": {
     "@types/cytoscape": "^3.21.9",
