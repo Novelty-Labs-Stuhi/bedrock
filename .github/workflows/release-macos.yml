@@ -1,0 +1,127 @@
+name: Release macOS
+
+# Fires on merges into main. A PR merge is a push to main, so this covers the
+# "only through PRs" flow — but nothing *enforces* that until branch protection
+# is on; a direct push to main would build and ship too.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "electron/**"
+      - "scripts/**"
+      - "build/**"
+      - "index.html"
+      - "terminal.html"
+      - "package.json"
+      - "package-lock.json"
+      - "vite.config.ts"
+      - "tsconfig.json"
+      # listed so a change to this workflow rebuilds and proves itself
+      - ".github/workflows/release-macos.yml"
+  workflow_dispatch:
+
+# Notarization is slow and the upload overwrites a fixed object name; two
+# concurrent releases would race to decide which build wins.
+concurrency:
+  group: release-macos
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write # mints the OIDC token that Google exchanges for credentials
+
+jobs:
+  release:
+    runs-on: macos-15 # arm64, matches the only target in package.json
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Import signing certificate
+        env:
+          CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          # Throwaway keychain, throwaway password — both die with the runner.
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+
+          echo "$CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          # The p12 carries the leaf + key but not Apple's intermediate; without
+          # it codesign cannot build a chain to the root on a clean runner.
+          security import DeveloperIDG2CA.cer -k "$KEYCHAIN" -T /usr/bin/codesign || true
+
+          # Without this codesign blocks on a GUI authorization prompt forever.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          security default-keychain -s "$KEYCHAIN"
+
+          rm -f "$RUNNER_TEMP/cert.p12"
+          # find-identity exits 0 even when it finds nothing; fail here rather
+          # than five minutes into electron-builder.
+          security find-identity -v -p codesigning "$KEYCHAIN" | tee /tmp/ids
+          grep -q "Developer ID Application: Parasition AB" /tmp/ids
+
+      - name: Build, sign and notarize
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        # Not `npm run package:mac` — that sources .env, which is gitignored and
+        # absent here. The three vars above are what notarize-dmg.cjs reads.
+        run: |
+          npm run build
+          npx electron-builder --mac dmg --publish never
+
+      - name: Verify the dmg Gatekeeper will actually see
+        run: |
+          set -euo pipefail
+          DMG="$(ls release/*.dmg)"
+          # No --deep here: the dmg is a flat file, not a bundle.
+          codesign --verify --verbose=2 "$DMG"
+          xcrun stapler validate "$DMG"
+          spctl -a -t open --context context:primary-signature -v "$DMG"
+
+      - uses: google-github-actions/auth@v2
+        with:
+          project_id: cleveland-464404-m0
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Upload to GCS
+        run: |
+          set -euo pipefail
+          DMG="$(ls release/*.dmg)"
+
+          # Versioned name is what site/nginx.conf currently redirects to, so
+          # overwriting it needs no site redeploy.
+          gcloud storage cp "$DMG" "gs://getbedrock-downloads/$(basename "$DMG")" \
+            --cache-control="public, max-age=3600"
+
+          # Stable alias, so a version bump stops meaning a site redeploy once
+          # nginx.conf is pointed here instead.
+          gcloud storage cp "$DMG" "gs://getbedrock-downloads/Bedrock-latest-arm64.dmg" \
+            --cache-control="public, max-age=300"
+
+          echo "shipped $(basename "$DMG")" >> "$GITHUB_STEP_SUMMARY"

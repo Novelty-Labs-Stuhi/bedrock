@@ -10,6 +10,8 @@ const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 
 const DIST = path.join(__dirname, "..", "dist");
+// Packaged builds carry the icon in the bundle; this covers running from the repo.
+const DEV_ICON = path.join(__dirname, "..", "build", "icon.png");
 
 protocol.registerSchemesAsPrivileged([
   { scheme: "app", privileges: { standard: true, secure: true, supportFetchAPI: true } },
@@ -33,6 +35,7 @@ function createWindow() {
     minHeight: 460,
     title: "bedrock",
     backgroundColor: "#1e1e1e",
+    ...(process.platform !== "darwin" && !app.isPackaged ? { icon: DEV_ICON } : {}),
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -73,29 +76,156 @@ function buildMenu() {
   );
 }
 
+/*
+ * The environment a git command runs in. Two things a GUI app gets wrong on its own:
+ *
+ * PATH — a process launched by the OS never sourced a shell profile, so a git that lives in
+ * Homebrew's bin is simply not findable. `loginPath()` is the same answer the terminal has.
+ *
+ * Prompting — git asking "Username for https://github.com:" on a process with no terminal
+ * waits forever with nothing on screen to answer, which is the worst possible failure: the
+ * button never comes back. Turning every prompt off turns each of those hangs into an error
+ * we can show. `BatchMode=yes` does the same for ssh's host-key and passphrase questions.
+ */
+const gitEnv = () => {
+  const env = { ...process.env, PATH: loginPath(), GIT_TERMINAL_PROMPT: "0" };
+  // A graphical askpass would pop its own dialog behind the app instead of failing.
+  delete env.GIT_ASKPASS;
+  delete env.SSH_ASKPASS;
+  env.GIT_SSH_COMMAND = `${process.env.GIT_SSH_COMMAND || "ssh"} -o BatchMode=yes`;
+  return env;
+};
+
 /** Runs one git command in `cwd`; a non-zero exit rejects with whatever git said. */
 const git = (cwd, ...args) =>
   new Promise((resolve, reject) => {
-    execFile("git", args, { cwd }, (err, stdout, stderr) => {
-      if (err) reject(new Error((stderr || stdout || err.message).trim()));
-      else resolve(stdout.trim());
+    const options = { cwd, env: gitEnv(), timeout: 120000, maxBuffer: 8 * 1024 * 1024 };
+    execFile("git", args, options, (err, stdout, stderr) => {
+      if (!err) return resolve(stdout.trim());
+      if (err.code === "ENOENT") return reject(new Error("git is not installed on this machine"));
+      if (err.killed) return reject(new Error("git gave up after two minutes — is the network there?"));
+      reject(new Error((stderr || stdout || err.message).trim()));
     });
   });
+
+/** Vault paths are typed by hand, so `~` is a real thing that arrives here. */
+const vaultDir = (root) => {
+  const dir = String(root || "").replace(/^~(?=$|\/)/, os.homedir());
+  if (!dir || !fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
+    throw new Error(`${dir || "(nowhere)"} is not a folder on this machine`);
+  }
+  return dir;
+};
+
+/** Whether a git command succeeds at all, for the several questions shaped that way. */
+const gitOk = (cwd, ...args) => git(cwd, ...args).then(() => true, () => false);
+
+/*
+ * Whether git's idea of the repository root is this very folder.
+ *
+ * Two traps, both of which would have us commit somebody else's repository. A vault sitting
+ * inside a bigger checkout answers `--show-toplevel` with the checkout's root, not its own,
+ * so the paths must be compared rather than the question merely being asked. And on macOS
+ * `/tmp` and `/var` are symlinks, so a typed path and git's answer can name the same folder
+ * in different words — `realpath` is what makes those compare equal.
+ */
+const sameDir = (a, b) => {
+  const real = (p) => {
+    try {
+      return fs.realpathSync(p);
+    } catch {
+      return path.resolve(p);
+    }
+  };
+  return real(a) === real(b);
+};
+
+/** The repository whose root is exactly `dir`, or null if this folder is not one. */
+const ownRepo = async (dir) => {
+  const top = await git(dir, "rev-parse", "--show-toplevel").catch(() => null);
+  return top && sameDir(top, dir) ? top : null;
+};
+
+/*
+ * Everything the settings page can say about the vault's repository, asked of git rather
+ * than remembered. All of it is read-only and none of it throws for the ordinary "there is
+ * no repository here yet" answers — a page that cannot render because the vault is not a
+ * repo would be reporting the one state it most needs to report.
+ */
+ipcMain.handle("git-status", async (_event, root) => {
+  const dir = vaultDir(root);
+  const blank = {
+    installed: true,
+    repo: false,
+    branch: null,
+    changes: 0,
+    lastCommit: null,
+    origin: null,
+    identity: null,
+    upstream: false,
+    ahead: 0,
+    behind: 0,
+  };
+  // `--version` is the cheapest question there is, and the only one worth asking first.
+  try {
+    await git(dir, "--version");
+  } catch (err) {
+    if (/not installed/.test(err.message)) return { ...blank, installed: false };
+    throw err;
+  }
+  if (!(await ownRepo(dir))) return blank;
+
+  const [name, email, origin, porcelain, branch] = await Promise.all([
+    git(dir, "config", "user.name").catch(() => ""),
+    git(dir, "config", "user.email").catch(() => ""),
+    git(dir, "remote", "get-url", "origin").catch(() => ""),
+    git(dir, "status", "--porcelain").catch(() => ""),
+    // `--show-current` rather than `rev-parse`, which on a repo with no commits yet fails
+    // and prints the word HEAD, so its answer cannot be told from a detached one.
+    git(dir, "branch", "--show-current").catch(() => ""),
+  ]);
+  const born = await gitOk(dir, "rev-parse", "--verify", "HEAD");
+  const lastCommit = born ? await git(dir, "log", "-1", "--format=%h — %s").catch(() => null) : null;
+  // `left...right` counts each side's own commits: behind first, then ahead.
+  const counts = born
+    ? await git(dir, "rev-list", "--left-right", "--count", "@{upstream}...HEAD").catch(() => null)
+    : null;
+  const [behind, ahead] = (counts || "").split(/\s+/).map(Number);
+
+  return {
+    installed: true,
+    repo: true,
+    branch: branch || null,
+    changes: porcelain ? porcelain.split("\n").filter(Boolean).length : 0,
+    lastCommit,
+    origin: origin || null,
+    identity: name && email ? `${name} <${email}>` : null,
+    upstream: counts !== null,
+    ahead: ahead || 0,
+    behind: behind || 0,
+  };
+});
 
 /*
  * The whole git integration: stage everything, commit. First use in a folder that is
  * not a repository initialises one — "turn git on" should not require a terminal.
  */
 ipcMain.handle("git-commit", async (_event, root) => {
-  const dir = String(root).replace(/^~(?=$|\/)/, os.homedir());
-  if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
-    throw new Error(`${dir} is not a folder on this machine`);
-  }
-  const fresh = await git(dir, "rev-parse", "--is-inside-work-tree").then(
-    () => false,
-    () => true,
-  );
+  const dir = vaultDir(root);
+  const fresh = !(await ownRepo(dir));
   if (fresh) await git(dir, "init");
+  // Asked before staging, because git's own answer to this is four paragraphs of advice
+  // about a machine-wide setting, and by then it has already stashed everything in place.
+  const [name, email] = await Promise.all([
+    git(dir, "config", "user.name").catch(() => ""),
+    git(dir, "config", "user.email").catch(() => ""),
+  ]);
+  if (!name || !email) {
+    throw new Error(
+      "git does not know who you are on this machine — run " +
+        `git config --global user.${!name ? "name" : "email"} "…" once, then commit`,
+    );
+  }
   await git(dir, "add", "-A");
   const stamp = new Date().toISOString().slice(0, 16).replace("T", " ");
   try {
@@ -107,6 +237,127 @@ ipcMain.handle("git-commit", async (_event, root) => {
     throw err;
   }
   return `committed ${await git(dir, "log", "-1", "--format=%h — %s")}`;
+});
+
+/*
+ * Push what has been committed to a GitHub remote. The URL is a choice the vault made and
+ * hands in; who you are and the token or key that lets you in are the machine's own git's
+ * business, exactly as they are for a commit — so there is nothing secret here, and a
+ * machine that cannot reach GitHub fails with git's own words rather than ours.
+ *
+ * `origin` is set to whatever URL came in (added the first time, repointed after that), so
+ * changing the remote in settings just works. The push is `-u … HEAD`, which names the
+ * branch after itself upstream and covers the empty-repo first push without a special case.
+ */
+ipcMain.handle("git-push", async (_event, root, remote) => {
+  const dir = vaultDir(root);
+  const url = String(remote || "").trim();
+  if (!url) throw new Error("no remote set — add a GitHub URL first");
+  if (!(await ownRepo(dir))) throw new Error("no repository here yet — commit before pushing");
+  // A repository with no commits has nothing to push, and git's own words for it
+  // ("src refspec HEAD does not match any") say nothing about what to do instead.
+  if (!(await gitOk(dir, "rev-parse", "--verify", "HEAD"))) {
+    throw new Error("nothing committed yet — commit before pushing");
+  }
+  const hasOrigin = await gitOk(dir, "remote", "get-url", "origin");
+  await git(dir, "remote", hasOrigin ? "set-url" : "add", "origin", url);
+  const branch = await git(dir, "rev-parse", "--abbrev-ref", "HEAD");
+  try {
+    await git(dir, "push", "-u", "origin", "HEAD");
+  } catch (err) {
+    throw new Error(pushAdvice(err.message));
+  }
+  return `pushed ${branch} to ${url}`;
+});
+
+/*
+ * Git's push failures are the ones a person is least equipped to act on: the remote's
+ * refusal arrives as a wall of hints about refspecs and credential helpers. These three
+ * cover everything seen in practice from a vault — the repo already has a commit in it,
+ * the credentials are not on this machine, or the URL is wrong — and each says the thing
+ * to actually do. Anything else is handed on in git's own words, which is the right
+ * default: better an unfamiliar message than a wrong friendly one.
+ */
+function pushAdvice(message) {
+  if (/\bnon-fast-forward\b|\brejected\b|fetch first/i.test(message)) {
+    return "the remote has commits this vault does not — press Pull first, then push";
+  }
+  return remoteAdvice(message);
+}
+
+/** The two ways any remote command fails that are about the machine, not the branch. */
+function remoteAdvice(message) {
+  if (/could not read (Username|Password)|Authentication failed|terminal prompts disabled|Permission denied \(publickey\)|BatchMode|Host key verification/i.test(message)) {
+    return (
+      "this machine's git cannot authenticate to the remote. Set it up once outside " +
+      "Bedrock — an ssh key (ssh-keygen, then add it on GitHub) or gh auth login — and " +
+      "it works from here on. No token is kept in the vault."
+    );
+  }
+  if (/Repository not found|does not appear to be a git repository|not found|Could not resolve host/i.test(message)) {
+    return "the remote refused that URL — check the repository exists and that your git account can write to it";
+  }
+  return message;
+}
+
+/*
+ * Bring the remote's commits down. This exists because without it the loop does not close:
+ * a repository made on GitHub with a README, or a vault edited from a second machine, leaves
+ * push refused forever and the only way out is a terminal.
+ *
+ * Rebase rather than merge, so a vault's history stays a line of snapshots rather than a
+ * braid. Two guards make it safe to press without thinking, which is the whole point:
+ *
+ *  - Uncommitted work is refused up front. Rebase would demand that anyway, and its own way
+ *    of saying so ("cannot pull with rebase: You have unstaged changes") reads as a fault.
+ *  - A rebase that stops on a conflict is aborted. Leaving a notes vault mid-rebase — files
+ *    full of conflict markers, HEAD detached, no terminal in sight — is far worse than not
+ *    having pulled, so this either lands cleanly or leaves the vault exactly as it was.
+ */
+ipcMain.handle("git-pull", async (_event, root, remote) => {
+  const dir = vaultDir(root);
+  const url = String(remote || "").trim();
+  if (!url) throw new Error("no remote set — add a GitHub URL first");
+  if (!(await ownRepo(dir))) throw new Error("no repository here yet — commit before pulling");
+  if (await git(dir, "status", "--porcelain")) {
+    throw new Error("there is uncommitted work in the vault — commit it first, then pull");
+  }
+  const hasOrigin = await gitOk(dir, "remote", "get-url", "origin");
+  await git(dir, "remote", hasOrigin ? "set-url" : "add", "origin", url);
+  try {
+    await git(dir, "fetch", "origin");
+  } catch (err) {
+    throw new Error(remoteAdvice(err.message));
+  }
+  const branch = (await git(dir, "branch", "--show-current").catch(() => "")) || "HEAD";
+  // A remote that has never heard of this branch has nothing to send, and git's way of
+  // saying so ("couldn't find remote ref main") sounds like a fault rather than an answer.
+  if (!(await gitOk(dir, "rev-parse", "--verify", `refs/remotes/origin/${branch}`))) {
+    return `the remote has no ${branch} yet — push to create it`;
+  }
+  const before = await git(dir, "rev-parse", "HEAD").catch(() => null);
+  try {
+    await git(dir, "pull", "--rebase", "origin", branch);
+  } catch (err) {
+    await git(dir, "rebase", "--abort").catch(() => {});
+    if (/conflict/i.test(err.message)) {
+      throw new Error(
+        "the remote's version of some notes clashes with this vault's. Nothing here was " +
+          `changed — sort it out in a terminal (git pull --rebase origin ${branch})`,
+      );
+    }
+    if (/would be overwritten/i.test(err.message)) {
+      throw new Error(
+        "the remote has files this vault also has, uncommitted — commit them first, then " +
+          "pull, so git has two versions to reconcile rather than one to overwrite",
+      );
+    }
+    throw new Error(remoteAdvice(err.message));
+  }
+  const after = await git(dir, "rev-parse", "HEAD").catch(() => null);
+  return before === after
+    ? "already up to date with the remote"
+    : `pulled the remote's ${branch} in — now at ${await git(dir, "log", "-1", "--format=%h — %s")}`;
 });
 
 /*
@@ -139,6 +390,278 @@ ipcMain.handle("fs-open", async (_event, target) => {
   if (!fs.existsSync(expanded)) return "missing";
   const error = await shell.openPath(expanded);
   return error ? error : "opened";
+});
+
+/*
+ * A webpage on the graph. The renderer hands over an address and gets back what a
+ * bookmark needs to draw itself: the page's own <title>, and the biggest icon the
+ * site offers, as data.
+ *
+ * It happens here rather than in the renderer for two reasons. The app's origin is
+ * `app://`, and a page fetched from there is a cross-origin read every site is free
+ * to refuse — the shell has no origin to be refused for. And only here can the answer
+ * be KEPT: a graph of thirty links must not re-scrape thirty sites at every launch.
+ * The cache is in userData, deliberately NOT in the vault: a commit snapshots the vault
+ * wholesale, and a folder of other people's logos is not something anybody meant to
+ * commit.
+ */
+const WEB_UA =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) " +
+  "Chrome/124.0.0.0 Safari/537.36";
+/** Enough of the HTML to be well past </head>, which is all this reads. */
+const PAGE_LIMIT = 512 * 1024;
+const ICON_LIMIT = 2 * 1024 * 1024;
+const WEB_TIMEOUT = 9000;
+/** How long a scraped icon is trusted before the site is asked again. */
+const ICON_TTL = 14 * 24 * 60 * 60 * 1000;
+/** Pages remembered; the least recently looked up fall off the end. */
+const ICON_KEEP = 300;
+
+const iconFile = () => path.join(app.getPath("userData"), "webicons.json");
+
+function readIcons() {
+  try {
+    const stored = JSON.parse(fs.readFileSync(iconFile(), "utf8"));
+    return stored && typeof stored.pages === "object" && stored.pages ? stored.pages : {};
+  } catch {
+    return {}; // nothing scraped yet, or a cache somebody broke — both mean "ask the site"
+  }
+}
+
+function writeIcons(pages) {
+  const kept = Object.entries(pages)
+    .sort((a, b) => (b[1].at ?? 0) - (a[1].at ?? 0))
+    .slice(0, ICON_KEEP);
+  try {
+    fs.mkdirSync(path.dirname(iconFile()), { recursive: true });
+    fs.writeFileSync(iconFile(), JSON.stringify({ version: 1, pages: Object.fromEntries(kept) }));
+  } catch {
+    /* an unwritable cache costs a re-fetch and nothing else */
+  }
+}
+
+/** One GET, capped and with a deadline — a site that hangs must not hang the node. */
+async function fetchBytes(url, limit) {
+  const response = await net.fetch(url, {
+    headers: { "user-agent": WEB_UA, accept: "*/*" },
+    signal: AbortSignal.timeout(WEB_TIMEOUT),
+  });
+  if (!response.ok) throw new Error(`${response.status}`);
+  const body = Buffer.from(await response.arrayBuffer());
+  return {
+    bytes: body.subarray(0, limit),
+    url: response.url || url, // where the redirects actually landed — relative hrefs hang off this
+    type: (response.headers.get("content-type") || "").toLowerCase(),
+  };
+}
+
+/** One attribute out of one tag, in any of the three quoting styles HTML allows. */
+function attr(tag, name) {
+  const found = new RegExp(`\\b${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s"'>]+))`, "i").exec(tag);
+  return found ? (found[1] ?? found[2] ?? found[3] ?? "") : null;
+}
+
+const ENTITIES = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " };
+
+/** Titles come entity-encoded far too often for "&amp;" to be left standing in a node label. */
+const decodeEntities = (text) =>
+  text.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (whole, body) => {
+    if (body[0] !== "#") return ENTITIES[body.toLowerCase()] ?? whole;
+    const code = body[1] === "x" || body[1] === "X" ? parseInt(body.slice(2), 16) : Number(body.slice(1));
+    return Number.isFinite(code) && code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : whole;
+  });
+
+function pageTitle(html) {
+  const found = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html);
+  return found ? decodeEntities(found[1]).replace(/\s+/g, " ").trim().slice(0, 90) : "";
+}
+
+/**
+ * How big a candidate CLAIMS to be, from its `sizes` attribute or from the size baked
+ * into its file name. Only a claim — it decides what is worth fetching, and the bytes
+ * decide what actually wins.
+ */
+function sizeHint(sizes, href) {
+  if (/\.svg(?:[?#]|$)/i.test(href)) return 9000; // scalable: nothing raster beats it
+  if (sizes && /^\s*any\s*$/i.test(sizes)) return 9000;
+  let best = 0;
+  for (const found of String(sizes || "").matchAll(/(\d+)\s*[x×]\s*(\d+)/gi)) {
+    best = Math.max(best, Number(found[1]));
+  }
+  if (best) return best;
+  const named = /(\d{2,4})x\1/.exec(href); // apple-touch-icon-180x180.png
+  return named ? Number(named[1]) : 0;
+}
+
+/** Every icon the page offers, best claim first — plus the two every site has anyway. */
+async function iconCandidates(html, base) {
+  const found = new Map();
+  const add = (href, hint) => {
+    if (!href) return;
+    let absolute;
+    try {
+      absolute = new URL(href, base).toString();
+    } catch {
+      return;
+    }
+    if (!/^https?:/i.test(absolute)) return; // data: and friends are not worth the round trip
+    found.set(absolute, Math.max(found.get(absolute) ?? 0, hint));
+  };
+
+  let manifest = null;
+  for (const tag of html.match(/<link\b[^>]*>/gi) ?? []) {
+    const rel = (attr(tag, "rel") || "").toLowerCase();
+    const href = attr(tag, "href");
+    if (/\bmanifest\b/.test(rel)) {
+      manifest = href;
+      continue;
+    }
+    // `mask-icon` is deliberately not among these: Safari's pinned-tab icon is a
+    // one-colour silhouette meant to be tinted by the browser, and taken at face
+    // value it puts a black blob where the site's actual mark should be.
+    if (!/\b(?:icon|apple-touch-icon|apple-touch-icon-precomposed|fluid-icon)\b/.test(rel)) {
+      continue;
+    }
+    add(href, sizeHint(attr(tag, "sizes"), href || ""));
+  }
+  // The web app manifest is where the big ones live — 192 and 512 square, drawn for
+  // exactly this job: the site standing on somebody else's screen as an icon.
+  if (manifest) {
+    try {
+      const body = await fetchBytes(new URL(manifest, base).toString(), PAGE_LIMIT);
+      for (const icon of JSON.parse(body.bytes.toString("utf8")).icons ?? []) {
+        add(new URL(icon.src, body.url).toString(), sizeHint(icon.sizes, icon.src || ""));
+      }
+    } catch {
+      /* no manifest, or nonsense in it — the <link> icons stand on their own */
+    }
+  }
+  // The conventions, for the many sites that declare nothing at all.
+  add(new URL("/favicon.ico", base).toString(), 0);
+  add(new URL("/apple-touch-icon.png", base).toString(), 180);
+
+  return [...found]
+    .map(([url, hint]) => ({ url, hint }))
+    .sort((a, b) => b.hint - a.hint)
+    .slice(0, 6);
+}
+
+/**
+ * What the bytes ACTUALLY are. Servers hand back an HTML error page under a 200 and an
+ * image content-type often enough that the header cannot be believed; the magic bytes
+ * can. Anything unrecognised is not an icon as far as this is concerned.
+ */
+function imageType(bytes) {
+  if (bytes.length < 12) return null;
+  if (bytes[0] === 0x89 && bytes.toString("latin1", 1, 4) === "PNG") return "image/png";
+  if (bytes[0] === 0xff && bytes[1] === 0xd8) return "image/jpeg";
+  if (bytes.toString("latin1", 0, 3) === "GIF") return "image/gif";
+  if (bytes.toString("latin1", 0, 4) === "RIFF" && bytes.toString("latin1", 8, 12) === "WEBP") {
+    return "image/webp";
+  }
+  if (bytes[0] === 0 && bytes[1] === 0 && bytes[2] === 1 && bytes[3] === 0) return "image/x-icon";
+  const head = bytes.toString("utf8", 0, 400).trim().toLowerCase();
+  if (head.startsWith("<svg") || (head.startsWith("<?xml") && head.includes("<svg"))) {
+    return "image/svg+xml";
+  }
+  return null;
+}
+
+/**
+ * The width the bytes really have, read off the header — "best resolution" decided by
+ * measurement rather than by what the page claimed. Unmeasurable is 0, which loses to
+ * anything measurable and falls back to the claim.
+ */
+function imageWidth(bytes, type) {
+  try {
+    if (type === "image/svg+xml") return 9000; // draws sharp at whatever size the node is
+    if (type === "image/png") return bytes.readUInt32BE(16);
+    if (type === "image/gif") return bytes.readUInt16LE(6);
+    if (type === "image/x-icon") {
+      // An .ico is a directory of images; the one that matters is its biggest. A width
+      // byte of 0 means 256 — the format has nowhere else to put a number that big.
+      let best = 0;
+      const count = bytes.readUInt16LE(4);
+      for (let i = 0; i < count && 6 + i * 16 < bytes.length; i++) best = Math.max(best, bytes[6 + i * 16] || 256);
+      return best;
+    }
+    if (type === "image/webp") {
+      const chunk = bytes.toString("latin1", 12, 16);
+      if (chunk === "VP8X") return bytes.readUIntLE(24, 3) + 1;
+      if (chunk === "VP8 ") return bytes.readUInt16LE(26) & 0x3fff;
+      if (chunk === "VP8L") return (bytes.readUInt32LE(21) & 0x3fff) + 1;
+      return 0;
+    }
+    if (type === "image/jpeg") {
+      for (let at = 2; at + 9 < bytes.length; ) {
+        if (bytes[at] !== 0xff) {
+          at++;
+          continue;
+        }
+        const marker = bytes[at + 1];
+        // Every SOF marker carries the dimensions; the four in the gaps do not.
+        if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+          return bytes.readUInt16BE(at + 7);
+        }
+        at += 2 + bytes.readUInt16BE(at + 2);
+      }
+    }
+  } catch {
+    /* a truncated or lying header is simply not measurable */
+  }
+  return 0;
+}
+
+async function scrapePage(target) {
+  let html = "";
+  let base = target;
+  try {
+    const page = await fetchBytes(target, PAGE_LIMIT);
+    base = page.url;
+    if (!page.type || /html|xml/.test(page.type)) html = page.bytes.toString("utf8");
+  } catch {
+    /* a page that will not be read still has an origin worth guessing at */
+  }
+  const candidates = await iconCandidates(html, base);
+  // All at once: six small GETs against one host, and the slowest of them is the wait
+  // rather than the sum. Every one of them is allowed to fail on its own.
+  const fetched = await Promise.all(
+    candidates.map(async (candidate) => {
+      try {
+        const got = await fetchBytes(candidate.url, ICON_LIMIT);
+        const type = imageType(got.bytes);
+        if (!type) return null;
+        return { bytes: got.bytes, type, width: imageWidth(got.bytes, type) || candidate.hint };
+      } catch {
+        return null;
+      }
+    }),
+  );
+  const best = fetched.filter(Boolean).sort((a, b) => b.width - a.width)[0];
+  return {
+    url: base,
+    title: pageTitle(html),
+    icon: best ? `data:${best.type};base64,${best.bytes.toString("base64")}` : "",
+  };
+}
+
+ipcMain.handle("web-page", async (_event, rawUrl) => {
+  const target = String(rawUrl || "").trim();
+  if (!/^https?:\/\//i.test(target)) throw new Error("that is not a web address");
+  const pages = readIcons();
+  const known = pages[target];
+  const remembered = known && { url: known.url || target, title: known.title || "", icon: known.icon || "" };
+  if (remembered && Date.now() - (known.at ?? 0) < ICON_TTL) return remembered;
+
+  const found = await scrapePage(target);
+  // A site that is down (or has just started refusing us) must not cost the node the
+  // icon it has been wearing all along: nothing found leaves the old answer standing.
+  if (!found.icon && !found.title && remembered) return remembered;
+  if (found.icon || found.title) {
+    pages[target] = { ...found, at: Date.now() };
+    writeIcons(pages);
+  }
+  return found;
 });
 
 /*
@@ -234,18 +757,34 @@ const GEMINI_CONVO = /^https:\/\/gemini\.google\.com\/(?:app|share)\/[\w-]+/;
 const GEMINI_PARTITION = "persist:gemini";
 const GOOGLE_RE = /^https:\/\/([\w-]+\.)*google\.com\//;
 
-ipcMain.handle("gemini-chat", (_event, url) => {
+/** The cookies Google sets when a sign-in takes. Only ever tested for existence. */
+const SIGNED_IN_COOKIE = /^(__Secure-1PSID|SID)$/;
+
+const geminiJar = () => session.fromPartition(GEMINI_PARTITION).cookies;
+
+async function geminiSignedIn() {
+  try {
+    const jar = await geminiJar().get({ domain: ".google.com" });
+    return jar.some((c) => SIGNED_IN_COOKIE.test(c.name) && !!c.value);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A window in the chat session. Google's sign-in flow opens popups; they must be real
+ * windows IN THIS SESSION for the login cookies to land where the chat lives. Anything
+ * else goes to the system browser, exactly like links in notes do.
+ */
+function geminiWindow(title) {
   const win = new BrowserWindow({
     width: 1100,
     height: 780,
-    title: "Gemini",
+    title,
     autoHideMenuBar: true,
     backgroundColor: "#1e1e1e",
     webPreferences: { partition: GEMINI_PARTITION, contextIsolation: true, nodeIntegration: false },
   });
-  // Google's sign-in flow opens popups; they must be real windows IN THIS SESSION
-  // for the login cookies to land where the chat lives. Anything else goes to the
-  // system browser, exactly like links in notes do.
   win.webContents.setWindowOpenHandler(({ url: target }) => {
     if (GOOGLE_RE.test(target)) {
       return {
@@ -259,6 +798,11 @@ ipcMain.handle("gemini-chat", (_event, url) => {
     if (/^https?:/.test(target)) void shell.openExternal(target);
     return { action: "deny" };
   });
+  return win;
+}
+
+ipcMain.handle("gemini-chat", (_event, url) => {
+  const win = geminiWindow("Gemini");
   void win.loadURL(String(url));
   return new Promise((resolve) => {
     let settled = false;
@@ -279,6 +823,387 @@ ipcMain.handle("gemini-chat", (_event, url) => {
       }
     });
   });
+});
+
+/**
+ * Whether the chat window's own session is signed into Google. There is no API to ask —
+ * the answer is in the cookie jar, and `__Secure-1PSID` is the one Google sets when a
+ * sign-in takes. It is only ever read for its EXISTENCE; the value is never handled.
+ */
+ipcMain.handle("gemini-status", async () => ({ signedIn: await geminiSignedIn() }));
+
+/**
+ * Signing in, and NOTHING ELSE. A window that opens on Google's own sign-in page, watches
+ * the jar for the cookie that says it took, and closes itself the moment it lands.
+ *
+ * Its own door rather than a side effect of opening a chat: a chat window that happens to
+ * show a login is the thing that made this integration feel broken — you could not tell
+ * whether you were about to talk to Gemini or to a form, and nothing told you when it had
+ * worked. Here the window has one job and reports whether it did it.
+ *
+ * The jar is watched rather than the navigation: which page Google lands on at the end of
+ * a login depends on the account (a consent screen, a chooser, a security interstitial),
+ * but the cookie is the same either way — it IS what being signed in means.
+ */
+ipcMain.handle("gemini-signin", async () => {
+  if (await geminiSignedIn()) return { signedIn: true };
+  const win = geminiWindow("Sign in to Google");
+  const jar = geminiJar();
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (signedIn) => {
+      if (settled) return;
+      settled = true;
+      jar.removeListener("changed", onChanged);
+      resolve({ signedIn });
+      // Closing is the confirmation: the window had one job and it is finished.
+      if (signedIn && !win.isDestroyed()) win.close();
+    };
+    const onChanged = (_e, cookie, _cause, removed) => {
+      if (removed || !SIGNED_IN_COOKIE.test(cookie.name) || !cookie.value) return;
+      if (!/(^|\.)google\.com$/.test(String(cookie.domain).replace(/^\./, "."))) return;
+      done(true);
+    };
+    jar.on("changed", onChanged);
+    // Dismissed without finishing — but check the jar rather than assuming, in case the
+    // login took on a page that closed itself.
+    win.on("closed", () => void geminiSignedIn().then(done));
+    void win.loadURL(
+      "https://accounts.google.com/ServiceLogin?continue=" +
+        encodeURIComponent("https://gemini.google.com/app"),
+    );
+  });
+});
+
+/**
+ * Forgets the chat window's session — cookies and all. The next chat opens at the sign-in
+ * page again. Nothing in any note changes: a conversation's URL is the note's, not the
+ * session's, and it will still open once somebody signs back in.
+ */
+ipcMain.handle("gemini-forget", async () => {
+  await session.fromPartition(GEMINI_PARTITION).clearStorageData();
+  return true;
+});
+
+/* ------------------------------------------------ claude, in a terminal of its own --- */
+/*
+ * The other way to run a session: the `claude` CLI, in a window this app draws, with the
+ * agent living OUTSIDE this app entirely.
+ *
+ * The trick is that Bedrock never owns the session — tmux does. A session is started
+ * detached (`tmux new-session -d`), which hands it to the tmux server, a daemon that
+ * belongs to the login session rather than to whoever asked for it. Bedrock then draws it
+ * by running `tmux attach` inside a pseudo-terminal and piping that into an xterm.js in a
+ * window. Closing the window kills the ATTACH, not the session.
+ *
+ * So the agent keeps working while the window is shut, keeps working while Bedrock is
+ * shut, and is still mid-turn when you come back — the app really is only a viewport onto
+ * something running on the machine. It is also why this needs tmux installed and will not
+ * pretend otherwise: without it there is nothing to hand the session to.
+ */
+
+const pty = require("@homebridge/node-pty-prebuilt-multiarch");
+
+/** A session's tmux name. The id is Claude's own, so the two never drift apart. */
+const tmuxName = (id) => `bedrock-${String(id)}`;
+
+/**
+ * The PATH a terminal would have. A GUI app on macOS inherits a bare launchd environment,
+ * so neither `tmux` (Homebrew) nor `claude` (~/.local/bin) is on it — asking the login
+ * shell is the only way to find what the user would find. Read once and kept: it changes
+ * when a shell profile does, which is not during a run.
+ */
+let loginPathCache = null;
+function loginPath() {
+  if (loginPathCache) return loginPathCache;
+  const shell = process.env.SHELL || "/bin/zsh";
+  try {
+    loginPathCache = require("node:child_process")
+      .execFileSync(shell, ["-lic", "printf %s \"$PATH\""], { encoding: "utf8", timeout: 5000 })
+      .trim();
+  } catch {
+    loginPathCache = process.env.PATH || "";
+  }
+  // The app's own guesses, in case a profile never exported them.
+  const extra = ["/opt/homebrew/bin", "/usr/local/bin", path.join(os.homedir(), ".local/bin")];
+  const parts = loginPathCache.split(":").filter(Boolean);
+  for (const dir of extra) if (!parts.includes(dir)) parts.push(dir);
+  loginPathCache = parts.join(":");
+  return loginPathCache;
+}
+
+/*
+ * Variables that decide WHO a Claude session is, and must never be inherited.
+ *
+ * A GUI app inherits whatever launched it. Launch Bedrock from a terminal that exports
+ * `ANTHROPIC_API_KEY` — or from another Claude Code session, which exports
+ * `ANTHROPIC_BASE_URL` and a dozen `CLAUDE_CODE_*` of its own — and every session started
+ * from here would quietly authenticate as that instead of as the CLI's own account. The
+ * symptom is a billing error from an account you did not think you were using, which is a
+ * miserable thing to debug and a worse thing to be charged for.
+ *
+ * So a session gets none of it. It runs as if you had opened a terminal yourself: the
+ * login shell is still sourced below, so anything YOU export in your own profile still
+ * applies — the scrub only drops what this app happened to be handed.
+ */
+const INHERITED_IDENTITY = /^(ANTHROPIC_|CLAUDE_|CLAUDECODE$)/;
+
+/** The environment a session (or an attach) runs in, with that inheritance removed. */
+function termEnv() {
+  const clean = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!INHERITED_IDENTITY.test(key)) clean[key] = value;
+  }
+  return {
+    ...clean,
+    PATH: loginPath(),
+    TERM: "xterm-256color",
+    // Or the CLI draws for whatever terminal happened to launch the app.
+    COLORTERM: "truecolor",
+  };
+}
+
+/**
+ * `env -u FOO -u BAR` for whatever we were actually handed, to put in front of the command
+ * tmux runs. Belt to the braces above: the tmux SERVER may already be running with an
+ * environment from an earlier, dirtier launch, and a session it spawns would inherit that
+ * rather than what we pass here. Unsetting at exec time is the only place that cannot be
+ * got round.
+ */
+const scrubArgs = () =>
+  Object.keys(process.env)
+    .filter((key) => INHERITED_IDENTITY.test(key))
+    .flatMap((key) => ["-u", key]);
+
+/** Where tmux is, or null when it is not installed. Not cached — it can be installed. */
+function tmuxPath() {
+  for (const dir of loginPath().split(":")) {
+    const candidate = path.join(dir, "tmux");
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch {
+      /* keep looking */
+    }
+  }
+  return null;
+}
+
+const tmux = (...args) =>
+  new Promise((resolve, reject) => {
+    const bin = tmuxPath();
+    if (!bin) return reject(new Error("tmux is not installed"));
+    execFile(bin, args, { env: termEnv() }, (err, stdout, stderr) => {
+      if (err) reject(new Error((stderr || stdout || err.message).trim()));
+      else resolve(stdout.trim());
+    });
+  });
+
+/** Whether a session is still running. `has-session` exits non-zero when it is not. */
+async function tmuxAlive(id) {
+  try {
+    await tmux("has-session", "-t", tmuxName(id));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * What the terminal integration can and cannot do here. `installer` is how tmux could be
+ * got if it is missing — the settings window offers the button, and refuses the mode
+ * until this reports a path.
+ */
+ipcMain.handle("term-status", () => {
+  const bin = tmuxPath();
+  const brew = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"].find((p) => fs.existsSync(p));
+  return {
+    tmux: bin,
+    installer: bin ? null : brew ? "brew" : null,
+    platform: process.platform,
+  };
+});
+
+/** `brew install tmux`, for the button that offers it. Slow, so it is awaited properly. */
+ipcMain.handle("term-install", async () => {
+  const brew = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"].find((p) => fs.existsSync(p));
+  if (!brew) throw new Error("Homebrew not found — install tmux yourself, then try again");
+  await new Promise((resolve, reject) => {
+    execFile(brew, ["install", "tmux"], { env: termEnv(), timeout: 600000 }, (err, stdout, stderr) => {
+      if (err) reject(new Error((stderr || stdout || err.message).trim().slice(-400)));
+      else resolve(stdout);
+    });
+  });
+  const bin = tmuxPath();
+  if (!bin) throw new Error("tmux installed but still not on the path — restart Bedrock");
+  return { tmux: bin };
+});
+
+/**
+ * Starts a session and hands it straight to tmux. The id is minted HERE and passed to the
+ * CLI with `--session-id`, which is the whole reason this path is tidier than the app's:
+ * the note knows its session's name before a word has been said in it, so nothing has to
+ * be watched for or guessed at later. The transcript it writes is the ordinary one, which
+ * is what lets the same session be opened in the Claude app afterwards.
+ */
+ipcMain.handle("claude-cli-start", async (_event, folder, resume) => {
+  const dir = realFolder(folder);
+  if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
+    throw new Error(`${dir} is not a folder on this machine`);
+  }
+  // Resuming keeps the id: `--resume` continues the same conversation rather than
+  // branching it, so the note's `session::` line stays true across any number of runs.
+  const resuming = /^[0-9a-f-]{36}$/i.test(String(resume ?? ""));
+  const id = resuming ? String(resume) : require("node:crypto").randomUUID();
+  const shell = process.env.SHELL || "/bin/zsh";
+  // Through a login shell so the CLI is found the way a terminal would find it, and
+  // `exec` so the shell does not sit around as a parent doing nothing.
+  const scrub = scrubArgs();
+  const prefix = scrub.length ? `env ${scrub.join(" ")} ` : "";
+  const command = resuming
+    ? `exec ${prefix}claude --resume ${id}`
+    : `exec ${prefix}claude --session-id ${id}`;
+  await tmux(
+    "new-session",
+    "-d",
+    "-s", tmuxName(id),
+    "-x", "120",
+    "-y", "34",
+    "-c", dir,
+    `${shell} -lc ${JSON.stringify(command)}`,
+  );
+  // No green bar across the bottom: this is a terminal that happens to be run by tmux,
+  // not a tmux the user is being asked to operate.
+  await tmux("set-option", "-t", tmuxName(id), "status", "off").catch(() => {});
+  return id;
+});
+
+ipcMain.handle("claude-cli-alive", (_event, id) => tmuxAlive(id));
+
+/**
+ * Who the CLI will run as — read from its own `~/.claude.json`, identity only.
+ *
+ * Worth surfacing because the CLI and the Claude app keep SEPARATE logins, and nothing
+ * otherwise tells you when they have drifted apart: two accounts, two plans, and the only
+ * symptom is one of them behaving differently halfway through a session.
+ *
+ * It reports WHICH account and nothing more. An earlier version of this tried to work out
+ * whether that account could pay, by reading a cache key whose name looked like it meant
+ * something — it did not, and it said "no subscription" about a premium team seat. What
+ * an account is entitled to is the server's to know; guessing at it from local cache
+ * files produces confident nonsense. No token is read here and none is returned.
+ */
+ipcMain.handle("claude-account", () => {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(os.homedir(), ".claude.json"), "utf8"));
+    const account = raw.oauthAccount ?? {};
+    return {
+      email: String(account.emailAddress || ""),
+      org: String(account.organizationName || ""),
+      // Reported verbatim, not interpreted — it is the account's own word for its plan.
+      seat: String(account.seatTier || account.organizationType || ""),
+    };
+  } catch {
+    return { email: "", org: "", seat: "" };
+  }
+});
+
+/** Ends a session for good — the one thing closing a window deliberately does not do. */
+ipcMain.handle("claude-cli-kill", async (_event, id) => {
+  if (!(await tmuxAlive(id))) return false;
+  await tmux("kill-session", "-t", tmuxName(id));
+  return true;
+});
+
+/* ------------------------------------------------------------- the terminal window --- */
+
+/** Session id -> its window, so a second click raises the one already open. */
+const termWindows = new Map();
+/** webContents id -> the pty drawing into it, so closing one kills only that attach. */
+const termPtys = new Map();
+
+ipcMain.handle("claude-cli-window", async (_event, options) => {
+  const { id, title } = options ?? {};
+  if (!(await tmuxAlive(id))) throw new Error("that session is not running any more");
+
+  const existing = termWindows.get(id);
+  if (existing && !existing.isDestroyed()) {
+    existing.show();
+    existing.focus();
+    return true;
+  }
+
+  const win = new BrowserWindow({
+    width: 900,
+    height: 620,
+    title: String(title || "Claude"),
+    backgroundColor: "#1e1e1e",
+    autoHideMenuBar: true,
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      preload: path.join(__dirname, "preload.cjs"),
+    },
+  });
+  termWindows.set(id, win);
+  win.on("closed", () => {
+    if (termWindows.get(id) === win) termWindows.delete(id);
+  });
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:/.test(url)) void shell.openExternal(url);
+    return { action: "deny" };
+  });
+  // The session id rides in the hash: the terminal page asks for it back on load.
+  await win.loadURL(`app://-/terminal.html#${encodeURIComponent(id)}`);
+  return true;
+});
+
+/**
+ * Draws a running session into the window that asked. The pty runs `tmux attach` and
+ * nothing else — it is a viewport, and killing it detaches rather than ends.
+ */
+ipcMain.handle("term-attach", (event, options) => {
+  const { id, cols, rows } = options ?? {};
+  const bin = tmuxPath();
+  if (!bin) throw new Error("tmux is not installed");
+  const contentsId = event.sender.id;
+  termPtys.get(contentsId)?.kill();
+
+  const term = pty.spawn(bin, ["attach", "-t", tmuxName(id)], {
+    name: "xterm-256color",
+    cols: Math.max(20, Number(cols) || 120),
+    rows: Math.max(5, Number(rows) || 34),
+    cwd: os.homedir(),
+    env: termEnv(),
+  });
+  termPtys.set(contentsId, term);
+
+  term.onData((data) => {
+    if (!event.sender.isDestroyed()) event.sender.send("term-data", data);
+  });
+  term.onExit(() => {
+    termPtys.delete(contentsId);
+    if (!event.sender.isDestroyed()) event.sender.send("term-ended");
+  });
+  // The window going away detaches; the session carries on without a viewer.
+  event.sender.once("destroyed", () => {
+    termPtys.get(contentsId)?.kill();
+    termPtys.delete(contentsId);
+  });
+  return true;
+});
+
+ipcMain.on("term-input", (event, data) => {
+  termPtys.get(event.sender.id)?.write(String(data));
+});
+
+ipcMain.on("term-resize", (event, cols, rows) => {
+  try {
+    termPtys.get(event.sender.id)?.resize(Math.max(20, cols | 0), Math.max(5, rows | 0));
+  } catch {
+    /* the pty went away between the resize and the render */
+  }
 });
 
 /*
@@ -822,6 +1747,9 @@ ipcMain.handle("claude-status", (_event, ids) => {
 
 app.whenReady().then(() => {
   protocol.handle("app", serve);
+  if (process.platform === "darwin" && !app.isPackaged && fs.existsSync(DEV_ICON)) {
+    app.dock.setIcon(DEV_ICON);
+  }
   // Session-wide user agent for the gemini partition: every request — first page,
   // redirects, sign-in popups — reads as plain Chrome, or Google blocks the login.
   const gemini = session.fromPartition(GEMINI_PARTITION);

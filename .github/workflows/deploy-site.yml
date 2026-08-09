@@ -1,0 +1,64 @@
+name: Deploy site
+
+# The download page. Independent of the dmg pipeline: overwriting the installer
+# in GCS needs no redeploy, because nginx only holds redirects to fixed names.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - ".github/workflows/deploy-site.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-site
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest # no Apple toolchain needed here
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          project_id: cleveland-464404-m0
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy to Cloud Run
+        # --source builds site/Dockerfile through Cloud Build and pushes to the
+        # cloud-run-source-deploy Artifact Registry repo.
+        run: |
+          gcloud run deploy bedrock-site \
+            --source site \
+            --region europe-north1 \
+            --project cleveland-464404-m0 \
+            --allow-unauthenticated \
+            --port 8080 \
+            --quiet
+
+      - name: Check the redirects still resolve
+        run: |
+          set -euo pipefail
+          URL="$(gcloud run services describe bedrock-site \
+            --region europe-north1 --project cleveland-464404-m0 \
+            --format 'value(status.url)')"
+          echo "site: $URL" >> "$GITHUB_STEP_SUMMARY"
+
+          for target in mac windows; do
+            # A redirect to an object that 404s is the failure mode that matters:
+            # the page looks fine and the download is broken.
+            location="$(curl -sS -o /dev/null -w '%{redirect_url}' "$URL/download/$target")"
+            code="$(curl -sS -o /dev/null -w '%{http_code}' -I "$location")"
+            echo "$target -> $location [$code]" >> "$GITHUB_STEP_SUMMARY"
+            test "$code" = "200"
+          done

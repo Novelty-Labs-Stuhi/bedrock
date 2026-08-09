@@ -219,23 +219,77 @@ export class LocalIssues implements IssueSource {
   }
 }
 
+/** One GraphQL call against Linear, with the key added by whoever makes it. */
+export type LinearCall = (query: string, variables?: unknown) => Promise<unknown>;
+
+/** A team, as the settings window offers it: "ENG — Engineering". */
+export type Team = { id: string; key: string; name: string };
+
+/** A project inside one. Optional everywhere — plenty of teams file issues without one. */
+export type Project = { id: string; name: string };
+
+/** Where this vault files its issues. Empty ids mean "Linear's own first answer". */
+export type Filing = { team: string; project: string };
+
+export const NO_FILING: Filing = { team: "", project: "" };
+
+/**
+ * The teams the key can see. Read by the settings window and nowhere else — the writing
+ * side never asks, it is TOLD which team by the vault's config.
+ */
+export async function fetchTeams(call: LinearCall): Promise<Team[]> {
+  try {
+    const data = (await call(`query{teams(first:100){nodes{id key name}}}`)) as {
+      teams?: { nodes?: Team[] };
+    };
+    return data?.teams?.nodes ?? [];
+  } catch {
+    return [];
+  }
+}
+
+/** And the projects inside one — a team with none is a perfectly ordinary team. */
+export async function fetchProjects(call: LinearCall, teamId: string): Promise<Project[]> {
+  if (!teamId) return [];
+  try {
+    const data = (await call(`query($id:String!){team(id:$id){projects(first:100){nodes{id name}}}}`, {
+      id: teamId,
+    })) as { team?: { projects?: { nodes?: Project[] } } };
+    return data?.team?.projects?.nodes ?? [];
+  } catch {
+    return [];
+  }
+}
+
 /**
  * The real thing, over the desktop shell's bridge — the renderer never holds the API
  * key, it asks the shell to make the call and the shell adds the header. A browser tab
  * has no bridge (and no way past Linear's CORS), so there `connected` stays false and
  * the local source above takes over.
+ *
+ * `filing` is where this vault's issues go: a team, and optionally a project inside it.
+ * Unset means the first team the key can see, which is the right answer for the many
+ * people whose Linear has exactly one — and the wrong one for everybody else, which is
+ * why it is a setting rather than a rule.
  */
 export class LinearApi implements IssueSource {
   readonly connected = true;
   /** Team and workflow states, fetched once on the first write that needs them. */
   private team: Promise<{ id: string; states: Map<TickState, string> } | null> | null = null;
 
-  constructor(private call: (query: string, variables?: unknown) => Promise<unknown>) {}
+  constructor(
+    private call: LinearCall,
+    private filing: Filing = NO_FILING,
+  ) {}
 
   async create(title: string): Promise<Created | null> {
     const team = await this.resolveTeam();
     if (!team) return null;
-    return this.issueCreate({ title, teamId: team.id });
+    const input: Record<string, string> = { title, teamId: team.id };
+    // A project is the vault's choice, not the issue's: everything filed from here
+    // belongs to the same piece of work, which is what a project IS.
+    if (this.filing.project) input.projectId = this.filing.project;
+    return this.issueCreate(input);
   }
 
   async addRow(parent: Ref, title: string): Promise<Created | null> {
@@ -267,7 +321,7 @@ export class LinearApi implements IssueSource {
   }
 
   /**
-   * The one read in the whole integration: which team to file under, and which of its
+   * The one read in the whole writing path: which team to file under, and which of its
    * workflow states each tick means. Cached for the session — states change about as
    * often as a team renames its columns, and a restart re-reads them anyway.
    */
@@ -277,10 +331,23 @@ export class LinearApi implements IssueSource {
   }
 
   private async fetchTeam(): Promise<{ id: string; states: Map<TickState, string> } | null> {
-    const data = await this.send<{
-      teams?: { nodes?: Array<{ id: string; states?: { nodes?: Array<{ id: string; type: string }> } }> };
-    }>(`query{teams(first:1){nodes{id states{nodes{id type}}}}}`);
-    const team = data?.teams?.nodes?.[0];
+    const STATES = `id states{nodes{id type}}`;
+    // The chosen team by id, or Linear's own first if the vault has not chosen. A team
+    // that has since been deleted (or that this key can no longer see) answers null, and
+    // falls back to the first — better than a vault that quietly stops pushing.
+    const chosen = this.filing.team
+      ? await this.send<{ team?: { id: string; states?: { nodes?: Array<{ id: string; type: string }> } } }>(
+          `query($id:String!){team(id:$id){${STATES}}}`,
+          { id: this.filing.team },
+        )
+      : null;
+    let team = chosen?.team;
+    if (!team) {
+      const data = await this.send<{
+        teams?: { nodes?: Array<{ id: string; states?: { nodes?: Array<{ id: string; type: string }> } }> };
+      }>(`query{teams(first:1){nodes{${STATES}}}}`);
+      team = data?.teams?.nodes?.[0];
+    }
     if (!team) return null;
     const states = new Map<TickState, string>();
     for (const state of team.states?.nodes ?? []) {

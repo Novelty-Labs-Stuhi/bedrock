@@ -1,3 +1,10 @@
+/*
+ * The defaults, and the shape of the theme. Every one of these except the accent is
+ * rewritten at runtime from the canvas colour chosen in Settings → General (`themeOn` in
+ * settings.ts) — the ground is the theme, so a pale canvas brings the sidebar, the tabs
+ * and the editor with it. The values below are what the app looks like before anybody
+ * chooses, and what the derivation reproduces when nobody has.
+ */
 :root {
   --bg: #1e1e1e;
   --bg-side: #252526;
@@ -5,6 +12,15 @@
   --line: #37383b;
   --text: #dcddde;
   --muted: #8b8d90;
+  /* Chrome that sits above the ground: a button face, its hover, its pressed state, and
+     the two shades a selected row in the tree wears. */
+  --btn: #303134;
+  --btn-hover: #3c3d41;
+  --btn-on: #45464a;
+  --sel: #2c2d30;
+  --sel-strong: #35363a;
+  /* For the one row or button under the cursor, which has to beat ordinary text. */
+  --text-strong: #ffffff;
   --accent: #f92411; /* the cola compound demo's colour */
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
   font-size: 14px;
@@ -29,7 +45,7 @@ body {
 }
 
 button {
-  background: #303134;
+  background: var(--btn);
   color: var(--text);
   border: 1px solid var(--line);
   border-radius: 4px;
@@ -40,11 +56,34 @@ button {
 }
 
 button:hover {
-  background: #3c3d41;
+  background: var(--btn-hover);
 }
 
 .hidden {
   display: none !important;
+}
+
+/* --------------------------------------------------------- session window --- */
+/* terminal.html: one xterm filling the window, and a line for when it is over. */
+
+.term-body {
+  padding: 6px 8px;
+  background: var(--bg);
+}
+
+#term {
+  position: absolute;
+  inset: 6px 8px;
+}
+
+#term-ended {
+  position: absolute;
+  inset: auto 0 0 0;
+  padding: 6px 10px;
+  background: var(--bg-side);
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 12px;
 }
 
 /* ------------------------------------------------------------- sidebar --- */
@@ -72,8 +111,7 @@ button:hover {
 #sidebar.collapsed #tree,
 #sidebar.collapsed #vault-name,
 #sidebar.collapsed #open-folder,
-#sidebar.collapsed .side-foot,
-#sidebar.collapsed #settings-panel {
+#sidebar.collapsed .side-foot {
   display: none;
 }
 
@@ -180,12 +218,12 @@ body.resizing {
 }
 
 .item.active {
-  background: #35363a;
-  color: #fff;
+  background: var(--sel-strong);
+  color: var(--text-strong);
 }
 
 .item.selected {
-  background: #2c2d30;
+  background: var(--sel);
   box-shadow: inset 2px 0 0 var(--accent);
 }
 
@@ -217,8 +255,8 @@ button.twisty {
 }
 
 button.twisty:hover {
-  background: #45464a;
-  color: #fff;
+  background: var(--btn-on);
+  color: var(--text-strong);
 }
 
 /* Points right when shut, down when open — a glyph this small read as a dot. */
@@ -283,7 +321,7 @@ button.twisty:hover {
 }
 
 .actions button:hover {
-  color: #fff;
+  color: var(--text-strong);
   background: transparent;
 }
 
@@ -294,7 +332,7 @@ button.twisty:hover {
 }
 
 /* ------------------------------------------------------------- settings --- */
-/* The sidebar's foot: the ⚙ that opens the toggles, and the git button when it is on. */
+/* The sidebar's foot: the ⚙ that opens the settings window, where the integrations live. */
 
 .side-foot {
   display: flex;
@@ -310,30 +348,212 @@ button.twisty:hover {
 
 #settings.on {
   border-color: var(--accent);
-  color: #fff;
+  color: var(--text-strong);
 }
 
-/* Floats over the tree, anchored to the foot it opened from. */
-#settings-panel {
-  position: absolute;
-  left: 8px;
-  right: 8px;
-  bottom: 44px;
-  z-index: 4;
-  padding: 10px 12px 6px;
-  background: var(--bg-side);
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  box-shadow: 0 8px 28px rgb(0 0 0 / 45%);
+/* A window in the middle of the app — settings are about the whole of it, and a drawer
+   hanging off the sidebar could only ever be as wide as the sidebar. */
+#settings-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.5);
   font-size: 12px;
 }
 
-#settings-panel h4 {
-  margin: 0 0 6px;
-  font-size: 11px;
+#settings-modal.open {
+  display: flex;
+}
+
+.settings-card {
+  display: flex;
+  flex-direction: column;
+  width: min(560px, 92vw);
+  /* Tall enough to read a tab without scrolling, never taller than the window. */
+  max-height: min(620px, 86vh);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-side);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.55);
+}
+
+.settings-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px 10px;
+}
+
+.settings-head h3 {
+  margin: 0;
+  font-size: 14px;
   font-weight: 600;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+}
+
+.settings-close {
+  padding: 2px 8px;
+  border-color: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1;
+}
+
+.settings-close:hover {
+  border-color: var(--line);
+  color: var(--text);
+}
+
+/* The three kinds of question, as a strip of tabs under the title. */
+.settings-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.settings-tab {
+  padding: 7px 12px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: none;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.settings-tab:hover {
+  color: var(--text);
+}
+
+.settings-tab.on {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+.settings-body {
+  overflow-y: auto;
+  padding: 10px 16px 16px;
+}
+
+/* An integration and its own page, folded away under its switch. */
+.setup {
+  border-bottom: 1px solid var(--line);
+}
+
+.setup-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 4px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.setup-head:hover {
+  background: var(--bg-hover);
+}
+
+.setup-head input {
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.setup-name {
+  flex: 1;
+  min-width: 0;
+}
+
+.setup-name b {
+  display: block;
+  font-size: 12px;
+}
+
+.setup-name small {
+  display: block;
+  color: var(--muted);
+}
+
+/* The answer to "is this working?", which is the only thing worth saying while folded. */
+.setup-status {
+  flex: none;
+  color: #6b6f76;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.setup-status.ready {
+  color: #3fb950;
+}
+
+.setup-fold {
+  flex: none;
+  width: 12px;
+  text-align: center;
+  color: var(--muted);
+}
+
+/* Indented under the switch it belongs to, so a page never reads as a sibling of one. */
+.setup-body {
+  padding: 2px 4px 12px 26px;
+}
+
+.setup-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 0;
+}
+
+.setup-label {
+  flex: none;
+  width: 112px;
+  color: var(--muted);
+}
+
+.setup-value {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.setup-line > button {
+  flex: none;
+  padding: 2px 8px;
+  font-size: 11px;
+}
+
+.setup-choices {
+  display: flex;
+  flex: none;
+  gap: 4px;
+}
+
+.setup-choices .style-pick {
+  padding: 3px 9px;
+  font-size: 11px;
+}
+
+/* A colour question in General: what it is, what it means, then the palette. */
+.settings-look {
+  padding: 9px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.settings-look h5 {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.settings-look small {
+  display: block;
+  margin: 1px 0 7px;
   color: var(--muted);
 }
 
@@ -472,7 +692,7 @@ button.twisty:hover {
   font-weight: 600;
   line-height: 1;
   color: var(--text);
-  background: #303134;
+  background: var(--btn);
   border: 1px solid var(--line);
 }
 .help-btn:hover,
@@ -752,7 +972,7 @@ button.twisty:hover {
 }
 
 .cm-code {
-  background: #2b2c2f;
+  background: var(--bg-hover);
   border-radius: 3px;
   padding: 1px 3px;
 }
@@ -768,7 +988,7 @@ button.twisty:hover {
   max-width: 100%;
   height: auto;
   border-radius: 5px;
-  background: #2b2c2f;
+  background: var(--bg-hover);
 }
 
 .cm-embed-alone {
@@ -943,6 +1163,104 @@ button.twisty:hover {
 }
 
 .menu-item:hover {
+  background: var(--bg-hover);
+}
+
+/* -------------------------------------------------------------- node style --- */
+/* The panel a node opens for its own look. Same card as the menu it comes out of, wider,
+   and laid out as rows of swatches: what a note can look like is a thing to look at, so
+   the choices are the pictures themselves rather than a list of their names. */
+
+#style-pop {
+  position: fixed;
+  z-index: 60;
+  display: none;
+  flex-direction: column;
+  gap: 10px;
+  width: 268px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg-side);
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.5);
+}
+
+#style-pop.open {
+  display: flex;
+}
+
+.style-row h5 {
+  margin: 0 0 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* Nothing to colour until there is an animation to colour — greyed rather than gone, so
+   switching the animation on and off does not shuffle the panel under the cursor. */
+.style-row.off {
+  opacity: 0.35;
+  pointer-events: none;
+}
+
+.style-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.style-swatch {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background-color: var(--bg);
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: 62%;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+/* A sign is a cut, not a colour: black and white on whatever it is cut into. So its
+   swatch is a mid grey — the panel shows the engraving on something to engrave, the way
+   a node will wear it, rather than a black mark on a black button. */
+.style-swatch[data-sign]:not([data-sign=""]) {
+  background-color: #7f868f;
+}
+
+.style-swatch:hover {
+  border-color: var(--text);
+}
+
+/* The chosen one wears a ring held off the swatch itself, so a colour is never read
+   through a border drawn on top of it. */
+.style-swatch.on {
+  border-color: var(--bg-side);
+  box-shadow: 0 0 0 2px var(--text);
+}
+
+.style-pick {
+  padding: 5px 11px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.style-pick:hover {
+  border-color: var(--text);
+}
+
+.style-pick.on {
+  border-color: var(--text);
   background: var(--bg-hover);
 }
 
@@ -1351,17 +1669,21 @@ button.issue-id:hover {
   height: 1.2em;
 }
 
-/* An active note radiates: a faint green halo on its rim at all times, and one ring
-   travelling out of it every three seconds. The halo is what says "active" when the
-   canvas is glanced at between beats; the ring is what catches the eye across the room.
-   Both sit in the overlay, so the pulse keeps time without the canvas redrawing. */
+/* A pulsing note radiates: a faint halo on its rim at all times, and one ring travelling
+   out of it every three seconds. The halo is what says "active" when the canvas is
+   glanced at between beats; the ring is what catches the eye across the room. Both sit in
+   the overlay, so the pulse keeps time without the canvas redrawing.
+
+   The colour is the note's own — `drawPulses` sets `--pulse` on the element from what was
+   picked in the style panel, and green is what a note that never picked one gets. */
 .node-pulse {
   position: absolute;
   width: 20px;
   height: 20px;
-  border: 1.5px solid rgba(63, 185, 80, 0.5);
+  --pulse: #3fb950;
+  border: 1.5px solid color-mix(in srgb, var(--pulse) 50%, transparent);
   border-radius: 50%;
-  box-shadow: 0 0 8px rgba(63, 185, 80, 0.3);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--pulse) 30%, transparent);
   transform: translate(-50%, -50%);
   pointer-events: none;
 }
@@ -1370,7 +1692,7 @@ button.issue-id:hover {
   content: "";
   position: absolute;
   inset: -1.5px;
-  border: 2px solid #3fb950;
+  border: 2px solid var(--pulse);
   border-radius: 50%;
   /* Inherited, not declared: `drawPulses` sets the delay on the element itself so
      every ring on the canvas beats on the same clock. */
@@ -1401,13 +1723,28 @@ button.issue-id:hover {
   }
 }
 
-/* Corner grips: nothing is drawn, the cursor is the only sign they are there. */
+/* Corner grips: nothing is drawn, the cursor is the only sign they are there. Above the
+   fence strips, which they overlap at the four ends — the corner has to win there. */
 .frame-handle {
   position: absolute;
+  z-index: 2;
   width: 18px;
   height: 18px;
   margin: -9px 0 0 -9px;
   background: transparent;
+  pointer-events: auto;
+}
+
+/* The fence itself: four strips lying along a box's border, and the only place a folder
+   can be picked up from. Drawn nothing, like the corners — the box's own border is
+   already there to be aimed at, and the cursor says what will happen. Straddling the
+   line, so it can be grabbed from just outside the box as readily as from just in. */
+.frame-fence {
+  position: absolute;
+  z-index: 1;
+  margin: -5.5px 0 0 -5.5px;
+  background: transparent;
+  cursor: move;
   pointer-events: auto;
 }
 
@@ -1444,24 +1781,4 @@ button.issue-id:hover {
   width: 12px;
   height: 12px;
   vertical-align: -2px;
-}
-
-.tab-actions .toggle {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 12px;
-  color: var(--muted);
-  cursor: pointer;
-  user-select: none;
-}
-
-.tab-actions .toggle:hover {
-  color: var(--text);
-}
-
-.tab-actions .toggle input {
-  margin: 0;
-  accent-color: var(--accent);
-  cursor: pointer;
 }

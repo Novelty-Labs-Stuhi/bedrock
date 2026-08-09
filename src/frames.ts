@@ -11,6 +11,16 @@ import type { SpatialStore } from "./spatial";
 
 export type Frame = { w: number; h: number };
 
+/**
+ * A folder's own colours: the fill inside the box, and the fence around it. Empty strings
+ * are "whatever a folder normally looks like" — the blue the canvas gives every box — so
+ * that a folder styled back to nothing is stored as nothing rather than as the default
+ * spelled out, and follows the theme if the theme ever changes.
+ */
+export type FolderStyle = { bg: string; fence: string };
+
+export const NO_FOLDER_STYLE: FolderStyle = { bg: "", fence: "" };
+
 export const DEFAULT_FRAME: Frame = { w: 260, h: 170 };
 /** Breathing room between a note's circle and the frame's border. */
 const EDGE_GAP = 5;
@@ -41,6 +51,23 @@ export class FrameStore {
 
   set(folder: string, frame: Frame, user = false): void {
     this.store.setFrame(folder, { w: frame.w, h: frame.h, user: user || this.isPinned(folder) });
+  }
+
+  style(folder: string): FolderStyle {
+    const held = this.store.frame(folder);
+    return { bg: held?.bg ?? "", fence: held?.fence ?? "" };
+  }
+
+  /** Colours a folder, leaving its size and where it sits exactly as they were. */
+  setStyle(folder: string, style: FolderStyle): void {
+    const frame = this.get(folder);
+    this.store.setFrame(folder, {
+      w: frame.w,
+      h: frame.h,
+      user: this.isPinned(folder),
+      bg: style.bg,
+      fence: style.fence,
+    });
   }
 }
 

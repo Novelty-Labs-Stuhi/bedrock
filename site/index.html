@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Bedrock — the graph is the app</title>
+    <meta
+      name="description"
+      content="A markdown vault whose graph is the place you work — spatial, durable, plain files."
+    />
+    <link rel="icon" href="icon.png" />
+    <link rel="apple-touch-icon" href="icon.png" />
+    <meta property="og:title" content="Bedrock — the graph is the app" />
+    <meta
+      property="og:description"
+      content="A markdown vault whose graph is the place you work — spatial, durable, plain files."
+    />
+    <meta property="og:image" content="bg.jpg" />
+    <meta property="og:type" content="website" />
+    <style>
+      :root {
+        --ink: #16171b;
+        --muted: rgba(22, 23, 27, 0.64);
+        --faint: rgba(22, 23, 27, 0.5);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        min-height: 100dvh;
+        display: flex;
+        flex-direction: column;
+        color: var(--ink);
+        /* Also what shows while the backdrop is still loading. */
+        background: #eceef0;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      /*
+       * The backdrop is a screenshot of a real vault, blurred just far enough to stop
+       * competing with the words in front of it. `scale` overshoots the
+       * viewport because `filter: blur()` samples the transparency beyond an element's
+       * edges, which would otherwise fade the border into the page background.
+       */
+      .backdrop {
+        position: fixed;
+        inset: 0;
+        background: url("bg.jpg") center / cover no-repeat;
+        /* Barely there — enough to take the edge off the type in the screenshot,
+           not enough to stop it reading as a vault. No colour treatment: the tone
+           on screen is the tone the app actually has. */
+        filter: blur(4px);
+        transform: scale(1.02);
+      }
+
+      /* The backdrop is fixed and painted first; content sits above it. */
+      header, main { position: relative; z-index: 1; }
+
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1rem;
+        padding: 1.35rem clamp(1.1rem, 5vw, 3rem);
+      }
+
+      .wordmark {
+        color: var(--ink);
+        font-size: 1.05rem;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+        text-decoration: none;
+      }
+
+      nav a {
+        color: var(--muted);
+        font-size: 0.95rem;
+        font-weight: 500;
+        text-decoration: none;
+        padding: 0.5rem 0.85rem;
+        border-radius: 10px;
+        transition: color 0.15s ease, background 0.15s ease;
+      }
+
+      nav a:hover { color: var(--ink); background: rgba(22, 23, 27, 0.07); }
+
+      main {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        text-align: center;
+        padding: 1rem clamp(1.1rem, 5vw, 3rem) clamp(3rem, 11vh, 6.5rem);
+      }
+
+      .mark {
+        width: clamp(92px, 13vw, 132px);
+        height: auto;
+        filter: drop-shadow(0 16px 36px rgba(24, 22, 12, 0.28));
+      }
+
+      h1 {
+        margin: 1.7rem 0 0;
+        font-size: clamp(2.7rem, 8vw, 4.5rem);
+        font-weight: 600;
+        letter-spacing: -0.035em;
+        line-height: 1;
+      }
+
+      .tagline {
+        margin: 1.15rem 0 0;
+        max-width: 34ch;
+        font-size: clamp(1.02rem, 2.4vw, 1.2rem);
+        line-height: 1.55;
+        color: var(--muted);
+        text-wrap: balance;
+      }
+
+      /*
+       * Two ways in, given equal room. Only one of them is an installer: the dashed
+       * outline is what says "this one hands you a repo, not a download" without
+       * needing a sentence to explain itself.
+       */
+      .actions {
+        margin-top: 2.5rem;
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+        align-items: stretch;
+        gap: 0.9rem;
+      }
+
+      .btn {
+        /* A fixed basis rather than min-width: the two boxes match to the pixel
+           instead of each sizing itself to its own label. */
+        flex: 0 0 16rem;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        padding: 1rem 1.5rem;
+        /* Transparent on the solid button too, so both boxes measure the same. */
+        border: 1.5px dashed transparent;
+        border-radius: 14px;
+        font-size: 1.05rem;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+        text-decoration: none;
+        transition: transform 0.15s ease, box-shadow 0.15s ease, background 0.15s ease,
+          border-color 0.15s ease;
+      }
+
+      .btn:hover { transform: translateY(-2px); }
+      .btn:active { transform: translateY(0); }
+
+      .btn .sub { margin-top: 0.15rem; font-size: 0.76rem; font-weight: 500; opacity: 0.62; }
+
+      .btn--mac {
+        background: #17181c;
+        color: #fff;
+        box-shadow: 0 10px 26px rgba(20, 21, 28, 0.26);
+      }
+
+      .btn--mac:hover { box-shadow: 0 16px 36px rgba(20, 21, 28, 0.34); }
+      .btn--mac:active { box-shadow: 0 7px 18px rgba(20, 21, 28, 0.28); }
+
+      .btn--win { border-color: rgba(22, 23, 27, 0.42); color: var(--ink); }
+      .btn--win:hover { border-color: rgba(22, 23, 27, 0.72); background: rgba(22, 23, 27, 0.05); }
+
+      /* Once they stack, the installer belongs on top whatever the source order is. */
+      @media (max-width: 34rem) {
+        .btn { flex: 1 1 100%; }
+        .btn--mac { order: -1; }
+      }
+
+      .meta { margin: 1.05rem 0 0; font-size: 0.9rem; color: var(--muted); }
+
+      .note { margin: 0.55rem 0 0; max-width: 42ch; font-size: 0.8rem; line-height: 1.55; color: var(--faint); }
+
+      a:focus-visible, .download:focus-visible {
+        outline: 2px solid rgba(22, 23, 27, 0.75);
+        outline-offset: 3px;
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        * { transition: none !important; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="backdrop"></div>
+
+    <header>
+      <a class="wordmark" href="/">Bedrock</a>
+      <nav>
+        <a href="https://github.com/Novelty-Labs-Stuhi/bedrock" target="_blank" rel="noopener">GitHub</a>
+      </nav>
+    </header>
+
+    <main>
+      <img class="mark" src="icon.png" alt="" width="132" height="132" />
+      <h1>Bedrock</h1>
+      <p class="tagline">
+        A markdown vault whose graph is the place you work — spatial, durable, plain files.
+      </p>
+      <div class="actions">
+        <!-- No Windows installer is published: the repo, and building it, is the honest answer. -->
+        <a
+          class="btn btn--win"
+          href="https://github.com/Novelty-Labs-Stuhi/bedrock"
+          target="_blank"
+          rel="noopener"
+        >
+          Download for Windows
+          <span class="sub">(cli)</span>
+        </a>
+        <!-- Through the site, not straight to the bucket: the redirect is the download counter. -->
+        <a class="btn btn--mac" href="/download/mac">Download for Mac</a>
+      </div>
+      <p class="meta">macOS · Apple Silicon</p>
+      <p class="note">
+        Unsigned build. On first launch, open System Settings › Privacy &amp; Security and click
+        Open Anyway.
+      </p>
+    </main>
+  </body>
+</html>
