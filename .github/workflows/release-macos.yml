@@ -56,7 +56,19 @@ jobs:
           # Throwaway keychain, throwaway password — both die with the runner.
           KEYCHAIN_PASSWORD="$(uuidgen)"
 
+          # An empty secret decodes to an empty file and surfaces four lines later
+          # as "SecKeychainItemImport: parameters not valid", which says nothing
+          # about the real cause. Fail here instead.
+          test -n "$CERT_P12_BASE64" || {
+            echo "::error::APPLE_CERT_P12_BASE64 is empty — the secret was never set, or was set from an empty pipe"
+            exit 1
+          }
           echo "$CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          size="$(wc -c < "$RUNNER_TEMP/cert.p12")"
+          test "$size" -gt 1000 || {
+            echo "::error::decoded p12 is only ${size} bytes — the secret is truncated or not a p12"
+            exit 1
+          }
 
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           security set-keychain-settings -lut 21600 "$KEYCHAIN"
