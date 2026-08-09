@@ -32,7 +32,7 @@ import {
 } from "./links";
 import { NO_FENCE, PULSE_DEFAULT, paint, signIcon } from "./node-style";
 import { ancestors, basename, dirname, noteName } from "./vault";
-import type { SettingsStore } from "./settings";
+import { canvasHex, inkOn, type Look, type SettingsStore } from "./settings";
 import type { SpatialStore } from "./spatial";
 import { type Sticky, type StickyStore } from "./sticky";
 import {
@@ -391,253 +391,273 @@ const typeShapeStyles = (): cytoscape.StylesheetJson =>
 /** First web link in a conversation note — what a click on its node opens. */
 const URL_RE = /https?:\/\/[^\s)\]>]+/;
 
-/** demo-compound.html's style, plus labels (a note graph is unusable without them). */
-const STYLE: cytoscape.StylesheetJson = [
-  {
-    selector: "node",
-    style: {
-      "background-color": "#f92411",
-      label: "data(label)",
-      color: "#dcddde",
-      "font-size": 10,
-      "text-valign": "center",
-      "text-halign": "right",
-      "text-margin-x": 4,
-      "min-zoomed-font-size": 8,
-      width: 20,
-      height: 20,
+/**
+ * demo-compound.html's style, plus labels (a note graph is unusable without them).
+ *
+ * A function rather than a constant, because four of its colours are the vault's to choose
+ * (Settings → General): the ground, and what a note, a link and a folder look like before
+ * anything says otherwise. Everything a note or folder chose FOR ITSELF still overrules
+ * this, further down the sheet — a default is where you start, not what you get.
+ *
+ * The ink follows the ground rather than being picked: labels have to stay readable on a
+ * pale canvas, and nobody should have to choose a text colour to get that.
+ */
+function styleSheet(look: Look): cytoscape.StylesheetJson {
+  const ground = canvasHex(look.bg);
+  const ink = inkOn(ground);
+  const nodeHex = paint(look.node) || UNTAGGED;
+  const edgeHex = paint(look.edge) || UNTAGGED;
+  const folderHex = paint(look.folder) || BOX;
+  return [
+    {
+      selector: "node",
+      style: {
+        "background-color": nodeHex,
+        label: "data(label)",
+        color: ink,
+        "font-size": 10,
+        "text-valign": "center",
+        "text-halign": "right",
+        "text-margin-x": 4,
+        "min-zoomed-font-size": 8,
+        width: 20,
+        height: 20,
+      },
     },
-  },
-  // Sized by incoming links (`nodeSize`), coloured by its tags (`pieData`).
-  {
-    selector: 'node[kind = "file"]',
-    style: { width: "data(size)", height: "data(size)", ...pieStyle() },
-  },
-  // Typed notes wear their type — a Gemini conversation is the Gemini icon.
-  ...typeShapeStyles(),
-  /*
-   * A note's own look, chosen on the canvas (right-click → "Style…") and kept in its
-   * markdown. Above the type styles, so a chosen colour or sign beats the one a type
-   * would have given it — the note was styled by hand, and by hand wins — and below the
-   * ghost, which is a statement about the note rather than a decoration on it.
-   *
-   * `[?key]` — has a truthy value — and never `[key != ""]`, which also matches every
-   * node that has no such key at all, and paints the whole graph with an undefined.
-   *
-   * A colour of its own replaces the tag pie: a note cannot be two colours at once, and
-   * whoever painted it meant that colour rather than the ones its tags worked out to.
-   */
-  {
-    selector: "node[?scolour]",
-    style: { "background-color": "data(scolour)", "background-opacity": 1, "pie-size": "0%" },
-  },
-  // The sign is engraved on the node, not fitted to it: a fraction of the circle, centred,
-  // with the node's colour left showing all round it.
-  {
-    selector: "node[?sign]",
-    style: {
-      "background-image": "data(sign)",
-      "background-fit": "none",
-      "background-width": "58%",
-      "background-height": "58%",
-      "background-position-x": "50%",
-      "background-position-y": "50%",
-      "background-image-opacity": 1,
-      "background-opacity": 1,
+    // Sized by incoming links (`nodeSize`), coloured by its tags (`pieData`).
+    {
+      selector: 'node[kind = "file"]',
+      style: { width: "data(size)", height: "data(size)", ...pieStyle() },
     },
-  },
-  {
-    selector: "node:parent",
-    style: {
-      "background-color": BOX,
-      // Almost see-through: the box is a boundary, and whatever it sits on top of
-      // (another box, an edge passing under) has to stay readable through it.
-      "background-opacity": 0.07,
-      "border-width": 1.5,
-      "border-color": BOX,
-      "border-opacity": 0.9,
-      "text-valign": "top",
-      "text-halign": "center",
-      "text-margin-x": 0,
-      "text-margin-y": -4,
-      "font-size": 12,
-      color: BOX,
-      // No padding: the drawn border then sits exactly on the frame's corner anchors,
-      // so where the box looks like it ends is where a note actually stops.
-      padding: "0px",
-      // A note's label hangs off its right side. Counted towards the parent's size it
-      // would shove the border outwards as soon as a note was dragged near the edge —
-      // the frame is the anchors, and only the anchors.
-      "compound-sizing-wrt-labels": "exclude",
-      /*
-       * A box is not something the mouse can land on at all: it is a boundary drawn
-       * round notes, and the ground inside it belongs to the canvas. So a drag started
-       * in the middle of a folder pans the view exactly as it would out in the open, and
-       * a rectangle can be drawn from inside one — navigation is never fenced in by a
-       * folder that happens to be under the cursor.
-       *
-       * What the box still answers to is all elsewhere: the fence strips and corner
-       * grips are in the overlay above the canvas (`drawHandles`), and every question of
-       * the form "which folder is this point in?" is answered from the frames themselves
-       * (`folderAt`) rather than by asking cytoscape what was hit.
-       */
-      events: "no",
+    // Typed notes wear their type — a Gemini conversation is the Gemini icon.
+    ...typeShapeStyles(),
+    /*
+     * A note's own look, chosen on the canvas (right-click → "Style…") and kept in its
+     * markdown. Above the type styles, so a chosen colour or sign beats the one a type
+     * would have given it — the note was styled by hand, and by hand wins — and below the
+     * ghost, which is a statement about the note rather than a decoration on it.
+     *
+     * `[?key]` — has a truthy value — and never `[key != ""]`, which also matches every
+     * node that has no such key at all, and paints the whole graph with an undefined.
+     *
+     * A colour of its own replaces the tag pie: a note cannot be two colours at once, and
+     * whoever painted it meant that colour rather than the ones its tags worked out to.
+     */
+    {
+      selector: "node[?scolour]",
+      style: { "background-color": "data(scolour)", "background-opacity": 1, "pie-size": "0%" },
     },
-  },
-  /*
-   * A folder's own two colours, when it has been given them (right-click a box → "Style
-   * folder…"). After the rule above, because they overrule it — a coloured box is still
-   * a box in every other respect. The fill is lifted a little off the 7% every box gets:
-   * a hue chosen on purpose should read as chosen, while still letting what is under the
-   * box show through it. The fence can also be taken off altogether, leaving a patch of
-   * coloured ground with a name on it — a grouping that is felt rather than drawn.
-   *
-   * The label is painted last and on its own key (`flabel`), because which colour it
-   * should take depends: normally the fence's, so a box does not read as two things at
-   * once, but the fill's when there is no fence to follow.
-   */
-  {
-    selector: "node[?fbg]",
-    style: { "background-color": "data(fbg)", "background-opacity": 0.13 },
-  },
-  { selector: "node[?ffence]", style: { "border-color": "data(ffence)" } },
-  { selector: "node[?fenceoff]", style: { "border-width": 0 } },
-  { selector: "node[?flabel]", style: { color: "data(flabel)" } },
-  /*
-   * A link has a direction — the note that points and the note pointed at — and a bare line
-   * says nothing about which is which. So every edge carries a head at its target end.
-   *
-   * Cytoscape scales an arrow with the line it sits on, so a 1px edge draws an arrowhead too
-   * small to read a direction from; the line is a shade thicker and the arrow is scaled up
-   * past it. `target-distance-from-node` holds the point clear of the circle instead of
-   * letting it disappear into the fill.
-   */
-  {
-    selector: "edge",
-    style: {
-      "line-color": "#f92411",
-      width: 1.4,
-      "curve-style": "bezier",
-      "target-arrow-shape": "triangle",
-      "target-arrow-color": "#f92411",
-      "arrow-scale": 1.3,
-      "target-distance-from-node": 2,
+    // The sign is engraved on the node, not fitted to it: a fraction of the circle, centred,
+    // with the node's colour left showing all round it.
+    {
+      selector: "node[?sign]",
+      style: {
+        "background-image": "data(sign)",
+        "background-fit": "none",
+        "background-width": "58%",
+        "background-height": "58%",
+        "background-position-x": "50%",
+        "background-position-y": "50%",
+        "background-image-opacity": 1,
+        "background-opacity": 1,
+      },
     },
-  },
-  // A connection that owns a note is drawn as a thicker line: the vault's documented
-  // flows are then legible as a shape, the same way `nodeSize` makes its hubs one. The
-  // arrow already grows with the line, so it is scaled back to stay in proportion.
-  { selector: "edge[described]", style: { width: 3, "arrow-scale": 1.1 } },
-  // A named connection writes its relation along the line, rotated with it and backed by the
-  // canvas colour so it stays readable where it crosses other edges.
-  {
-    selector: "edge[label]",
-    style: {
-      label: "data(label)",
-      "font-size": 9,
-      color: "#dcddde",
-      "text-rotation": "autorotate",
-      "text-background-color": "#1e1f22",
-      "text-background-opacity": 0.85,
-      "text-background-padding": "2px",
-      "text-background-shape": "roundrectangle",
+    {
+      selector: "node:parent",
+      style: {
+        "background-color": folderHex,
+        // Almost see-through: the box is a boundary, and whatever it sits on top of
+        // (another box, an edge passing under) has to stay readable through it.
+        "background-opacity": 0.07,
+        // The fence can be off for the whole vault, which leaves the fill and the name —
+        // a grouping felt rather than drawn. A folder that chose a fence colour still gets
+        // its line, below: choosing one is asking for one.
+        "border-width": look.fence ? 1.5 : 0,
+        "border-color": folderHex,
+        "border-opacity": 0.9,
+        "text-valign": "top",
+        "text-halign": "center",
+        "text-margin-x": 0,
+        "text-margin-y": -4,
+        "font-size": 12,
+        color: folderHex,
+        // No padding: the drawn border then sits exactly on the frame's corner anchors,
+        // so where the box looks like it ends is where a note actually stops.
+        padding: "0px",
+        // A note's label hangs off its right side. Counted towards the parent's size it
+        // would shove the border outwards as soon as a note was dragged near the edge —
+        // the frame is the anchors, and only the anchors.
+        "compound-sizing-wrt-labels": "exclude",
+        /*
+         * A box is not something the mouse can land on at all: it is a boundary drawn
+         * round notes, and the ground inside it belongs to the canvas. So a drag started
+         * in the middle of a folder pans the view exactly as it would out in the open, and
+         * a rectangle can be drawn from inside one — navigation is never fenced in by a
+         * folder that happens to be under the cursor.
+         *
+         * What the box still answers to is all elsewhere: the fence strips and corner
+         * grips are in the overlay above the canvas (`drawHandles`), and every question of
+         * the form "which folder is this point in?" is answered from the frames themselves
+         * (`folderAt`) rather than by asking cytoscape what was hit.
+         */
+        events: "no",
+      },
     },
-  },
-  /*
-   * The marks a right-click can put on things (see `applyMarks`). A ghost is parked, not
-   * gone: the node turns grey and wears the ghost itself, ringed by long dashes — long
-   * on purpose, a dash you can read from across the canvas where a dot is just fuzz.
-   * The edge version is the same statement drawn along a line. A radiating edge is the
-   * line counterpart of a radiating note — the same green, with `syncEdgeBeat` walking
-   * the dashes along it so the flow reads as flowing.
-   */
-  {
-    selector: "node.ghost",
-    style: {
-      "pie-size": "0%",
-      "background-color": GHOST_GREY,
-      "background-opacity": 1,
-      "background-image": GHOST_ICON,
-      "background-image-opacity": 1,
-      "background-fit": "none",
-      "background-width": "74%",
-      "background-height": "74%",
-      "border-width": 2,
-      "border-color": "#8b949e",
-      "border-style": "dashed",
-      "border-dash-pattern": [9, 6],
-      color: "#8b949e",
+    /*
+     * A folder's own two colours, when it has been given them (right-click a box → "Style
+     * folder…"). After the rule above, because they overrule it — a coloured box is still
+     * a box in every other respect. The fill is lifted a little off the 7% every box gets:
+     * a hue chosen on purpose should read as chosen, while still letting what is under the
+     * box show through it. The fence can also be taken off altogether, leaving a patch of
+     * coloured ground with a name on it — a grouping that is felt rather than drawn.
+     *
+     * The label is painted last and on its own key (`flabel`), because which colour it
+     * should take depends: normally the fence's, so a box does not read as two things at
+     * once, but the fill's when there is no fence to follow.
+     */
+    {
+      selector: "node[?fbg]",
+      style: { "background-color": "data(fbg)", "background-opacity": 0.13 },
     },
-  },
-  {
-    selector: "edge.ghost",
-    style: {
-      "line-style": "dashed",
-      "line-dash-pattern": [12, 8],
-      "line-color": "#6e7681",
-      "target-arrow-color": "#6e7681",
+    { selector: "node[?ffence]", style: { "border-color": "data(ffence)", "border-width": 1.5 } },
+    { selector: "node[?fenceoff]", style: { "border-width": 0 } },
+    { selector: "node[?flabel]", style: { color: "data(flabel)" } },
+    /*
+     * A link has a direction — the note that points and the note pointed at — and a bare line
+     * says nothing about which is which. So every edge carries a head at its target end.
+     *
+     * Cytoscape scales an arrow with the line it sits on, so a 1px edge draws an arrowhead too
+     * small to read a direction from; the line is a shade thicker and the arrow is scaled up
+     * past it. `target-distance-from-node` holds the point clear of the circle instead of
+     * letting it disappear into the fill.
+     */
+    {
+      selector: "edge",
+      style: {
+        "line-color": edgeHex,
+        width: 1.4,
+        "curve-style": "bezier",
+        "target-arrow-shape": "triangle",
+        "target-arrow-color": edgeHex,
+        "arrow-scale": 1.3,
+        "target-distance-from-node": 2,
+      },
     },
-  },
-  {
-    selector: "edge.radiate",
-    style: {
-      "line-style": "dashed",
-      "line-dash-pattern": [7, 5],
-      "line-color": "#3fb950",
-      "target-arrow-color": "#3fb950",
+    // A connection that owns a note is drawn as a thicker line: the vault's documented
+    // flows are then legible as a shape, the same way `nodeSize` makes its hubs one. The
+    // arrow already grows with the line, so it is scaled back to stay in proportion.
+    { selector: "edge[described]", style: { width: 3, "arrow-scale": 1.1 } },
+    // A named connection writes its relation along the line, rotated with it and backed by the
+    // canvas colour so it stays readable where it crosses other edges.
+    {
+      selector: "edge[label]",
+      style: {
+        label: "data(label)",
+        "font-size": 9,
+        color: ink,
+        "text-rotation": "autorotate",
+        "text-background-color": ground,
+        "text-background-opacity": 0.85,
+        "text-background-padding": "2px",
+        "text-background-shape": "roundrectangle",
+      },
     },
-  },
-  { selector: "node.active", style: { "border-width": 3, "border-color": "#dcddde" } },
-  { selector: ".faded", style: { opacity: 0.25 } },
-  // The arrow is recoloured with the line everywhere, or a highlighted edge keeps a red
-  // head that reads as a different edge crossing it.
-  {
-    selector: ".highlight",
-    style: { "line-color": "#ffffff", "target-arrow-color": "#ffffff", width: 2, "arrow-scale": 1.3 },
-  },
-  // The connection whose note is the open tab — the edge's answer to the node's ring.
-  {
-    selector: "edge.active",
-    style: { "line-color": "#dcddde", "target-arrow-color": "#dcddde", width: 3, "arrow-scale": 1.1 },
-  },
-  // The link being drawn: an invisible cursor-following node plus an arrow to it.
-  {
-    selector: "node.draft",
-    style: { width: 1, height: 1, "background-opacity": 0, label: "", events: "no" },
-  },
-  {
-    selector: "edge.draft",
-    style: {
-      "line-color": "#ffffff",
-      "line-style": "dashed",
-      width: 2,
-      "target-arrow-shape": "triangle",
-      "target-arrow-color": "#ffffff",
-      "curve-style": "straight",
-      events: "no",
+    /*
+     * The marks a right-click can put on things (see `applyMarks`). A ghost is parked, not
+     * gone: the node turns grey and wears the ghost itself, ringed by long dashes — long
+     * on purpose, a dash you can read from across the canvas where a dot is just fuzz.
+     * The edge version is the same statement drawn along a line. A radiating edge is the
+     * line counterpart of a radiating note — the same green, with `syncEdgeBeat` walking
+     * the dashes along it so the flow reads as flowing.
+     */
+    {
+      selector: "node.ghost",
+      style: {
+        "pie-size": "0%",
+        "background-color": GHOST_GREY,
+        "background-opacity": 1,
+        "background-image": GHOST_ICON,
+        "background-image-opacity": 1,
+        "background-fit": "none",
+        "background-width": "74%",
+        "background-height": "74%",
+        "border-width": 2,
+        "border-color": "#8b949e",
+        "border-style": "dashed",
+        "border-dash-pattern": [9, 6],
+        color: "#8b949e",
+      },
     },
-  },
-  { selector: "node.draft-source", style: { "border-width": 3, "border-color": "#ffffff" } },
-  // Folder box under a dragged note: dashed while resisting, solid once armed.
-  {
-    selector: "node.drop-hover",
-    style: { "border-width": 2, "border-color": "#ffffff", "border-style": "dashed" },
-  },
-  {
-    selector: "node.drop-armed",
-    style: { "border-width": 3, "border-color": "#ffffff", "background-opacity": 0.22 },
-  },
-  // Leaving a folder reads differently from entering one.
-  {
-    selector: "node.drop-leaving",
-    style: { "border-width": 3, "border-color": "#ffd166", "border-style": "dashed" },
-  },
-  // The invisible corner children that hold a folder box at a constant size.
-  {
-    selector: "node.frame-anchor",
-    style: { width: 1, height: 1, "background-opacity": 0, label: "", events: "no" },
-  },
-];
+    {
+      selector: "edge.ghost",
+      style: {
+        "line-style": "dashed",
+        "line-dash-pattern": [12, 8],
+        "line-color": "#6e7681",
+        "target-arrow-color": "#6e7681",
+      },
+    },
+    {
+      selector: "edge.radiate",
+      style: {
+        "line-style": "dashed",
+        "line-dash-pattern": [7, 5],
+        "line-color": "#3fb950",
+        "target-arrow-color": "#3fb950",
+      },
+    },
+    { selector: "node.active", style: { "border-width": 3, "border-color": ink } },
+    { selector: ".faded", style: { opacity: 0.25 } },
+    // The arrow is recoloured with the line everywhere, or a highlighted edge keeps a red
+    // head that reads as a different edge crossing it.
+    {
+      selector: ".highlight",
+      style: { "line-color": ink, "target-arrow-color": ink, width: 2, "arrow-scale": 1.3 },
+    },
+    // The connection whose note is the open tab — the edge's answer to the node's ring.
+    {
+      selector: "edge.active",
+      style: { "line-color": ink, "target-arrow-color": ink, width: 3, "arrow-scale": 1.1 },
+    },
+    // The link being drawn: an invisible cursor-following node plus an arrow to it.
+    {
+      selector: "node.draft",
+      style: { width: 1, height: 1, "background-opacity": 0, label: "", events: "no" },
+    },
+    {
+      selector: "edge.draft",
+      style: {
+        "line-color": ink,
+        "line-style": "dashed",
+        width: 2,
+        "target-arrow-shape": "triangle",
+        "target-arrow-color": ink,
+        "curve-style": "straight",
+        events: "no",
+      },
+    },
+    { selector: "node.draft-source", style: { "border-width": 3, "border-color": ink } },
+    // Folder box under a dragged note: dashed while resisting, solid once armed.
+    {
+      selector: "node.drop-hover",
+      style: { "border-width": 2, "border-color": ink, "border-style": "dashed" },
+    },
+    {
+      selector: "node.drop-armed",
+      style: { "border-width": 3, "border-color": ink, "background-opacity": 0.22 },
+    },
+    // Leaving a folder reads differently from entering one.
+    {
+      selector: "node.drop-leaving",
+      style: { "border-width": 3, "border-color": "#ffd166", "border-style": "dashed" },
+    },
+    // The invisible corner children that hold a folder box at a constant size.
+    {
+      selector: "node.frame-anchor",
+      style: { width: 1, height: 1, "background-opacity": 0, label: "", events: "no" },
+    },
+  ];
+}
 
 /* ------------------------------------------------------------------- marks --- */
 
@@ -1335,12 +1355,28 @@ export class GraphView {
 
   private build(docs: Doc[], active: string | null, described: ReadonlySet<string>): void {
     this.cy?.destroy();
+    this.container.style.background = canvasHex(this.settings.look().bg);
     this.cy = cytoscape({
       container: this.container,
       elements: buildElements(docs, described),
-      style: STYLE,
+      style: styleSheet(this.settings.look()),
       layout: LAYOUT,
       wheelSensitivity: 0.2,
+      /*
+       * Draw at twice the screen's own resolution, whatever it says that is.
+       *
+       * Cytoscape otherwise takes `devicePixelRatio` at its word, and a display reporting
+       * 1 — a plain monitor, or a Mac in a scaled mode, where the window is rendered at
+       * one size and resampled to another — gets one canvas pixel per CSS pixel. Native
+       * text stays crisp through that because the OS re-renders it; a canvas cannot, so
+       * the graph alone goes soft. Supersampling puts the detail back: circles, 10px
+       * labels and the engraved signs are rasterised at 2× and scaled down.
+       *
+       * A retina display already gets 2 and is left alone. The cost is four times the
+       * fill area per frame, which this graph can afford — there is no simulation running
+       * behind it, and a repaint only happens when something actually moves.
+       */
+      pixelRatio: Math.max(2, window.devicePixelRatio || 1),
       // Nothing consumes cytoscape's own selection, and its shift+drag box would
       // fight the group tool's rectangle.
       boxSelectionEnabled: false,
@@ -2078,6 +2114,21 @@ export class GraphView {
   /** Re-applies the feature toggles to everything drawn above the canvas. */
   refreshOverlay(): void {
     this.applyMarks(); // the marks follow the same toggle as the pulses
+    this.drawOverlay();
+  }
+
+  /**
+   * Re-paints the canvas in the vault's chosen colours (Settings → General). A restyle
+   * rather than a rebuild: nothing about WHICH notes are on screen or where they sit has
+   * changed, and a rebuild would throw away the arrangement to put it straight back.
+   */
+  applyLook(): void {
+    const look = this.settings.look();
+    this.container.style.background = canvasHex(look.bg);
+    this.cy?.style(styleSheet(look));
+    // The folders' own colours are painted onto node data, which the new sheet reads —
+    // and the badges sit on top of the canvas rather than in it.
+    this.paintFolders();
     this.drawOverlay();
   }
 

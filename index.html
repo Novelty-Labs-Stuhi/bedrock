@@ -21,10 +21,8 @@
         <div id="crumb">/</div>
         <nav id="tree"></nav>
         <div class="side-foot">
-          <button id="git-commit" class="hidden" title="Stage everything and commit, in the vault's folder">⎇ Commit</button>
-          <button id="settings" title="Integrations on and off">⚙ Settings</button>
+          <button id="settings" title="Settings">⚙ Settings</button>
         </div>
-        <div id="settings-panel" class="hidden"></div>
       </aside>
       <div id="side-resize" title="Drag to resize the sidebar"></div>
 
@@ -64,6 +62,10 @@
         <div id="help-panel" class="help-panel hidden"></div>
       </main>
     </div>
+
+    <!-- Settings is a window, not a drawer: it is about the whole app, so it opens in
+         the middle of the whole app rather than hanging off the sidebar that opened it. -->
+    <div id="settings-modal"></div>
 
     <script type="module" src="/src/main.ts"></script>
   </body>

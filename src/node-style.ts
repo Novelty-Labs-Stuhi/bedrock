@@ -186,26 +186,48 @@ const swatch = (selected: boolean, extra = ""): string =>
   `class="style-swatch${selected ? " on" : ""}"${extra}`;
 
 /**
- * A row of the palette. The first swatch is what the thing looks like when it has been
- * given no colour of its own; `off`, where there is one, is the swatch that takes the
- * thing away entirely rather than colouring it.
+ * A row of swatches, each of which writes `data-<field>` when clicked. The first is what
+ * the thing looks like when it has been given no colour of its own; `off`, where there is
+ * one, is the swatch that takes the thing away entirely rather than colouring it.
+ *
+ * `options` is the palette to offer — the notes' ten by default, but the settings window
+ * asks the same question about a canvas background, which wants grounds rather than hues.
  */
+export const swatchRow = (
+  field: string,
+  chosen: string,
+  none: { title: string; fill?: string },
+  extra: {
+    options?: Array<{ key: string; name: string; hex: string }>;
+    off?: { value: string; title: string };
+  } = {},
+): string => {
+  const { options = COLOURS, off } = extra;
+  return (
+    `<div class="style-grid">` +
+    `<button ${swatch(!chosen, ` data-${field}="" title="${none.title}"`)}` +
+    (none.fill ? ` style="background:${none.fill}"></button>` : `>∅</button>`) +
+    (off
+      ? `<button ${swatch(chosen === off.value, ` data-${field}="${off.value}" title="${off.title}"`)}>∅</button>`
+      : "") +
+    options
+      .map(
+        (colour) =>
+          `<button ${swatch(chosen === colour.key, ` data-${field}="${colour.key}" title="${colour.name}"`)}` +
+          ` style="background:${colour.hex}"></button>`,
+      )
+      .join("") +
+    `</div>`
+  );
+};
+
+/** The notes' own palette, which is what every picker in this file asks about. */
 const colours = (
   field: string,
   chosen: string,
   none: { title: string; fill?: string },
   off?: { value: string; title: string },
-): string =>
-  `<div class="style-grid">` +
-  `<button ${swatch(!chosen, ` data-${field}="" title="${none.title}"`)}` +
-  (none.fill ? ` style="background:${none.fill}"></button>` : `>∅</button>`) +
-  (off ? `<button ${swatch(chosen === off.value, ` data-${field}="${off.value}" title="${off.title}"`)}>∅</button>` : "") +
-  COLOURS.map(
-    (colour) =>
-      `<button ${swatch(chosen === colour.key, ` data-${field}="${colour.key}" title="${colour.name}"`)}` +
-      ` style="background:${colour.hex}"></button>`,
-  ).join("") +
-  `</div>`;
+): string => swatchRow(field, chosen, none, { off });
 
 /**
  * Opens the panel at the cursor and keeps it there until Esc or a click outside. `build`

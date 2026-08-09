@@ -12,9 +12,15 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("bedrock", {
   gitCommit: (root) => ipcRenderer.invoke("git-commit", root),
+  gitPush: (root, remote) => ipcRenderer.invoke("git-push", root, remote),
+  gitPull: (root, remote) => ipcRenderer.invoke("git-pull", root, remote),
+  gitStatus: (root) => ipcRenderer.invoke("git-status", root),
   pickPath: (kind) => ipcRenderer.invoke("fs-pick", kind),
   openPath: (target) => ipcRenderer.invoke("fs-open", target),
   geminiChat: (url) => ipcRenderer.invoke("gemini-chat", url),
+  geminiStatus: () => ipcRenderer.invoke("gemini-status"),
+  geminiSignIn: () => ipcRenderer.invoke("gemini-signin"),
+  geminiForget: () => ipcRenderer.invoke("gemini-forget"),
   webPage: (url) => ipcRenderer.invoke("web-page", url),
   claudeFolder: () => ipcRenderer.invoke("claude-folder"),
   claudeFolders: (limit) => ipcRenderer.invoke("claude-folders", limit),
@@ -27,4 +33,21 @@ contextBridge.exposeInMainWorld("bedrock", {
   linearStatus: () => ipcRenderer.invoke("linear-status"),
   linearForget: () => ipcRenderer.invoke("linear-forget"),
   linearCall: (query, variables) => ipcRenderer.invoke("linear-call", query, variables),
+
+  // Sessions run by the CLI, under tmux. `termStatus` is what the settings window gates
+  // the whole mode on; the rest is the window that draws one.
+  termStatus: () => ipcRenderer.invoke("term-status"),
+  termInstall: () => ipcRenderer.invoke("term-install"),
+  claudeCliStart: (folder, resume) => ipcRenderer.invoke("claude-cli-start", folder, resume),
+  claudeCliAlive: (id) => ipcRenderer.invoke("claude-cli-alive", id),
+  claudeAccount: () => ipcRenderer.invoke("claude-account"),
+  claudeCliKill: (id) => ipcRenderer.invoke("claude-cli-kill", id),
+  claudeCliWindow: (options) => ipcRenderer.invoke("claude-cli-window", options),
+
+  // Used only by terminal.html: the pty's two directions, plus its size.
+  termAttach: (options) => ipcRenderer.invoke("term-attach", options),
+  termInput: (data) => ipcRenderer.send("term-input", data),
+  termResize: (cols, rows) => ipcRenderer.send("term-resize", cols, rows),
+  onTermData: (fn) => ipcRenderer.on("term-data", (_e, data) => fn(data)),
+  onTermEnded: (fn) => ipcRenderer.on("term-ended", () => fn()),
 });

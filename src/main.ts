@@ -16,7 +16,15 @@ import { askChoice, askConfirm, askText } from "./dialog";
 import { EDGE_DIR, edgeNotePath, edgeNoteTemplate, edgeTitle, isEdgeNote, renamedEdgeNote } from "./edges";
 import { showMenu, type MenuItem } from "./menu";
 import { mountHelp } from "./help";
-import { SettingsStore, mountSettings } from "./settings";
+import {
+  SettingsStore,
+  applyTheme,
+  canvasHex,
+  mountSettings,
+  type Feature,
+  type SetupLine,
+  type SetupPage,
+} from "./settings";
 import { imageFiles, resetAssets, saveImage } from "./images";
 import { createEditor, type Editor } from "./editor";
 import { linkTargets } from "./markdown";
@@ -28,10 +36,15 @@ import {
   ISSUE_DIR,
   LinearApi,
   LocalIssues,
+  fetchProjects,
+  fetchTeams,
   issueTemplate,
   parseIssue,
   writeIssue,
+  type Filing,
   type IssueSource,
+  type LinearCall,
+  type Team,
 } from "./linear";
 import type { IssueChange } from "./graph";
 import {
@@ -84,8 +97,7 @@ const ui = {
   help: el("help"),
   helpPanel: el("help-panel"),
   settings: el<HTMLButtonElement>("settings"),
-  settingsPanel: el("settings-panel"),
-  gitCommit: el<HTMLButtonElement>("git-commit"),
+  settingsPanel: el("settings-modal"),
 };
 
 mountHelp(ui.help, ui.helpPanel);
@@ -939,10 +951,87 @@ async function copyPath(path: string, absolute: boolean): Promise<void> {
 /* ------------------------------------------------------------------- git --- */
 
 /**
- * The whole git integration: stage everything and commit, in the vault's folder on
- * disk. The work happens in the desktop shell (see `electron/main.cjs`) because a
- * renderer cannot run git; in a plain browser the button says so instead of failing.
+ * The git integration lives on its own settings page now, not on the canvas: committing
+ * and pushing are both actions there. The work happens in the desktop shell (see
+ * `electron/main.cjs`) because a renderer cannot run git; in a plain browser these say so
+ * instead of failing. Each leaves its outcome in the status line and redraws the page, so
+ * the answer to "did it work?" lands both where you triggered it and where you can see it.
  */
+/**
+ * The repository as git last described it, or null when nothing has asked yet (no desktop
+ * shell, or the vault's folder on disk is still unknown). Read from the shell rather than
+ * remembered, for the same reason tmux is: it changes underneath the app constantly — every
+ * note saved is a file changed — and a page quoting a stale count is worse than a blank one.
+ */
+let gitState: GitStatus | null = null;
+
+/**
+ * And why there is none, when the asking failed — which in practice means one thing: the
+ * folder this vault is remembered as living in is not there any more. Kept and shown rather
+ * than swallowed, because "could not read it" with no reason is a dead end, and this
+ * particular reason has a fix the page can offer.
+ */
+let gitTrouble: string | null = null;
+
+/**
+ * What a rejected shell call actually said. Electron wraps a handler's error in a sentence
+ * of its own ("Error invoking remote method 'git-status': Error: …") which names an internal
+ * channel and buries the part meant to be read.
+ */
+const shellError = (err: unknown): string =>
+  (err as Error).message.replace(/^Error invoking remote method '[^']*':\s*(Error:\s*)?/, "");
+
+/**
+ * Asks the shell where the repository stands, then redraws whatever is reporting it. Silent
+ * by design: this runs when the settings window opens, so it uses the vault's folder only if
+ * it is already known — being asked "where does this vault live?" by a window you just
+ * opened to look at something else is not an answer to anything.
+ */
+async function refreshGit(): Promise<void> {
+  const bridge = window.bedrock;
+  const root = knownVaultRoot();
+  if (!bridge || !root) {
+    gitState = null;
+    gitTrouble = null;
+  } else {
+    try {
+      gitState = await bridge.gitStatus(root);
+      gitTrouble = null;
+    } catch (err) {
+      gitState = null;
+      gitTrouble = shellError(err);
+    }
+  }
+  // A repository that already has an origin has answered the remote question itself, and
+  // making somebody type a URL git could have told us is the sort of form this app avoids.
+  if (gitState?.origin && !settings.setup().gitRemote) {
+    settings.setSetup({ gitRemote: gitState.origin });
+  }
+  redrawSettings();
+}
+
+/**
+ * Where this vault lives on disk — the folder every git action operates on.
+ *
+ * It is asked for once and remembered, which is right until the answer stops being true:
+ * the folder gets renamed, or moved, or the vault is opened on a second machine where that
+ * path means nothing. Before this existed there was no way to correct it from inside the
+ * app, so a vault with a stale path had every git button fail at once and no way back.
+ * The OS's own picker answers it where there is one, since the alternative is typing an
+ * absolute path from memory.
+ */
+async function setVaultRoot(): Promise<void> {
+  const bridge = window.bedrock;
+  const current = knownVaultRoot();
+  const chosen = bridge
+    ? await bridge.pickPath("folder")
+    : await askText(`Where does "${vault.name}" live on disk?`, current ?? `~/${vault.name}`, "Use this");
+  if (!chosen) return;
+  localStorage.setItem(ROOT_KEY + vault.name, chosen.replace(/\/+$/, ""));
+  ui.status.textContent = `git: this vault is at ${chosen}`;
+  await refreshGit();
+}
+
 async function commitVault(): Promise<void> {
   const bridge = window.bedrock;
   if (!bridge) {
@@ -952,23 +1041,113 @@ async function commitVault(): Promise<void> {
   const root = await vaultRoot();
   if (!root) return;
   await flushAll();
-  ui.gitCommit.disabled = true;
   ui.status.textContent = "git: committing…";
   try {
     ui.status.textContent = `git: ${await bridge.gitCommit(root)}`;
   } catch (err) {
-    ui.status.textContent = `git: ${(err as Error).message}`;
-  } finally {
-    ui.gitCommit.disabled = false;
+    ui.status.textContent = `git: ${shellError(err)}`;
   }
+  await refreshGit();
+}
+
+/**
+ * Push what has been committed to the vault's GitHub remote. The remote is a choice kept
+ * in the config; the machine's git holds who you are and the token or key that gets you
+ * in, the same as it does for a commit. With no remote set there is nowhere to push, so
+ * this asks for one first rather than failing at git.
+ */
+async function pushVault(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) {
+    ui.status.textContent = "git needs the desktop app — npm start";
+    return;
+  }
+  const root = await vaultRoot();
+  if (!root) return;
+  let remote = settings.setup().gitRemote;
+  if (!remote) {
+    if (!(await setGitRemote())) return; // asked, but nothing given
+    remote = settings.setup().gitRemote;
+  }
+  await flushAll();
+  ui.status.textContent = "git: pushing…";
+  try {
+    ui.status.textContent = `git: ${await bridge.gitPush(root, remote)}`;
+  } catch (err) {
+    ui.status.textContent = `git: ${shellError(err)}`;
+  }
+  await refreshGit();
+}
+
+/**
+ * The other direction, without which the loop does not close: a repository made on GitHub
+ * with a README, or a vault edited from a second machine, leaves push refused forever and
+ * the only way out is a terminal. The shell aborts rather than leaving a half-rebased vault,
+ * so the worst this can do is nothing — but the notes it brings in are notes the open panes
+ * may be showing, so the sidebar is re-read afterwards.
+ */
+async function pullVault(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) {
+    ui.status.textContent = "git needs the desktop app — npm start";
+    return;
+  }
+  const root = await vaultRoot();
+  if (!root) return;
+  const remote = settings.setup().gitRemote;
+  if (!remote) {
+    ui.status.textContent = "git: set a remote first — there is nowhere to pull from";
+    return;
+  }
+  await flushAll();
+  ui.status.textContent = "git: pulling…";
+  try {
+    ui.status.textContent = `git: ${await bridge.gitPull(root, remote)}`;
+    await refreshSidebar(); // the pull may have brought notes the tree does not know about
+  } catch (err) {
+    ui.status.textContent = `git: ${shellError(err)}`;
+  }
+  await refreshGit();
+}
+
+/**
+ * The GitHub URL this vault pushes to. Kept in the config because it is a choice — which
+ * repo — not a credential. Returns whether one is now set, so the push can ask for it and
+ * carry on in the same gesture.
+ */
+async function setGitRemote(): Promise<boolean> {
+  const current = settings.setup().gitRemote;
+  const typed = await askText(
+    "The GitHub repository to push to — an https:// or git@ URL. It says which repo; " +
+      "this machine's git says who you are.",
+    current || "https://github.com/you/vault.git",
+    current ? "Change" : "Set",
+  );
+  if (typed === null) return Boolean(current); // dismissed (or emptied) — leave what was there
+  settings.setSetup({ gitRemote: typed });
+  ui.status.textContent = `git: pushes to ${typed}`;
+  void refreshGit();
+  return true;
 }
 
 /** Follows the toggles: what is switched off appears nowhere. */
 function applyFeatures(): void {
-  ui.gitCommit.classList.toggle("hidden", !settings.enabled("git"));
+  // Opening a vault runs this too, and the vault brings its own colours with it.
+  applyLook();
   graphView.refreshOverlay();
   watchSessions();
   void ensureCardDirs();
+}
+
+/**
+ * The vault's chosen ground, applied to the whole app. The canvas is only where the colour
+ * is CHOSEN — a sidebar and an editor left behind on the old one read as a bug rather than
+ * a setting, so the ground drives every surface (`applyTheme`) and the graph repaints to
+ * match.
+ */
+function applyLook(): void {
+  applyTheme(canvasHex(settings.look().bg));
+  graphView.applyLook();
 }
 
 /** A switched-on integration shows its folder in the tree from the start. */
@@ -1135,9 +1314,22 @@ async function adoptLinearKey(): Promise<void> {
     return;
   }
   const status = await bridge.linearStatus().catch(() => ({ connected: false, user: "" }));
-  issues = status.connected ? new LinearApi((query, vars) => bridge.linearCall(query, vars)) : new LocalIssues();
+  issues = status.connected ? new LinearApi(linearCall, linearFiling()) : new LocalIssues();
   linearUser = status.connected ? status.user || "connected" : null;
 }
+
+/** One call to Linear, key added by the shell. Throws in a browser tab, which has none. */
+const linearCall: LinearCall = (query, variables) => {
+  const bridge = window.bedrock;
+  if (!bridge) return Promise.reject(new Error("Linear needs the desktop app"));
+  return bridge.linearCall(query, variables);
+};
+
+/** Where this vault files its issues, as the API wants it. */
+const linearFiling = (): Filing => {
+  const setup = settings.setup();
+  return { team: setup.linearTeam, project: setup.linearProject };
+};
 
 /**
  * The whole setup: paste a personal API key once. It is proved against Linear before it
@@ -1174,12 +1366,569 @@ async function setUpLinear(): Promise<void> {
   redrawSettings();
 }
 
-/** What the settings panel says under the Linear row. */
-function linearDetail(): { text: string; action?: string } | null {
-  if (!window.bedrock) return { text: "ticks stay in the notes — the API needs the desktop app" };
-  return linearUser
-    ? { text: `connected as ${escapeHtml(linearUser)}`, action: "Disconnect" }
-    : { text: "not connected — ticks stay in the notes", action: "Connect…" };
+/* ------------------------------------------------- the integrations' pages --- */
+
+/**
+ * What each integration's folded page says about itself.
+ *
+ * Worth being blunt about, because the four are not the same kind of thing at all. Only
+ * Linear holds a credential of its own. Claude and git hold NONE — they run through
+ * software already on this machine and already signed in, so their pages have nothing to
+ * connect and say so. Gemini is the odd one: Google will not let an app borrow the
+ * browser's login (Chrome's cookies are encrypted per user through the OS keychain), so
+ * the choice is a sign-in inside this app's own window, or your real browser and a paste.
+ * That choice is the page.
+ */
+function integrationPage(feature: Feature): SetupPage | null {
+  const bridge = window.bedrock;
+  const setup = settings.setup();
+  switch (feature) {
+    case "linear": {
+      if (!bridge) {
+        return {
+          status: "desktop app only",
+          lines: [
+            {
+              label: "Why",
+              value: "the API needs a key, and a browser tab has neither a keychain to hold one nor a way past Linear's CORS. Ticks still work — they stay in the notes.",
+            },
+          ],
+        };
+      }
+      if (!linearUser) {
+        return {
+          status: "not connected",
+          lines: [
+            {
+              label: "API key",
+              value: "not connected — ticks stay in the notes and nothing is pushed",
+              action: { id: "connect", label: "Connect…" },
+            },
+            {
+              label: "Where to get one",
+              value: "linear.app → Settings → Security & access → Personal API keys. It is kept in this machine's keychain, never in the vault.",
+            },
+          ],
+        };
+      }
+      return {
+        status: setup.linearTeamName || "connected",
+        ready: true,
+        lines: [
+          {
+            label: "Account",
+            value: linearUser,
+            action: { id: "connect", label: "Disconnect" },
+          },
+          {
+            label: "Team",
+            value: setup.linearTeamName || "not chosen — issues go to the first team this key can see",
+            action: { id: "team", label: setup.linearTeam ? "Change…" : "Choose…" },
+          },
+          {
+            label: "Project",
+            value: setup.linearProjectName || "none — issues go straight to the team",
+            action: { id: "project", label: setup.linearProject ? "Change…" : "Choose…" },
+          },
+          {
+            label: "What is pushed",
+            value: "a new issue note, each checklist row under it as a sub-issue, and every tick's state. Nothing is ever read back — the notes are the truth.",
+          },
+        ],
+      };
+    }
+
+    case "claude": {
+      if (!bridge) return { status: "desktop app only", lines: [{ label: "Why", value: "sessions open through the Claude app, which a browser tab cannot reach — npm start" }] };
+      const folder = settings.claudeFolder();
+      const inTerminal = setup.claudeWindow === "terminal";
+      const lines: SetupLine[] = [
+        {
+          label: "Run sessions in",
+          value: "",
+          choices: [
+            { id: "run-app", label: "The Claude app", on: !inTerminal },
+            { id: "run-terminal", label: "A terminal here", on: inTerminal },
+          ],
+        },
+        {
+          label: "Sign-in",
+          value: inTerminal
+            ? claudeAccount?.email
+              ? `the CLI's own login — ${claudeAccount.email}` +
+                (claudeAccount.org ? ` (${claudeAccount.org}` : "") +
+                (claudeAccount.org && claudeAccount.seat ? `, ${claudeAccount.seat}` : "") +
+                (claudeAccount.org ? ")" : "") +
+                ". Separate from the Claude app's, so the two can be different accounts — `/login` in a session changes this one."
+              : "the CLI's own login, which is separate from the Claude app's"
+            : "none — the Claude app is already signed in as you. Bedrock never sees a token.",
+        },
+      ];
+      if (inTerminal) {
+        lines.push(
+          {
+            label: "tmux",
+            value: tmuxPath
+              ? `${tmuxPath} — sessions run under it, so they outlive this app`
+              : "not installed. Sessions run under tmux so they keep working when Bedrock is shut; without it there is nothing to hand a session to.",
+            ...(tmuxPath ? {} : { action: { id: "install-tmux", label: "Install tmux" } }),
+          },
+          {
+            label: "How it behaves",
+            value: "closing a session window detaches from it — the agent carries on, and reopening the node picks the terminal back up mid-turn. Quitting Bedrock changes nothing.",
+          },
+          {
+            label: "In the Claude app",
+            value: "a terminal session writes the ordinary transcript, so it can still be opened in the app later — switch this back and click the node.",
+          },
+        );
+      } else {
+        lines.push({
+          label: "How it behaves",
+          value: "the node opens the session in the Claude app's own window, which owns it from then on",
+        });
+      }
+      lines.push({
+        label: "Default folder",
+        value: folder || "not set — every new session note asks where to run",
+        action: { id: "folder", label: folder ? "Change…" : "Choose…" },
+      });
+      if (folder) {
+        lines.push({
+          label: "",
+          value: "go back to asking for each new session",
+          action: { id: "forget", label: "Forget it" },
+        });
+      }
+      const status = inTerminal
+        ? tmuxPath
+          ? "terminal"
+          : "tmux needed"
+        : folder
+          ? basename(folder) || folder
+          : "asks each time";
+      return { status, ready: !inTerminal || !!tmuxPath, lines };
+    }
+
+    case "gemini": {
+      if (!bridge) {
+        return {
+          status: "browser only",
+          lines: [
+            {
+              label: "Where",
+              value: "a new tab, signed in as whoever you are there. Copy the conversation's URL in Gemini and it lands in the note when you come back.",
+            },
+          ],
+        };
+      }
+      const own = setup.geminiWindow === "app";
+      const lines: SetupLine[] = [
+        {
+          label: "Open chats in",
+          value: "",
+          choices: [
+            { id: "window-app", label: "Bedrock's window", on: own },
+            { id: "window-browser", label: "Your browser", on: !own },
+          ],
+        },
+      ];
+      if (own) {
+        lines.push(
+          {
+            label: "Google account",
+            value: geminiSignedIn
+              ? "signed in — the cookies live in Bedrock's own session and survive restarts"
+              : "not signed in. Chrome's login cannot be borrowed — its cookies are encrypted per user by the OS — so this session needs its own, once.",
+            action: geminiSignedIn
+              ? { id: "signout", label: "Sign out" }
+              : { id: "signin", label: "Sign in…" },
+          },
+          {
+            label: "Conversation links",
+            value: "saved into the note by themselves — the window watches for the URL Google mints on your first message",
+          },
+        );
+        if (!geminiSignedIn) {
+          lines.push({
+            label: "Until then",
+            value: "Gemini nodes are refused rather than opened — a chat window showing a login is not a conversation",
+          });
+        }
+      } else {
+        lines.push(
+          {
+            label: "Google account",
+            value: "whoever you are signed in as in your browser — nothing to set up here",
+          },
+          {
+            label: "Conversation links",
+            value: "copy the URL in Gemini; it lands in the note the moment you come back to Bedrock",
+          },
+        );
+      }
+      return {
+        status: own ? (geminiSignedIn ? "signed in" : "sign-in needed") : "your browser",
+        ready: !own || geminiSignedIn,
+        lines,
+      };
+    }
+
+    /*
+     * The one page whose subject changes constantly underneath it — every note saved is a
+     * file changed — so almost every line here is read off `gitState` rather than written.
+     * The status pill answers "is there anything to do?", which for git is the only useful
+     * reading of "is this working?": connected but three commits behind is not working.
+     */
+    case "git": {
+      if (!bridge) return { status: "desktop app only", lines: [{ label: "Why", value: "there is no git in a browser tab — npm start" }] };
+      const remote = setup.gitRemote;
+      const repo = gitState;
+      const root = knownVaultRoot();
+      if (repo && !repo.installed) {
+        return {
+          status: "no git here",
+          lines: [
+            {
+              label: "git",
+              value:
+                "not installed on this machine. On a Mac, xcode-select --install gets it; " +
+                "everywhere else, git-scm.com. Nothing else on this page works until it is there.",
+            },
+          ],
+        };
+      }
+      const lines: SetupLine[] = [];
+      lines.push({
+        label: "Vault folder",
+        value: root || `not known yet — every git action here needs to know where "${vault.name}" is on disk`,
+        action: { id: "folder", label: root ? "Change…" : "Choose…" },
+      });
+      if (root) {
+        lines.push({
+          label: "Repository",
+          value: gitTrouble
+            ? `${gitTrouble} — the folder above is where this vault is remembered as living, and ` +
+              "nothing here can work until it points at the right one"
+            : !repo
+              ? "not read yet"
+              : !repo.repo
+                ? "none in that folder yet — the first commit initialises one"
+                : `on ${repo.branch || "no branch yet"}, ` +
+                  (repo.changes
+                    ? `${repo.changes} file${repo.changes === 1 ? "" : "s"} changed since the last commit`
+                    : "everything committed"),
+        });
+      }
+      if (repo?.repo && repo.lastCommit) lines.push({ label: "Last commit", value: repo.lastCommit });
+      if (repo?.repo && !repo.identity) {
+        lines.push({
+          label: "Who commits",
+          value:
+            "git has no name or email on this machine, and refuses to commit without one. " +
+            'Run git config --global user.name "…" and user.email "…" once, in a terminal.',
+        });
+      }
+      lines.push({
+        label: "Commit",
+        value: "stages everything in the vault's folder and commits it, initialising a repository the first time",
+        action: { id: "commit", label: "Commit" },
+      });
+      lines.push({
+        label: "Remote",
+        value: remote || "none yet — set a GitHub URL to push to",
+        action: { id: "remote", label: remote ? "Change" : "Set" },
+      });
+      lines.push({
+        label: "Push",
+        value: !remote
+          ? "set a remote first; then this pushes your commits to it"
+          : repo?.upstream && repo.behind
+            ? `the remote is ${repo.behind} commit${repo.behind === 1 ? "" : "s"} ahead of this vault — ` +
+              "pull those in first or this is refused"
+            : "sends your commits to the remote, over the git already set up on this machine — no token lives in the vault",
+        action: { id: "push", label: "Push" },
+      });
+      lines.push({
+        label: "Pull",
+        value: !remote
+          ? "and this brings the remote's commits back down, once there is a remote"
+          : "brings the remote's commits down and replays yours on top. Uncommitted work is " +
+            "refused and a clash is abandoned, so this never leaves the vault half-changed.",
+        action: { id: "pull", label: "Pull" },
+      });
+      // Signing in is git's own business and cannot be checked without attempting a push,
+      // so the page says where that lives rather than pretending to know.
+      lines.push({
+        label: "Signing in",
+        value:
+          "whoever this machine's git already is — an ssh key or a credential helper. " +
+          "Bedrock keeps no token, so a push that is refused is answered outside the app, once.",
+      });
+      const status = gitTrouble
+        ? "folder is not there"
+        : !repo
+          ? root
+            ? "not read yet"
+            : "folder unknown"
+          : !repo.repo
+          ? "no repository yet"
+          : !repo.identity
+            ? "git has no identity"
+            : repo.changes
+              ? `${repo.changes} to commit`
+              : !remote
+                ? "local snapshots"
+                : repo.upstream && repo.behind
+                  ? `${repo.behind} behind`
+                  : repo.ahead
+                    ? `${repo.ahead} to push`
+                    : repo.upstream
+                      ? "pushed"
+                      : "committed";
+      // Green means the vault and the remote hold the same thing — which a repository that
+      // has a remote but has never pushed to it does not, however tidy it looks locally.
+      const ready = Boolean(
+        repo?.repo && repo.identity && !repo.changes && remote && repo.upstream && !repo.ahead && !repo.behind,
+      );
+      return { status, ready, lines };
+    }
+
+    default:
+      return null;
+  }
+}
+
+/** A button on one of those pages. */
+function runIntegrationAction(feature: Feature, action: string): void {
+  if (feature === "linear" && action === "connect") void setUpLinear();
+  else if (feature === "linear" && action === "team") void pickLinearTeam();
+  else if (feature === "linear" && action === "project") void pickLinearProject();
+  else if (feature === "claude" && action === "folder") void setUpClaudeFolder();
+  else if (feature === "claude" && action === "forget") forgetClaudeFolder();
+  else if (feature === "claude" && action.startsWith("run-")) setClaudeWindow(action.slice(4));
+  else if (feature === "claude" && action === "install-tmux") void installTmux();
+  else if (feature === "gemini" && action.startsWith("window-")) setGeminiWindow(action.slice(7));
+  else if (feature === "gemini" && action === "signin") void signIntoGemini();
+  else if (feature === "gemini" && action === "signout") void signOutOfGemini();
+  else if (feature === "git" && action === "folder") void setVaultRoot();
+  else if (feature === "git" && action === "commit") void commitVault();
+  else if (feature === "git" && action === "remote") void setGitRemote();
+  else if (feature === "git" && action === "push") void pushVault();
+  else if (feature === "git" && action === "pull") void pullVault();
+}
+
+/* ------------------------------------------------------ claude's own page --- */
+
+/**
+ * The vault's default folder for new Claude sessions. Asked here once instead of at every
+ * new session note: a vault is usually about one codebase, and answering the same question
+ * every time is what made the session note feel like a form.
+ */
+async function setUpClaudeFolder(): Promise<void> {
+  if (!window.bedrock) {
+    ui.status.textContent = "Claude sessions need the desktop app — npm start";
+    return;
+  }
+  const chosen = await askClaudeFolder(settings.claudeFolder());
+  if (!chosen) return;
+  settings.setSetup({ claudeFolder: chosen });
+  ui.status.textContent = `Claude: new sessions run in ${chosen}`;
+  redrawSettings();
+}
+
+function forgetClaudeFolder(): void {
+  settings.setSetup({ claudeFolder: "" });
+  ui.status.textContent = "Claude: new sessions will ask where to run";
+  redrawSettings();
+}
+
+/**
+ * Where tmux is, or null — the whole terminal mode hangs off this, the way Gemini's hangs
+ * off a cookie. Read from the shell rather than remembered, because it can be installed
+ * (from this very page) while the app is running.
+ */
+let tmuxPath: string | null = null;
+
+/**
+ * And who the CLI would run as. Read alongside tmux because it is the same kind of fact —
+ * something true of this machine that the mode depends on and nothing else would tell you.
+ */
+let claudeAccount: { email: string; org: string; seat: string } | null = null;
+
+async function refreshTmux(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  const [status, account] = await Promise.all([
+    bridge.termStatus().catch(() => null),
+    bridge.claudeAccount().catch(() => null),
+  ]);
+  tmuxPath = status?.tmux ?? null;
+  claudeAccount = account;
+  redrawSettings();
+}
+
+function setClaudeWindow(where: string): void {
+  const terminal = where === "terminal";
+  settings.setSetup({ claudeWindow: terminal ? "terminal" : "app" });
+  redrawSettings();
+  if (terminal) void refreshTmux(); // choosing it is when its prerequisite starts mattering
+}
+
+/** The button that gets tmux, so nobody has to be told to open a terminal to get one. */
+async function installTmux(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  ui.status.textContent = "tmux: installing with Homebrew — this takes a moment…";
+  try {
+    const { tmux } = await bridge.termInstall();
+    tmuxPath = tmux;
+    ui.status.textContent = `tmux: installed at ${tmux} — terminal sessions are ready`;
+  } catch (err) {
+    ui.status.textContent = `tmux: ${(err as Error).message}`;
+  }
+  redrawSettings();
+}
+
+/**
+ * Whether a terminal session may be opened. Asked of the shell each time, so installing
+ * tmux takes effect without a restart — and refused rather than half-done, because a
+ * session note whose terminal cannot open is worse than no note at all.
+ */
+async function terminalReady(): Promise<boolean> {
+  const bridge = window.bedrock;
+  if (!bridge) return false;
+  const status = await bridge.termStatus().catch(() => null);
+  tmuxPath = status?.tmux ?? null;
+  if (!tmuxPath) {
+    ui.status.textContent =
+      "Claude: terminal sessions need tmux — Settings → Integrations → Claude Code → Install tmux";
+    redrawSettings();
+  }
+  return !!tmuxPath;
+}
+
+/* ------------------------------------------------------ gemini's own page --- */
+
+/** Whether the chat window's Google session is signed in; null until the shell says. */
+let geminiSignedIn = false;
+
+/** Asks the shell, then redraws whatever is reporting it. */
+async function refreshGeminiStatus(): Promise<void> {
+  const status = await window.bedrock?.geminiStatus().catch(() => ({ signedIn: false }));
+  geminiSignedIn = status?.signedIn ?? false;
+  redrawSettings();
+}
+
+function setGeminiWindow(where: string): void {
+  settings.setSetup({ geminiWindow: where === "browser" ? "browser" : "app" });
+  redrawSettings();
+  // Switching to Bedrock's window is the moment its sign-in starts mattering.
+  if (where !== "browser") void refreshGeminiStatus();
+}
+
+/** The one door into Google: a window that signs in and then gets out of the way. */
+async function signIntoGemini(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  ui.status.textContent = "Gemini: signing in — finish in the window that opened";
+  const { signedIn } = await bridge.geminiSignIn().catch(() => ({ signedIn: false }));
+  geminiSignedIn = signedIn;
+  ui.status.textContent = signedIn
+    ? "Gemini: signed in — conversation nodes work from here on"
+    : "Gemini: not signed in — the window closed before the login took";
+  redrawSettings();
+}
+
+/**
+ * Whether a Gemini action may go ahead, asked of the shell rather than of the flag, so the
+ * answer is never one sign-in out of date.
+ *
+ * Only Bedrock's own window has anything to be signed into. In browser mode the login is
+ * your browser's business and there is nothing here to check; in a plain tab there is no
+ * session at all. So the gate is exactly as narrow as the thing it guards.
+ */
+async function geminiReady(): Promise<boolean> {
+  const bridge = window.bedrock;
+  if (!bridge || settings.setup().geminiWindow !== "app") return true;
+  const { signedIn } = await bridge.geminiStatus().catch(() => ({ signedIn: false }));
+  geminiSignedIn = signedIn;
+  if (!signedIn) {
+    ui.status.textContent =
+      "Gemini: sign in first — Settings → Integrations → Gemini → Sign in, or switch it to your browser";
+    redrawSettings();
+  }
+  return signedIn;
+}
+
+async function signOutOfGemini(): Promise<void> {
+  if (!(await askConfirm("Sign out of Google in Bedrock's chat window? Notes keep their conversation links.", "Sign out"))) {
+    return;
+  }
+  await window.bedrock?.geminiForget().catch(() => false);
+  ui.status.textContent = "Gemini: signed out — the next chat opens Google's sign-in";
+  await refreshGeminiStatus();
+}
+
+/* ------------------------------------------------------ linear's own page --- */
+
+/**
+ * Which team new issues are filed under. Fetched live rather than remembered: a team you
+ * have been added to since is a team you should be able to pick, and the list is one
+ * cheap query. The names are kept beside the ids so the page can say where issues go
+ * without a round trip every time it is drawn.
+ */
+async function pickLinearTeam(): Promise<void> {
+  if (!linearUser) return;
+  ui.status.textContent = "Linear: reading your teams…";
+  const teams = await fetchTeams(linearCall);
+  if (!teams.length) {
+    ui.status.textContent = "Linear: that key can see no teams";
+    return;
+  }
+  const label = (team: Team): string => `${team.key} — ${team.name}`;
+  const picked = await askChoice("Which team should new issues go to?", teams.map(label), "Cancel");
+  const team = teams.find((t) => label(t) === picked);
+  if (!team) return;
+  // A different team means the old project is somebody else's; it does not travel.
+  settings.setSetup({
+    linearTeam: team.id,
+    linearTeamName: label(team),
+    ...(team.id === settings.setup().linearTeam ? {} : { linearProject: "", linearProjectName: "" }),
+  });
+  await adoptLinearKey(); // the source caches team and states — it needs rebuilding
+  ui.status.textContent = `Linear: new issues go to ${label(team)}`;
+  redrawSettings();
+}
+
+/** And which project inside it, if any. "No project" is a real answer, so it is offered. */
+async function pickLinearProject(): Promise<void> {
+  const setup = settings.setup();
+  if (!linearUser) return;
+  if (!setup.linearTeam) {
+    ui.status.textContent = "Linear: choose a team first — projects live inside one";
+    return;
+  }
+  ui.status.textContent = "Linear: reading that team's projects…";
+  const projects = await fetchProjects(linearCall, setup.linearTeam);
+  const NONE = "No project — file straight to the team";
+  const picked = await askChoice(
+    "Which project should new issues belong to?",
+    [NONE, ...projects.map((p) => p.name)],
+    "Cancel",
+  );
+  if (picked === null) return;
+  const project = projects.find((p) => p.name === picked);
+  if (!project && picked !== NONE) return;
+  settings.setSetup({
+    linearProject: project?.id ?? "",
+    linearProjectName: project?.name ?? "",
+  });
+  await adoptLinearKey();
+  ui.status.textContent = project
+    ? `Linear: new issues belong to ${project.name}`
+    : "Linear: new issues go straight to the team";
+  redrawSettings();
 }
 
 /* --------------------------------------------------------- issue writing --- */
@@ -1417,7 +2166,10 @@ const geminiTemplate = (name: string): string => `# ${name}\n\n${GEMINI_URL}\n\n
 function openGeminiChat(path: string, target: string): string {
   const generic = target === GEMINI_URL; // no conversation of its own yet
   if (generic) armGeminiCapture(path); // follows renames; doubles as the fallback
-  if (window.bedrock?.geminiChat) {
+  // Settings → Integrations → Gemini: the app's own window watches for the link and
+  // needs its own Google sign-in; the browser needs none and hands the link back by
+  // clipboard. Both are complete ways to work, which is why it is a choice.
+  if (window.bedrock?.geminiChat && settings.setup().geminiWindow === "app") {
     void window.bedrock.geminiChat(target).then((convo) => {
       if (convo && generic) void adoptGeminiLink(convo);
     });
@@ -1432,14 +2184,30 @@ function openGeminiChat(path: string, target: string): string {
     : `${noteName(path)} → ${target}`;
 }
 
-/** Click on a Gemini node: it is a link, not a page. Editing stays in the tree. */
+/**
+ * Click on a Gemini node: it is a link, not a page. Editing stays in the tree.
+ *
+ * The sign-in is checked first, and a node whose session has none is refused rather than
+ * opened onto a login form — which is the same call `createGeminiAt` makes, for the same
+ * reason. In browser mode there is nothing to check and the click goes straight through.
+ */
 function openGeminiNode(path: string, url: string | null): void {
-  const message = openGeminiChat(path, url || GEMINI_URL);
-  // One tick later: a click is also a grab+free to cytoscape, and the free handler
-  // clears the hint right after this — the message has to land after that reset.
-  window.setTimeout(() => {
-    ui.status.textContent = message;
-  }, 0);
+  const say = (message: string): void => {
+    // One tick later: a click is also a grab+free to cytoscape, and the free handler
+    // clears the hint right after this — the message has to land after that reset.
+    window.setTimeout(() => {
+      ui.status.textContent = message;
+    }, 0);
+  };
+  // Straight through where nothing has to be asked, so the popup blocker still sees the
+  // click that opened the chat as the gesture it was.
+  if (!window.bedrock || settings.setup().geminiWindow !== "app") {
+    say(openGeminiChat(path, url || GEMINI_URL));
+    return;
+  }
+  void geminiReady().then((ready) => {
+    if (ready) say(openGeminiChat(path, url || GEMINI_URL));
+  });
 }
 
 /* ------------------------------------------------------- catching the link --- */
@@ -1519,6 +2287,9 @@ async function createGeminiAt(
   folder: string | null,
   source: string | null = null,
 ): Promise<void> {
+  // Refused before anything is written: a conversation note whose chat cannot open is a
+  // file to clean up later, and the sign-in is one button away in Settings.
+  if (!(await geminiReady())) return;
   const dir = folder ?? "";
   const path = uniquePath(filePaths(), dir, "Gemini chat", ".md");
   await vault.createFile(path, geminiTemplate(noteName(path)));
@@ -1877,21 +2648,20 @@ const CLAUDE_NAME = "Claude session";
  * is whatever happened to be touched last, which is rarely what this note is about. The
  * recent ones are offered because they are usually right; typing a path is always there.
  * Answered once per note, then it lives in the note as `folder::`.
+ *
+ * `first` is put at the top of the list — the vault's own default when there is one, which
+ * is the answer being changed when this is asked from the settings window.
  */
-async function askClaudeFolder(): Promise<string | null> {
+async function askClaudeFolder(first?: string | null): Promise<string | null> {
   const recent = (await window.bedrock?.claudeFolders(8).catch(() => [])) ?? [];
   // The vault itself belongs on the list — a session about these notes may well run in
   // them — but only if its location is already known. Asking where the vault lives in order
   // to ask which folder to run in is two questions to answer one.
   const root = knownVaultRoot();
-  const choices = [...new Set([...recent, ...(root ? [root] : [])])];
-  if (!choices.length) return askText("Which folder should this session run in?", "~/", "Use this");
-  return askChoice(
-    "Which folder should this session run in?",
-    choices,
-    "Another folder…",
-    "Which folder should this session run in?",
-  );
+  const choices = [...new Set([...(first ? [first] : []), ...recent, ...(root ? [root] : [])])];
+  const question = "Which folder should this session run in?";
+  if (!choices.length) return askText(question, first ?? "~/", "Use this");
+  return askChoice(question, choices, "Another folder…", question, first ?? undefined);
 }
 
 /** Notes with a start in flight — a second click must not open a second session. */
@@ -1916,6 +2686,7 @@ async function openClaudeSession(path: string, session: string | null): Promise<
     ui.status.textContent = "Claude sessions need the desktop app — npm start";
     return;
   }
+  if (settings.setup().claudeWindow === "terminal") return openClaudeTerminal(path, session);
   if (session) return resumeClaudeSession(path, session);
   if (claudeStarting.has(path)) {
     ui.status.textContent = `${noteName(path)} — a session is already open for this note; send it a message and its id saves itself`;
@@ -1927,7 +2698,10 @@ async function openClaudeSession(path: string, session: string | null): Promise<
   const caught = await adoptClaudeSession(path, parseField(text, "folder"), parseField(text, "started"));
   if (caught) return resumeClaudeSession(path, caught);
 
-  const folder = parseField(text, "folder") || (await askClaudeFolder());
+  // The note's own answer first, then the vault's (Settings → Integrations → Claude Code),
+  // and only then the question — a vault that has said where its sessions run is not asked
+  // again for every note.
+  const folder = parseField(text, "folder") || settings.claudeFolder() || (await askClaudeFolder());
   if (!folder) return; // nowhere to run it, and the ask was declined
   const started = new Date().toISOString();
   // On disk BEFORE the link opens: this is the note's own record of what it is waiting for,
@@ -1949,6 +2723,52 @@ async function openClaudeSession(path: string, session: string | null): Promise<
     ui.status.textContent = `Claude: ${(err as Error).message}`;
   } finally {
     claudeStarting.delete(path);
+  }
+}
+
+/**
+ * The same click, in terminal mode.
+ *
+ * Three states, and the note's own `session::` line tells them apart: a session still
+ * running under tmux is simply drawn again (the window is a viewport, so reopening it is
+ * free and lands you mid-turn); a session that has finished is resumed as a new tmux
+ * session on the same id, so its history comes back with it; a note that has never run
+ * starts one. In every case the id is minted by the shell BEFORE the CLI starts, so the
+ * note knows its session's name immediately — none of the app path's watching-for-a-
+ * transcript is needed here.
+ */
+async function openClaudeTerminal(path: string, session: string | null): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge || !(await terminalReady())) return;
+
+  if (session && (await bridge.claudeCliAlive(session).catch(() => false))) {
+    await bridge.claudeCliWindow({ id: session, title: noteName(path) });
+    await markSessionSeen(path);
+    ui.status.textContent = `${noteName(path)} → its terminal, still running`;
+    return;
+  }
+
+  await flushAll(); // the note may be open and mid-edit; its fields have to be current
+  const text = await vault.read(path);
+  const folder = parseField(text, "folder") || settings.claudeFolder() || (await askClaudeFolder());
+  if (!folder) return; // nowhere to run it, and the ask was declined
+
+  try {
+    // A note that has run before resumes ITS session rather than starting a stranger.
+    const id = await bridge.claudeCliStart(folder, session ?? null);
+    await saveClaudeSession(path, id);
+    if (!parseField(text, "folder")) {
+      const next = setField(await vault.read(path), "folder", folder);
+      await tryVault(`could not write to ${noteName(path)}`, () => vault.write(path, next));
+      syncOpenPanes(path, next);
+    }
+    graphStale = true;
+    await bridge.claudeCliWindow({ id, title: noteName(path) });
+    ui.status.textContent = session
+      ? `${noteName(path)} — resumed in a terminal, in ${folder}`
+      : `${noteName(path)} — a terminal session started in ${folder}; it keeps running if you close the window`;
+  } catch (err) {
+    ui.status.textContent = `Claude: ${(err as Error).message}`;
   }
 }
 
@@ -2087,10 +2907,12 @@ async function createClaudeAt(
   source: string | null = null,
 ): Promise<void> {
   const dir = folder ?? "";
-  // Asked now rather than at the click, so the note says where it runs from the start — and
-  // only where the shell can answer: in a browser the note is made without a folder and the
-  // click reports what it needs.
-  const where = window.bedrock ? await askClaudeFolder() : null;
+  // Where it runs is settled now rather than at the click, so the note says so from the
+  // start. The vault's own answer wins outright when it has one (Settings → Integrations →
+  // Claude Code): "every session in this vault runs here" is the whole point of setting it,
+  // and asking anyway would make it a suggestion. Only a vault that has NOT been told asks —
+  // and only where the shell can answer, since a browser has no folders to offer.
+  const where = settings.claudeFolder() || (window.bedrock ? await askClaudeFolder() : null);
   const path = uniquePath(filePaths(), dir, CLAUDE_NAME, ".md");
   await vault.createFile(path, claudeTemplate(where));
   entries = [...entries, { path, kind: "file" }]; // so the rename's collision check sees it
@@ -2279,15 +3101,20 @@ ui.openFolder.addEventListener("click", () => void pickFolder());
 ui.newNote.addEventListener("click", () => void newNote());
 ui.newFolder.addEventListener("click", () => void newFolder());
 ui.graph.addEventListener("click", () => openGraph());
-ui.gitCommit.addEventListener("click", () => void commitVault());
 
 const redrawSettings = mountSettings(ui.settings, ui.settingsPanel, settings, {
-  detail: (feature) => (feature === "linear" ? linearDetail() : null),
-  onAction: (feature) => {
-    if (feature === "linear") void setUpLinear();
-  },
+  page: integrationPage,
+  onAction: runIntegrationAction,
+});
+// All of these are the shell's to know, and all can change while the app runs — a Google
+// sign-in, a tmux install, a `/login` inside a session, a commit made in a terminal.
+ui.settings.addEventListener("click", () => {
+  void refreshGeminiStatus();
+  void refreshTmux();
+  void refreshGit();
 });
 settings.onChange = applyFeatures;
+settings.onLook = applyLook;
 // A card is a file in a visible folder, so making or deleting one must show in the tree.
 stickies.onFilesChanged = () => void refreshSidebar();
 
