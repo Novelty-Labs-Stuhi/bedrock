@@ -5,6 +5,14 @@
   "type": "module",
   "description": "A markdown vault whose graph is the place you work — spatial, durable, plain files.",
   "main": "electron/main.cjs",
+  "bin": {
+    "bedrock": "bin/bedrock"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "electron"
+  ],
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
@@ -12,7 +20,8 @@
     "start": "npm run build && electron .",
     "app": "electron .",
     "package": "npm run build && electron-builder --mac dmg --win nsis",
-    "package:mac": "npm run build && set -a && . ./.env && set +a && electron-builder --mac dmg"
+    "package:mac": "npm run build && set -a && . ./.env && set +a && electron-builder --mac dmg",
+    "prepare": "npm run build"
   },
   "build": {
     "appId": "dev.getbedrock.app",
