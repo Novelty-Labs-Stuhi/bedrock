@@ -9,7 +9,10 @@ on:
     paths:
       - "src/**"
       - "electron/**"
-      - "scripts/**"
+      # Not scripts/** — that swept in the deploy and download-counting scripts,
+      # so editing a bash script rebuilt, signed and notarized the whole dmg for
+      # nothing. This is the only script the build actually uses.
+      - "scripts/notarize-dmg.cjs"
       - "build/**"
       - "index.html"
       - "terminal.html"
