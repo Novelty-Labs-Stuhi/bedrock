@@ -101,6 +101,16 @@ echo "==> External table over the usage logs"
      uris = ['${LOG_BUCKET}/${LOG_PREFIX}_usage_*']
    )"
 
+echo "==> Letting CI publish the count the site shows"
+# deploy-site.yml runs scripts/publish-count.sh, so the GitHub Actions identity
+# needs to run a query and read the external table. Storage write it already has.
+CI_SA="github-actions-bedrock@${PROJECT}.iam.gserviceaccount.com"
+for role in roles/bigquery.jobUser roles/bigquery.dataViewer; do
+  retry "${GC[@]}" projects add-iam-policy-binding "$PROJECT" \
+    --member "serviceAccount:${CI_SA}" --role "$role" >/dev/null
+  echo "    $role"
+done
+
 echo
 echo "Done. Usage logs start arriving within the hour; nothing before now is"
 echo "recoverable. Read the count with:"

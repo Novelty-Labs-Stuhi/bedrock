@@ -121,6 +121,60 @@
       }
 
       /*
+       * Frosted so it reads as sitting on the vault screenshot rather than on a
+       * card of its own. Starts hidden and is only revealed once a real number
+       * arrives — see the script at the end of the body.
+       */
+      .counter {
+        margin: 1.9rem 0 0;
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.42rem 0.9rem 0.42rem 0.72rem;
+        border-radius: 999px;
+        font-size: 0.875rem;
+        background: rgba(255, 255, 255, 0.55);
+        border: 1px solid rgba(255, 255, 255, 0.72);
+        box-shadow: 0 1px 2px rgba(20, 21, 28, 0.05), 0 10px 24px rgba(20, 21, 28, 0.08);
+        backdrop-filter: blur(14px) saturate(150%);
+        -webkit-backdrop-filter: blur(14px) saturate(150%);
+        animation: counter-in 0.55s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+      }
+
+      .counter[hidden] { display: none; }
+
+      /* Tightens the gap only when the pill is actually there. */
+      .counter:not([hidden]) + .actions { margin-top: 1.6rem; }
+
+      .counter__pulse {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: #2f9e68;
+        animation: counter-pulse 2.6s ease-out infinite;
+      }
+
+      /* tabular-nums so the digits do not jitter while counting up. */
+      .counter__value {
+        font-variant-numeric: tabular-nums;
+        font-weight: 650;
+        letter-spacing: -0.01em;
+      }
+
+      .counter__label { color: var(--muted); }
+
+      @keyframes counter-in {
+        from { opacity: 0; transform: translateY(7px) scale(0.97); }
+        to { opacity: 1; transform: none; }
+      }
+
+      @keyframes counter-pulse {
+        0% { box-shadow: 0 0 0 0 rgba(47, 158, 104, 0.5); }
+        70% { box-shadow: 0 0 0 7px rgba(47, 158, 104, 0); }
+        100% { box-shadow: 0 0 0 0 rgba(47, 158, 104, 0); }
+      }
+
+      /*
        * Two ways in, given equal room. Only one of them is an installer: the dashed
        * outline is what says "this one hands you a repo, not a download" without
        * needing a sentence to explain itself.
@@ -188,6 +242,13 @@
 
       @media (prefers-reduced-motion: reduce) {
         * { transition: none !important; }
+        /* The counter reveal and its pulse are animations, not transitions, so
+           the rule above does not reach them. Collapsing the duration lands them
+           on their final frame immediately. */
+        *, *::before, *::after {
+          animation-duration: 0.01ms !important;
+          animation-iteration-count: 1 !important;
+        }
       }
     </style>
   </head>
@@ -206,6 +267,15 @@
       <h1>Bedrock</h1>
       <p class="tagline">
         A markdown vault whose graph is the place you work — spatial, durable, plain files.
+      </p>
+      <!--
+        Hidden until a real count arrives. "0 downloads" is worse than saying
+        nothing, so a missing, unreachable or zero count leaves no trace.
+      -->
+      <p class="counter" id="counter" hidden>
+        <span class="counter__pulse" aria-hidden="true"></span>
+        <span class="counter__value" id="counterValue">0</span>
+        <span class="counter__label">downloads</span>
       </p>
       <div class="actions">
         <!-- No Windows installer is published: the repo, and building it, is the honest answer. -->
@@ -227,5 +297,46 @@
         Open Anyway.
       </p>
     </main>
+
+    <script>
+      /*
+       * counts.json is published by scripts/publish-count.sh and served through
+       * the site's own /counts.json route, so this is a same-origin fetch with no
+       * CORS to configure. Everything here fails quietly: the pill simply never
+       * appears if the count is missing, unreachable or still zero.
+       */
+      (function () {
+        var pill = document.getElementById('counter');
+        var out = document.getElementById('counterValue');
+        if (!pill || !out || !window.fetch) return;
+
+        var still = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+        function show(total) {
+          out.textContent = total.toLocaleString('en-US');
+          pill.hidden = false;
+          if (still || total < 2) return;
+
+          // Count up from a little below so the pill lands on its number rather
+          // than arriving at it — starting from 0 reads as a loading state.
+          var from = Math.max(0, total - Math.min(total, Math.ceil(total * 0.25) + 8));
+          var start = performance.now();
+          (function step(now) {
+            var t = Math.min(1, (now - start) / 900);
+            var eased = 1 - Math.pow(1 - t, 3);
+            out.textContent = Math.round(from + (total - from) * eased).toLocaleString('en-US');
+            if (t < 1) requestAnimationFrame(step);
+          })(start);
+        }
+
+        fetch('/counts.json', { cache: 'no-store' })
+          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (data) {
+            var total = data && typeof data.total === 'number' ? data.total : 0;
+            if (total > 0) show(total);
+          })
+          .catch(function () {});
+      })();
+    </script>
   </body>
 </html>
