@@ -289,30 +289,27 @@ function decorateLine(
 }
 
 /**
- * What a line inside the revealed block still gets.
+ * What a line inside the revealed block still gets: its formulas, still drawn.
  *
  * Revealing a block means showing its markers, and for every other piece of markdown that is the
- * whole story: `**` is two characters wide either way, so the line barely moves. A formula is not
- * a marker wrapped around text, it is a different picture of it — `$\frac{1}{3\pm3}$` is half the
- * width of the fraction it draws — so un-drawing every formula in a paragraph because the caret
- * landed at the far end of it moves the page for an edit that has nothing to do with them. That
- * is the reflow this file went to block-sized reveals to avoid, arriving by another road.
+ * whole story — `**` is two characters wide either way, so the line barely moves. A formula is
+ * not a marker wrapped around text, it is a different picture of it: `$\frac12$` is nine
+ * characters standing in for a fraction twice the height of the line. Swapping between them as
+ * the caret arrives is exactly the reflow this file went to block-sized reveals to avoid.
  *
- * So the reveal is formula-sized: only the one the selection is actually touching gives up its
- * source, which is still how you fix LaTeX by hand.
+ * Nor is there anything left to reveal *for*. Revealing exists so a marker can be edited as the
+ * characters it is, and for a formula that is what the LaTeX box inside the field is — opened by
+ * clicking the formula, holding the same characters, and able to draw what they mean while you
+ * type. LaTeX too broken to draw still falls back to its own source, so nothing is unreachable.
  */
 function decorateRevealedMath(
   line: { from: number; to: number; text: string },
   out: Range<Decoration>[],
   ctx: { math: MathSpan | null },
-  state: EditorState,
 ): void {
   for (const span of mathSpans(line)) {
     // The one already open as a field — `math.ts` is drawing that range itself.
     if (ctx.math && span.from < ctx.math.to && span.to > ctx.math.from) continue;
-    if (state.selection.ranges.some((range) => range.from <= span.to && range.to >= span.from)) {
-      continue;
-    }
     const widget = new MathRender(span.latex, span.display);
     out.push(Decoration.replace({ widget }).range(span.from, span.to));
   }
@@ -335,7 +332,7 @@ function build(view: EditorView, ctx: LiveContext): DecorationSet {
       if (!line.text.trim()) continue;
       if (fences.some((span) => overlaps(span, line.from, line.to))) continue;
       if (open.some((span) => overlaps(span, line.from, line.to))) {
-        decorateRevealedMath(line, out, here, state);
+        decorateRevealedMath(line, out, here);
         continue;
       }
       decorateLine(line, out, here);

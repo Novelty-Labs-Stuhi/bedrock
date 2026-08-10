@@ -48,8 +48,8 @@ key with nowhere left to go inside the formula. Clicking a formula reopens it.
 Formulas are stored as plain LaTeX in the markdown — `$E = mc^2$` inline, `$$…$$`
 for one on its own — so a note with math in it is still a note: greppable, diffable,
 and readable in any other editor. A `$` that reads like money is left alone (`$5 and
-$10 each` is not a formula), and putting the caret in the block shows the LaTeX as
-ordinary characters, which is still the way to fix it by hand.
+$10 each` is not a formula). A formula stays drawn while you write around it; the
+LaTeX box in the field is where you edit it as characters.
 
 MathLive loads on demand, and its fonts ship with the app rather than coming from a
 CDN, so math works offline.
