@@ -1052,8 +1052,11 @@ button.twisty:hover {
   color: var(--text);
   --caret-color: var(--text);
   --primary: var(--accent);
-  --selection-background-color: var(--accent);
-  --selection-color: #fff;
+  /* A template's empty slot arrives selected, so this is what paints it — the accent made a
+     bright red block out of "type here". The note's own selection colours instead, which is
+     what selecting anything else in the app already looks like. */
+  --selection-background-color: var(--sel-strong);
+  --selection-color: var(--text);
   /* MathLive shades the sub-expression the caret sits in. Off: the border already says which
      formula is live and the caret says where you are inside it, and a slab that moves as you
      type is noise in the middle of a sentence. Named rather than left alone, or the OS's
@@ -1061,6 +1064,10 @@ button.twisty:hover {
   --contains-highlight-background-color: transparent;
   --contains-highlight-color: var(--text);
   --text-highlight-background-color: transparent;
+  /* The other empty slots a template leaves behind — `\frac{#0}{#0}` puts two on screen and
+     only one of them is selected. Grey, so they read as "type here" rather than as content. */
+  --box-placeholder-color: var(--muted);
+  --box-placeholder-pressed-color: var(--muted);
   --placeholder-color: var(--muted);
   --smart-fence-color: var(--muted);
   --smart-fence-opacity: 0.6;
