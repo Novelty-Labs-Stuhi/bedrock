@@ -269,8 +269,9 @@
         A markdown vault whose graph is the place you work — spatial, durable, plain files.
       </p>
       <!--
-        Hidden until a real count arrives. "0 downloads" is worse than saying
-        nothing, so a missing, unreachable or zero count leaves no trace.
+        Hidden until the count is fetched, then shown whatever it says — zero is
+        the truth until someone downloads, and a fabricated floor is worse. Only
+        a missing or unreachable count leaves no trace.
       -->
       <p class="counter" id="counter" hidden>
         <span class="counter__pulse" aria-hidden="true"></span>
@@ -332,8 +333,9 @@
         fetch('/counts.json', { cache: 'no-store' })
           .then(function (r) { return r.ok ? r.json() : null; })
           .then(function (data) {
-            var total = data && typeof data.total === 'number' ? data.total : 0;
-            if (total > 0) show(total);
+            // Shown whenever a real count came back, zero included. Only a
+            // missing or unreachable count leaves the pill hidden.
+            if (data && typeof data.total === 'number') show(data.total);
           })
           .catch(function () {});
       })();
