@@ -60,7 +60,8 @@ GROUP BY day, object
 ORDER BY day DESC, object
 EOF
 
-TOTAL_SQL="SELECT SUM(downloads) AS downloads, SUM(bots) AS bots FROM ($(
+# IFNULL so an empty log bucket reads as 0 rather than NULL, which looks broken.
+TOTAL_SQL="SELECT IFNULL(SUM(downloads), 0) AS downloads, IFNULL(SUM(bots), 0) AS bots FROM ($(
   echo "${SQL//\`TABLE_REF\`/\`${TABLE}\`}"
 ))"
 
@@ -70,5 +71,7 @@ else
   QUERY="${SQL//\`TABLE_REF\`/\`${TABLE}\`}"
 fi
 
-bq --account "$ACCOUNT" --project_id "$PROJECT" --location "$REGION" \
+# bq has no --account flag; CLOUDSDK_CORE_ACCOUNT is the documented equivalent.
+env "CLOUDSDK_CORE_ACCOUNT=$ACCOUNT" \
+  bq --project_id "$PROJECT" --location "$REGION" \
   query --use_legacy_sql=false --format pretty "$QUERY"

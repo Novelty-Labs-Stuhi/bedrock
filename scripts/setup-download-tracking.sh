@@ -23,6 +23,8 @@ DATASET="bedrock_downloads"
 TABLE="usage"
 
 GC=(gcloud --account "$ACCOUNT" --project "$PROJECT")
+# bq has no --account flag; CLOUDSDK_CORE_ACCOUNT is the documented equivalent.
+BQ=(env "CLOUDSDK_CORE_ACCOUNT=$ACCOUNT" bq --project_id "$PROJECT" --location "$REGION")
 
 retry() {
   local n=0
@@ -62,19 +64,17 @@ echo "==> Turning on usage logging for $DL_BUCKET"
 
 echo "==> BigQuery dataset"
 # Must sit in the same region as the bucket for an external table to read it.
-if bq --account "$ACCOUNT" --project_id "$PROJECT" show "${DATASET}" >/dev/null 2>&1; then
+if "${BQ[@]}" show "${DATASET}" >/dev/null 2>&1; then
   echo "    already exists"
 else
-  bq --account "$ACCOUNT" --project_id "$PROJECT" --location "$REGION" \
-    mk --dataset --description "Bedrock download tracking" "${DATASET}"
+  "${BQ[@]}" mk --dataset --description "Bedrock download tracking" "${DATASET}"
 fi
 
 echo "==> External table over the usage logs"
 # Schema is the documented v0 usage-log layout. CREATE OR REPLACE keeps this
 # idempotent; the table holds no data, it just points at the CSV glob, so new
 # logs show up in queries the moment GCS delivers them.
-bq --account "$ACCOUNT" --project_id "$PROJECT" --location "$REGION" \
-  query --use_legacy_sql=false --format none \
+"${BQ[@]}" query --use_legacy_sql=false --format none \
   "CREATE OR REPLACE EXTERNAL TABLE \`${PROJECT}.${DATASET}.${TABLE}\` (
      time_micros INT64,
      c_ip STRING,
