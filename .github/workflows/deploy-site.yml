@@ -7,6 +7,11 @@ on:
     branches: [main]
     paths:
       - "site/**"
+      # The count the page shows is refreshed by this job, so a change to how it
+      # is computed has to be able to trigger one. Without these, merging a fix
+      # to the counter produced no site build at all.
+      - "scripts/publish-count.sh"
+      - "scripts/download-count.sql"
       - ".github/workflows/deploy-site.yml"
   workflow_dispatch:
 
