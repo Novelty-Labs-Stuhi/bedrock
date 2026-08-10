@@ -49,7 +49,9 @@ Formulas are stored as plain LaTeX in the markdown — `$E = mc^2$` inline, `$$�
 for one on its own — so a note with math in it is still a note: greppable, diffable,
 and readable in any other editor. A `$` that reads like money is left alone (`$5 and
 $10 each` is not a formula). A formula stays drawn while you write around it; the
-LaTeX box in the field is where you edit it as characters.
+LaTeX box in the field is where you edit it as characters. It is one thing on the
+page and so one step for the caret — one arrow key crosses it, one backspace takes
+it — however much LaTeX it is made of.
 
 MathLive loads on demand, and its fonts ship with the app rather than coming from a
 CDN, so math works offline.

@@ -213,6 +213,7 @@ const decodePath = (src: string): string => {
 function decorateLine(
   line: { from: number; to: number; text: string },
   out: Range<Decoration>[],
+  atoms: Range<Decoration>[],
   ctx: { note: string; vault: Vault; math: MathSpan | null },
 ): void {
   const text = line.text;
@@ -257,7 +258,9 @@ function decorateLine(
     if (!free(span.from - line.from, span.to - span.from)) continue;
     if (ctx.math && span.from < ctx.math.to && span.to > ctx.math.from) continue;
     const widget = new MathRender(span.latex, span.display);
-    out.push(Decoration.replace({ widget }).range(span.from, span.to));
+    const deco = Decoration.replace({ widget }).range(span.from, span.to);
+    out.push(deco);
+    atoms.push(deco);
     taken.push({ from: span.from - line.from, to: span.to - line.from });
   }
 
@@ -305,23 +308,30 @@ function decorateLine(
 function decorateRevealedMath(
   line: { from: number; to: number; text: string },
   out: Range<Decoration>[],
+  atoms: Range<Decoration>[],
   ctx: { math: MathSpan | null },
 ): void {
   for (const span of mathSpans(line)) {
     // The one already open as a field — `math.ts` is drawing that range itself.
     if (ctx.math && span.from < ctx.math.to && span.to > ctx.math.from) continue;
     const widget = new MathRender(span.latex, span.display);
-    out.push(Decoration.replace({ widget }).range(span.from, span.to));
+    const deco = Decoration.replace({ widget }).range(span.from, span.to);
+    out.push(deco);
+    atoms.push(deco);
   }
 }
 
+/** Everything on screen: what to draw, and which of it the caret crosses in one step. */
+type Built = { decorations: DecorationSet; atoms: DecorationSet };
+
 /** The decorations for what is on screen. Off-screen lines cost nothing. */
-function build(view: EditorView, ctx: LiveContext): DecorationSet {
+function build(view: EditorView, ctx: LiveContext): Built {
   const state = view.state;
   const fences = fencedSpans(state);
   // An editor nobody is typing in has no block to reveal: the note reads as finished text.
   const open = view.hasFocus ? revealed(state, fences) : [];
   const out: Range<Decoration>[] = [];
+  const atoms: Range<Decoration>[] = [];
   const here = { note: ctx.note(), vault: ctx.vault(), math: activeMathSpan(state) };
 
   for (const range of view.visibleRanges) {
@@ -332,34 +342,48 @@ function build(view: EditorView, ctx: LiveContext): DecorationSet {
       if (!line.text.trim()) continue;
       if (fences.some((span) => overlaps(span, line.from, line.to))) continue;
       if (open.some((span) => overlaps(span, line.from, line.to))) {
-        decorateRevealedMath(line, out, here);
+        decorateRevealedMath(line, out, atoms, here);
         continue;
       }
-      decorateLine(line, out, here);
+      decorateLine(line, out, atoms, here);
     }
   }
   // Sorted on the way in: a line's decorations are produced in the order that reads best,
   // not the order the range set needs.
-  return Decoration.set(out, true);
+  return { decorations: Decoration.set(out, true), atoms: Decoration.set(atoms, true) };
 }
 
 export function livePreview(ctx: LiveContext): Extension {
   return ViewPlugin.fromClass(
     class {
-      decorations: DecorationSet;
+      built: Built;
 
       constructor(view: EditorView) {
-        this.decorations = build(view, ctx);
+        this.built = build(view, ctx);
       }
 
       update(update: ViewUpdate): void {
         const moved = update.docChanged || update.selectionSet;
         if (moved || update.viewportChanged || update.focusChanged) {
-          this.decorations = build(update.view, ctx);
+          this.built = build(update.view, ctx);
         }
       }
     },
-    { decorations: (plugin) => plugin.decorations },
+    {
+      decorations: (plugin) => plugin.built.decorations,
+      /*
+       * A drawn formula is one thing on the page, so it is one step for the caret: `$\frac12$`
+       * is nine characters in the file, and without this, crossing it means nine presses of the
+       * arrow key through positions that are not anywhere on screen. Backspace takes the whole
+       * formula for the same reason.
+       *
+       * Only the formulas. The hidden markers around a heading or a bit of bold are the *same*
+       * text you are editing, with the `#` or the `**` tucked away; skipping them would make
+       * the caret jump over the words themselves.
+       */
+      provide: (plugin) =>
+        EditorView.atomicRanges.of((view) => view.plugin(plugin)?.built.atoms ?? Decoration.none),
+    },
   );
 }
 
