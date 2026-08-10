@@ -28,15 +28,24 @@ WITH transfers AS (
     AND cs_object LIKE '%.dmg'
   GROUP BY day, c_ip, cs_object
 ),
+-- Resolved per object *per day*, not per object. Bedrock-latest-arm64.dmg is
+-- overwritten by every release, so a single size for its whole history would be
+-- the largest version ever published — and after a release that shrinks the dmg,
+-- every complete download of the new one would silently fall under the bar and
+-- go uncounted. Per day, the bar tracks whatever was actually being served.
+--
+-- The trade is that a day whose only traffic is one large partial sets its own
+-- low bar and counts that partial; the 50MB floor below bounds how wrong that
+-- can get. A silent, permanent undercount is the worse failure.
 sizes AS (
-  SELECT cs_object, MAX(sent) AS full_size
+  SELECT cs_object, day, MAX(sent) AS full_size
   FROM transfers
-  GROUP BY cs_object
+  GROUP BY cs_object, day
 ),
 finished AS (
   SELECT t.day, t.cs_object, t.automated
   FROM transfers t
-  JOIN sizes s USING (cs_object)
+  JOIN sizes s USING (cs_object, day)
   WHERE t.sent >= GREATEST(0.9 * s.full_size, 50 * 1024 * 1024)
 )
 SELECT
