@@ -1032,6 +1032,13 @@ button.twisty:hover {
   max-width: 100%;
 }
 
+/*
+ * MathLive draws in black whatever the page around it looks like: its shadow root sets the
+ * colour rather than inheriting one, which is fine on white and invisible on this canvas. The
+ * palette has to be handed in from out here — the glyphs, the caret and the selection each
+ * separately, and the glyphs twice, because the container inside the shadow root sets its own
+ * and only a `::part` reaches it.
+ */
 .cm-mathfield math-field {
   flex: 0 1 auto;
   min-width: 3ch;
@@ -1039,6 +1046,14 @@ button.twisty:hover {
   border: 1px solid var(--accent);
   border-radius: 4px;
   background: var(--bg-hover);
+  color: var(--text);
+  --caret-color: var(--text);
+  --selection-background-color: var(--accent);
+  --selection-color: #fff;
+}
+
+.cm-mathfield math-field::part(container) {
+  color: var(--text);
 }
 
 /* Not a second source of truth — it shows and edits the same formula the field holds, and
@@ -1050,7 +1065,7 @@ button.twisty:hover {
   border: 1px solid var(--line);
   border-radius: 4px;
   background: var(--bg);
-  color: var(--muted);
+  color: var(--text);
   font-family: inherit;
   font-size: 0.85em;
 }
