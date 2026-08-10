@@ -222,15 +222,22 @@ class MathField extends WidgetType {
       if (caret !== null) view.focus();
     };
 
+    /** Escape belongs to the formula before the editor, which would otherwise close the note. */
     const onKey = (event: KeyboardEvent): void => {
       if (event.key !== "Enter" && event.key !== "Escape") return;
-      // Escape belongs to the formula first. Left to reach the editor it would close the note
-      // out from under a half-written one.
       event.preventDefault();
       event.stopPropagation();
       commit("after");
     };
-    field.addEventListener("keydown", onKey);
+    field.addEventListener("keydown", (event) => {
+      /*
+       * Halfway through a `\command` both keys belong to MathLive — Enter completes it, Escape
+       * abandons it — and taking them here would swallow the keystroke that was meant to turn
+       * `\sqrt` into a radical.
+       */
+      if (field.mode === "latex") return;
+      onKey(event);
+    });
     source.addEventListener("keydown", onKey);
 
     // An arrow key with nowhere left to go inside the formula means out of it, that way.
@@ -268,6 +275,15 @@ class MathField extends WidgetType {
       if (!field.isConnected) return; // closed again within the frame
       field.value = this.span.latex;
       field.menuItems = []; // no context menu — the note is the document, not the formula
+      /*
+       * MathLive ships a table of inline shortcuts that rewrite letters as you type them:
+       * `sqrt` becomes a radical, `pi` becomes π, and so on. A formula is often prose about
+       * mathematics as much as mathematics — `sqrt` may well be the name of the function being
+       * written about — and having it turn into an operator underfoot is not something you can
+       * undo a character at a time. A backslash is how you ask for an operator, as in Abitti:
+       * `\sqrt` is a radical, `sqrt` is four letters.
+       */
+      field.inlineShortcuts = {};
       field.focus();
     });
     return box;
