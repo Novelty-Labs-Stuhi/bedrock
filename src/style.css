@@ -1033,11 +1033,14 @@ button.twisty:hover {
 }
 
 /*
- * MathLive draws in black whatever the page around it looks like: its shadow root sets the
- * colour rather than inheriting one, which is fine on white and invisible on this canvas. The
- * palette has to be handed in from out here — the glyphs, the caret and the selection each
- * separately, and the glyphs twice, because the container inside the shadow root sets its own
- * and only a `::part` reaches it.
+ * MathLive carries two palettes and picks between them on the *operating system's* colour
+ * scheme, which has nothing to do with which theme this app is wearing: on a dark Mac it drew a
+ * near-black slab round the sub-expression holding the caret, on a light note. The glyph colour
+ * is worse still — that one it hardcodes, so a formula came out black on a dark canvas.
+ *
+ * So none of it is left to MathLive. Every variable it switches on `prefers-color-scheme` is
+ * named here and answered from the app's own palette, and the glyph colour twice, because the
+ * container inside the shadow root sets its own and only a `::part` reaches it.
  */
 .cm-mathfield math-field {
   flex: 0 1 auto;
@@ -1048,8 +1051,19 @@ button.twisty:hover {
   background: var(--bg-hover);
   color: var(--text);
   --caret-color: var(--text);
+  --primary: var(--accent);
   --selection-background-color: var(--accent);
   --selection-color: #fff;
+  /* MathLive shades the sub-expression the caret sits in. Off: the border already says which
+     formula is live and the caret says where you are inside it, and a slab that moves as you
+     type is noise in the middle of a sentence. Named rather than left alone, or the OS's
+     colour scheme picks it again. */
+  --contains-highlight-background-color: transparent;
+  --contains-highlight-color: var(--text);
+  --text-highlight-background-color: transparent;
+  --placeholder-color: var(--muted);
+  --smart-fence-color: var(--muted);
+  --smart-fence-opacity: 0.6;
 }
 
 .cm-mathfield math-field::part(container) {
