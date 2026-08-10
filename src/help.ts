@@ -41,6 +41,7 @@ const MARKDOWN: Row[] = [
   ["~~struck~~", "struck through"],
   ["==marked==", "highlighted"],
   ["`code`", "code — ``` on its own line for a block"],
+  ["$…$ / $$…$$", "a formula — ⌘E opens the editor"],
   ["- item", "list (1. numbers it)"],
   ["> quoted", "quote"],
   ["[[Note]]", "link a note — this is what draws an edge"],
@@ -56,7 +57,7 @@ const MARKDOWN: Row[] = [
 /** The bar does all of this too — it is here so the bar can stop being needed. */
 const EDITING: Row[] = [
   ["select text", "the format bar appears over it"],
-  ["⌘B ⌘I ⌘E", "bold, italic, code"],
+  ["⌘B ⌘I ⌘E / ⌘⇧E", "bold, italic, formula / code"],
   ["⌘K / ⌘⇧K", "link a note / a web address"],
   ["type * ` [ (", "wraps the selection instead of replacing it"],
   ["Enter in a list", "carries the bullet down; empty item ends it"],

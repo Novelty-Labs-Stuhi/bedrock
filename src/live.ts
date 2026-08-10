@@ -188,6 +188,9 @@ const WIKILINK = /\[\[[^\][]+\]\]/g;
  */
 const INLINE = /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|(~~[^~\n]+~~)|(==[^=\n]+==)|(\*[^*\n]+\*)/g;
 
+/** Backticks alone — claimed before formulas so `$x$` inside code stays literal. */
+const INLINE_CODE = /`[^`\n]+`/g;
+
 /** Per capture group of `INLINE`: how many characters the marker is, and what it means. */
 const KINDS = [
   { pad: 1, cls: "cm-code" },
@@ -244,6 +247,22 @@ function decorateLine(
     const to = alone ? line.to : line.from + at + m[0].length;
     out.push(Decoration.replace({ widget }).range(from, to));
     if (alone) return; // the line is the picture — there is nothing else on it to decorate
+    taken.push({ from: at, to: at + m[0].length });
+  }
+
+  /*
+   * Inline code before formulas: `` `$x$` `` is a code span that happens to hold dollar signs,
+   * not a formula wrapped in backticks. Claiming the backticks first keeps math out of them;
+   * the later INLINE pass still draws the code (already in `taken`, so free() skips a second go).
+   */
+  for (const m of text.matchAll(INLINE_CODE)) {
+    const at = m.index ?? 0;
+    if (!free(at, m[0].length)) continue;
+    const from = line.from + at;
+    const to = from + m[0].length;
+    out.push(HIDE.range(from, from + 1));
+    out.push(Decoration.mark({ class: "cm-code" }).range(from + 1, to - 1));
+    out.push(HIDE.range(to - 1, to));
     taken.push({ from: at, to: at + m[0].length });
   }
 
@@ -311,9 +330,18 @@ function decorateRevealedMath(
   atoms: Range<Decoration>[],
   ctx: { math: MathSpan | null },
 ): void {
+  // Same rule as decorateLine: dollars inside backticks are code, not math.
+  const code: Span[] = [];
+  for (const m of line.text.matchAll(INLINE_CODE)) {
+    const at = m.index ?? 0;
+    code.push({ from: at, to: at + m[0].length });
+  }
   for (const span of mathSpans(line)) {
     // The one already open as a field — `math.ts` is drawing that range itself.
     if (ctx.math && span.from < ctx.math.to && span.to > ctx.math.from) continue;
+    const localFrom = span.from - line.from;
+    const localTo = span.to - line.from;
+    if (code.some((c) => localFrom < c.to && localTo > c.from)) continue;
     const widget = new MathRender(span.latex, span.display);
     const deco = Decoration.replace({ widget }).range(span.from, span.to);
     out.push(deco);

@@ -5,15 +5,14 @@
 // unchanged if this feature is ever removed. Everything below is a way of looking at those
 // characters, never a second copy of them.
 //
-// Three states, and which one you get follows the rule `live.ts` already sets for the rest of
-// markdown — rendered until you are working on it:
+// Two states, following the rule `live.ts` already sets for the rest of markdown — drawn until
+// you open one:
 //
-//   - not where you are working → the formula, drawn.
-//   - caret somewhere in the block → the source, `$\frac{a}{b}$`, editable as text like any
-//     other markdown marker. This is still the way to fix LaTeX by hand.
-//   - the formula itself opened (⌘E, or a click on a drawn one) → a MathLive field with the
-//     symbol bar above the note and the LaTeX beside it, which is the only part of the app
-//     where you edit something other than characters.
+//   - not being edited → the formula, drawn. It stays drawn with the caret elsewhere in the
+//     block; the LaTeX box inside the field is where you edit it as characters.
+//   - opened (⌘E, or a click on a drawn one) → a MathLive field with the symbol bar above the
+//     note and the LaTeX beside it, which is the only part of the app where you edit something
+//     other than characters.
 //
 // The field is deliberately transient. It owns its content while it is open and writes back once,
 // on the way out; the document does not change under it on every keystroke. That is what keeps
@@ -85,10 +84,83 @@ const activeMath = StateField.define<MathSpan | null>({
 export const activeMathSpan = (state: EditorState): MathSpan | null =>
   state.field(activeMath, false) ?? null;
 
+/**
+ * The field currently on screen. Commit goes through here rather than reading `activeMath` from a
+ * blur that may arrive after another formula has already taken its place — otherwise the old
+ * field's LaTeX lands in the new one's range.
+ */
+type OpenHandle = {
+  span: MathSpan;
+  latest: () => string;
+  /** Marks this field settled; returns false if it already committed or was discarded. */
+  take: () => boolean;
+};
+
+let openHandle: OpenHandle | null = null;
+
+/** Shift `span` after a replace of `[from, to)` with `insertLen` characters. */
+function mapSpan(span: MathSpan, from: number, to: number, insertLen: number): MathSpan {
+  if (span.to <= from) return span;
+  if (span.from >= to) {
+    const delta = insertLen - (to - from);
+    return { ...span, from: span.from + delta, to: span.to + delta };
+  }
+  // Overlapped the formula just written — point at where that body landed.
+  return { ...span, from, to: from + insertLen };
+}
+
+/**
+ * Write a field back into the document. `null` caret leaves the selection alone — a click away
+ * has already placed it, and setting one here would snap it back onto the formula.
+ */
+function flushHandle(
+  view: EditorView,
+  handle: OpenHandle,
+  caret: "before" | "after" | null,
+): { from: number; to: number; insertLen: number } | null {
+  if (!handle.take()) return null;
+  if (openHandle === handle) openHandle = null;
+
+  // Only write while this field is still the active one. Cleared by an external edit → leave the
+  // file alone, same rule as the state field.
+  const open = view.state.field(activeMath);
+  if (!open || open.from !== handle.span.from || open.to !== handle.span.to) return null;
+
+  const latex = handle.latest().trim();
+  // An emptied formula deletes itself. That is the way to take one out, and ⌘Z is one step.
+  const body = latex ? (open.display ? `$$${latex}$$` : `$${latex}$`) : "";
+  const spec: {
+    changes: { from: number; to: number; insert: string };
+    effects: ReturnType<typeof setActive.of>;
+    selection?: { anchor: number };
+  } = {
+    changes: { from: open.from, to: open.to, insert: body },
+    effects: setActive.of(null),
+  };
+  if (caret !== null) {
+    spec.selection = { anchor: caret === "before" ? open.from : open.from + body.length };
+  }
+  view.dispatch(spec);
+  if (caret !== null) view.focus();
+  return { from: open.from, to: open.to, insertLen: body.length };
+}
+
 /** Put a field over a formula. Awaits the library so the widget can be built synchronously. */
 async function openField(view: EditorView, span: MathSpan): Promise<void> {
   await loadMathLive();
-  view.dispatch({ selection: { anchor: span.from }, effects: setActive.of(span) });
+  const current = view.state.field(activeMath);
+  // Same formula already open — do not commit-and-reopen under the caret.
+  if (current && current.from === span.from && current.to === span.to) return;
+
+  // Flush first. Opening another field destroys this one, and a blur arriving after the new
+  // formula is active would otherwise write the old LaTeX into the new range.
+  let target = span;
+  if (openHandle) {
+    const replaced = flushHandle(view, openHandle, null);
+    if (replaced) target = mapSpan(span, replaced.from, replaced.to, replaced.insertLen);
+  }
+
+  view.dispatch({ selection: { anchor: target.from }, effects: setActive.of(target) });
 }
 
 /* ------------------------------------------------------------- drawing --- */
@@ -154,6 +226,8 @@ export class MathRender extends WidgetType {
 /* ------------------------------------------------------------ the field --- */
 
 class MathField extends WidgetType {
+  private handle: OpenHandle | null = null;
+
   constructor(private readonly span: MathSpan) {
     super();
   }
@@ -195,6 +269,19 @@ class MathField extends WidgetType {
      * commit was supposed to save. `input` only fires while the field is mounted and correct.
      */
     let latest = this.span.latex;
+    let settled = false;
+    const handle: OpenHandle = {
+      span: this.span,
+      latest: () => latest,
+      take: () => {
+        if (settled) return false;
+        settled = true;
+        return true;
+      },
+    };
+    this.handle = handle;
+    openHandle = handle;
+
     field.addEventListener("input", () => {
       latest = field.value;
       source.value = latest;
@@ -204,22 +291,9 @@ class MathField extends WidgetType {
       field.setValue(latest, { silenceNotifications: true });
     });
 
-    let settled = false;
     /** Write the formula back into the file. `null` leaves the caret wherever the click went. */
     const commit = (caret: "before" | "after" | null): void => {
-      if (settled) return;
-      settled = true;
-      const open = view.state.field(activeMath);
-      if (!open) return;
-      const latex = latest.trim();
-      // An emptied formula deletes itself. That is the way to take one out, and ⌘Z is one step.
-      const body = latex ? (open.display ? `$$${latex}$$` : `$${latex}$`) : "";
-      view.dispatch({
-        changes: { from: open.from, to: open.to, insert: body },
-        selection: { anchor: caret === "before" ? open.from : open.from + body.length },
-        effects: setActive.of(null),
-      });
-      if (caret !== null) view.focus();
+      flushHandle(view, handle, caret);
     };
 
     /** Escape belongs to the formula before the editor, which would otherwise close the note. */
@@ -295,6 +369,10 @@ class MathField extends WidgetType {
   }
 
   destroy(): void {
+    // Discard without writing when the document changed under us. A late blur must not flush
+    // into whatever formula opened next, so burn the handle if it is still ours.
+    if (this.handle && openHandle === this.handle) openHandle = null;
+    this.handle?.take();
     hideBar();
   }
 }
