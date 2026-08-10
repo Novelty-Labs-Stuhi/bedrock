@@ -10,8 +10,7 @@ on:
       # The count the page shows is refreshed by this job, so a change to how it
       # is computed has to be able to trigger one. Without these, merging a fix
       # to the counter produced no site build at all.
-      - "scripts/publish-count.sh"
-      - "scripts/download-count.sql"
+      - "scripts/publish-count.py"
       - ".github/workflows/deploy-site.yml"
   workflow_dispatch:
 
@@ -53,11 +52,13 @@ jobs:
             --quiet
 
       - name: Refresh the download count the page shows
+        # Also on a schedule in refresh-count.yml; this just means a freshly
+        # deployed page is never showing a number from the last deploy.
         # GCLOUD_ACCOUNT empty: use the ambient workload identity credentials
         # rather than the gmail account the script assumes when run by hand.
         env:
           GCLOUD_ACCOUNT: ""
-        run: ./scripts/publish-count.sh
+        run: python3 scripts/publish-count.py
 
       - name: Check the redirects still resolve
         run: |

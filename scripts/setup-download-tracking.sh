@@ -104,8 +104,10 @@ echo "==> External table over the usage logs"
 echo "==> Letting CI publish the count the site shows"
 # deploy-site.yml runs scripts/publish-count.sh, so the GitHub Actions identity
 # needs to run a query and read the external table. Storage write it already has.
+# bigquery.*: download-count.sh reads the external table. monitoring.viewer:
+# publish-count.py reads bytes served, which is what the page's count comes from.
 CI_SA="github-actions-bedrock@${PROJECT}.iam.gserviceaccount.com"
-for role in roles/bigquery.jobUser roles/bigquery.dataViewer; do
+for role in roles/bigquery.jobUser roles/bigquery.dataViewer roles/monitoring.viewer; do
   retry "${GC[@]}" projects add-iam-policy-binding "$PROJECT" \
     --member "serviceAccount:${CI_SA}" --role "$role" >/dev/null
   echo "    $role"
