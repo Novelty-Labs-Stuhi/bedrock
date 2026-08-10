@@ -154,14 +154,16 @@ def refresh_count(backfill=None):
         "generated": datetime.now(timezone.utc).strftime(ISO),
     }
 
-    bucket.blob(COUNTS_OBJECT).upload_from_string(
+    # Short cache, set before the upload so it lands in the same request. Doing it
+    # as a second patch leaves a window where the object is public with no
+    # cache-control, and anything fetching in that window caches it under GCS's
+    # much longer default — which is how a stale copy outlives several rewrites.
+    blob = bucket.blob(COUNTS_OBJECT)
+    blob.cache_control = "public, max-age=120"
+    blob.upload_from_string(
         json.dumps(payload, indent=2) + "\n",
         content_type="application/json",
     )
-    # Short cache: the site proxies this and the whole point is that it moves.
-    blob = bucket.get_blob(COUNTS_OBJECT)
-    blob.cache_control = "public, max-age=120"
-    blob.patch()
 
     payload["window"] = f"{start.strftime(ISO)}..{end.strftime(ISO)}"
     payload["new_bytes"] = fresh
