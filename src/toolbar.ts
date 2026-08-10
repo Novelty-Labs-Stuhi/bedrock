@@ -35,7 +35,7 @@ const GROUPS: Action[][] = [
     { label: "I", cls: "f-i", title: "Italic  ⌘I", run: italic },
     { label: "S", cls: "f-s", title: "Strikethrough", run: (t, s, e) => md.toggleWrap(t, s, e, "~~") },
     { label: "A", cls: "f-hl", title: "Highlight", run: (t, s, e) => md.toggleWrap(t, s, e, "==") },
-    { label: "<>", title: "Code — a block if it spans lines  ⌘E", run: md.code },
+    { label: "<>", title: "Code — a block if it spans lines  ⌘⇧E", run: md.code },
   ],
   [
     { label: "H", title: "Heading — H1, H2, H3, then off", run: md.heading },
@@ -207,7 +207,9 @@ const onTab = (out: boolean): Command => (view) => {
 const KEYS: KeyBinding[] = [
   { key: "Mod-b", run: patcher(bold) },
   { key: "Mod-i", run: patcher(italic) },
-  { key: "Mod-e", run: patcher(md.code) },
+  // ⌘E writes a formula (`math.ts`), which is the binding people arrive with from Abitti and
+  // the other exam editors; code moves one modifier along rather than sharing it.
+  { key: "Mod-Shift-e", run: patcher(md.code) },
   { key: "Mod-k", run: patcher(md.wikilink) },
   { key: "Mod-Shift-k", run: patcher(md.link) },
   { key: "Enter", run: onEnter },

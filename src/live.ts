@@ -26,6 +26,7 @@ import {
   WidgetType,
 } from "@codemirror/view";
 import { assetUrl, cachedAsset, missingMarker } from "./images";
+import { MathRender, activeMathSpan, mathSpans, type MathSpan } from "./math";
 import { basename, isImage, type Vault } from "./vault";
 
 /** What the layer needs from the app: which note is open, and what to read its bytes from. */
@@ -212,7 +213,7 @@ const decodePath = (src: string): string => {
 function decorateLine(
   line: { from: number; to: number; text: string },
   out: Range<Decoration>[],
-  ctx: { note: string; vault: Vault },
+  ctx: { note: string; vault: Vault; math: MathSpan | null },
 ): void {
   const text = line.text;
   const taken: Span[] = [];
@@ -243,6 +244,21 @@ function decorateLine(
     out.push(Decoration.replace({ widget }).range(from, to));
     if (alone) return; // the line is the picture — there is nothing else on it to decorate
     taken.push({ from: at, to: at + m[0].length });
+  }
+
+  /*
+   * Formulas claim their ranges next, for the same reason embeds do: `$a * b * c$` holds a
+   * perfectly good pair of asterisks that must not become italics, and the `_` in `$x_1$` is a
+   * subscript rather than the start of anything. The formula currently open as a field is the
+   * one exception — `math.ts` is already drawing over that range, and two widgets replacing the
+   * same characters is an error rather than a race.
+   */
+  for (const span of mathSpans(line)) {
+    if (!free(span.from - line.from, span.to - span.from)) continue;
+    if (ctx.math && span.from < ctx.math.to && span.to > ctx.math.from) continue;
+    const widget = new MathRender(span.latex, span.display);
+    out.push(Decoration.replace({ widget }).range(span.from, span.to));
+    taken.push({ from: span.from - line.from, to: span.to - line.from });
   }
 
   const heading = HEADING.exec(text);
@@ -279,7 +295,7 @@ function build(view: EditorView, ctx: LiveContext): DecorationSet {
   // An editor nobody is typing in has no block to reveal: the note reads as finished text.
   const open = view.hasFocus ? revealed(state, fences) : [];
   const out: Range<Decoration>[] = [];
-  const here = { note: ctx.note(), vault: ctx.vault() };
+  const here = { note: ctx.note(), vault: ctx.vault(), math: activeMathSpan(state) };
 
   for (const range of view.visibleRanges) {
     let pos = range.from;

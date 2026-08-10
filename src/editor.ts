@@ -8,6 +8,7 @@ import { Annotation, EditorState } from "@codemirror/state";
 import { EditorView, keymap, placeholder } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { livePreview, wikilinkAt } from "./live";
+import { math } from "./math";
 import { formatting } from "./toolbar";
 import type { Vault } from "./vault";
 
@@ -60,6 +61,9 @@ export function createEditor(parent: HTMLElement, hooks: EditorHooks): Editor {
     ]),
     // The format bar, the markdown shortcuts, and the list/indent/wrap typing behaviour.
     formatting(),
+    // Before the live layer: `math()` owns the formula being edited, and the live layer reads
+    // which one that is so it does not draw over the top of it.
+    math(),
     livePreview({ note: hooks.note, vault: hooks.vault }),
     EditorView.lineWrapping,
     placeholder(PLACEHOLDER),
