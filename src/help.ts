@@ -6,6 +6,21 @@
 
 type Row = [string, string];
 
+/**
+ * A field somebody is typing in. `INPUT` and `TEXTAREA` are the plain ones — the LaTeX box beside
+ * a formula is one of them — and `MATH-FIELD` is the formula itself, a custom element with its own
+ * editing surface behind a shadow root, which is why its tag has to be named here rather than
+ * caught by either of the others.
+ *
+ * A formula is the one place where this is not a nicety. `/` is how you ask for a fraction, and on
+ * a Nordic layout `/` is Shift+7 — arriving as a shifted slash, which is exactly what this panel
+ * answers to. Without this, a fraction cannot be typed at all.
+ *
+ * The note itself is deliberately not on the list: `?` still opens the panel from inside a note.
+ */
+const typing = (target: EventTarget | null): boolean =>
+  /^(INPUT|TEXTAREA|MATH-FIELD)$/.test((target as HTMLElement | null)?.tagName ?? "");
+
 /** Left column is typed or done; right column is what happens. Nothing else fits. */
 const GESTURES: Row[] = [
   ["click a note", "open it"],
@@ -81,7 +96,7 @@ export function mountHelp(button: HTMLElement, panel: HTMLElement): void {
     // `?` from anywhere except a field somebody is typing in. Some layouts (and every
     // automated key injection) report the unshifted `/` instead, so both are accepted.
     const asked = event.key === "?" || (event.key === "/" && event.shiftKey);
-    if (!asked || /^(INPUT|TEXTAREA)$/.test((event.target as HTMLElement)?.tagName)) return;
+    if (!asked || typing(event.target)) return;
     show(panel.classList.contains("hidden"));
   });
 }
