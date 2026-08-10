@@ -44,7 +44,15 @@ jobs:
             --project cleveland-464404-m0 \
             --allow-unauthenticated \
             --port 8080 \
+            --max-instances 4 \
             --quiet
+
+      - name: Refresh the download count the page shows
+        # GCLOUD_ACCOUNT empty: use the ambient workload identity credentials
+        # rather than the gmail account the script assumes when run by hand.
+        env:
+          GCLOUD_ACCOUNT: ""
+        run: ./scripts/publish-count.sh
 
       - name: Check the redirects still resolve
         run: |
