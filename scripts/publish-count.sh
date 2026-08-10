@@ -61,7 +61,10 @@ PY
 )"
 echo "    $PAYLOAD"
 
-TMP="$(mktemp -t counts)"
+# Full template, no -t: BSD mktemp treats -t's argument as a prefix, GNU requires
+# at least three X's in it and errors out otherwise. This form behaves the same on
+# the runner and on a mac.
+TMP="$(mktemp "${TMPDIR:-/tmp}/counts.XXXXXX")"
 trap 'rm -f "$TMP"' EXIT
 printf '%s\n' "$PAYLOAD" >"$TMP"
 
