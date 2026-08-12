@@ -19,8 +19,6 @@ export type Frame = { w: number; h: number };
  */
 export type FolderStyle = { bg: string; fence: string };
 
-export const NO_FOLDER_STYLE: FolderStyle = { bg: "", fence: "" };
-
 export const DEFAULT_FRAME: Frame = { w: 260, h: 170 };
 /** Breathing room between a note's circle and the frame's border. */
 const EDGE_GAP = 5;

@@ -23,7 +23,6 @@ import { layoutGraph } from "./apply-layout";
 import {
   LinkResolver,
   parseField,
-  parseGhost,
   parseLinks,
   parseStyle,
   parseTags,
@@ -281,37 +280,6 @@ const GLOBE_ICON =
   );
 
 /**
- * The ghost a parked note wears: the classic sheet — rounded head, two eye slots, three
- * drips of uneven length trailing off the bottom — floating over its own little shadow.
- * Darker grey on the grey the node turns, so a ghosted note reads as a shape with the
- * light off rather than a different kind of note. Inline SVG like the app icons above,
- * and 256px of raster for the same reason they are.
- */
-const GHOST_GREY = "#565b63";
-const GHOST_DARK = "#2b2e33";
-
-const GHOST_ICON =
-  "data:image/svg+xml;utf8," +
-  encodeURIComponent(
-    `<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 64 64">` +
-      // Head and shoulders: a semicircle carried straight down a little, so the drips
-      // below hang off a body rather than straight off the dome.
-      `<path fill="${GHOST_DARK}" d="M12 26 a20 20 0 0 1 40 0 v6 h-40 z"/>` +
-      // The drips: round-capped strokes of uneven length, the middle one longest —
-      // even lengths read as a paw print, not a ghost.
-      `<g stroke="${GHOST_DARK}" stroke-width="11" stroke-linecap="round">` +
-      `<line x1="17.5" y1="30" x2="17.5" y2="41"/>` +
-      `<line x1="32" y1="30" x2="32" y2="46"/>` +
-      `<line x1="46.5" y1="30" x2="46.5" y2="36"/>` +
-      `</g>` +
-      // Eyes cut in the node's own grey, so they read as holes rather than dots.
-      `<rect x="24" y="16" width="5.5" height="10" rx="2.75" fill="${GHOST_GREY}"/>` +
-      `<rect x="34.5" y="16" width="5.5" height="10" rx="2.75" fill="${GHOST_GREY}"/>` +
-      `<ellipse cx="32" cy="58" rx="10" ry="2.8" fill="${GHOST_DARK}" opacity="0.5"/>` +
-      `</svg>`,
-  );
-
-/**
  * Styles by note TYPE — the `type:: …` line a file ends with. Untyped notes are
  * tag-pie circles; a typed one wears its type on its sleeve — a Gemini
  * conversation IS the Gemini app icon. New types slot in here and get their
@@ -401,10 +369,29 @@ const URL_RE = /https?:\/\/[^\s)\]>]+/;
  *
  * The ink follows the ground rather than being picked: labels have to stay readable on a
  * pale canvas, and nobody should have to choose a text colour to get that.
+ *
+ * Names can also be taken off altogether (`look.captions`), which leaves the graph as
+ * shapes and makes a name something you ask for by pointing at it: the hover handlers put
+ * `.named` on whatever should speak, and the two rules at the foot of the sheet are what
+ * lets it. Folder names are exempt — a box does not answer the mouse at all.
  */
 function styleSheet(look: Look): cytoscape.StylesheetJson {
   const ground = canvasHex(look.bg);
   const ink = inkOn(ground);
+  /** What a node or edge is labelled with when nothing is hovering it. */
+  const name = look.captions ? "data(label)" : "";
+  /**
+   * A label the pointer asked for lands wherever the graph already is — over edges, over
+   * other notes — so it is backed by the ground it sits on, the way edge labels always are.
+   */
+  const plate = {
+    "text-background-color": ground,
+    "text-background-opacity": 0.85,
+    "text-background-padding": "2px",
+    // `as const`: cytoscape's types take the shape from a fixed set, and a widened
+    // `string` no longer fits the block this is spread into.
+    "text-background-shape": "roundrectangle" as const,
+  };
   const nodeHex = paint(look.node) || UNTAGGED;
   const edgeHex = paint(look.edge) || UNTAGGED;
   const folderHex = paint(look.folder) || BOX;
@@ -413,7 +400,7 @@ function styleSheet(look: Look): cytoscape.StylesheetJson {
       selector: "node",
       style: {
         "background-color": nodeHex,
-        label: "data(label)",
+        label: name,
         color: ink,
         "font-size": 10,
         "text-valign": "center",
@@ -433,9 +420,8 @@ function styleSheet(look: Look): cytoscape.StylesheetJson {
     ...typeShapeStyles(),
     /*
      * A note's own look, chosen on the canvas (right-click → "Style…") and kept in its
-     * markdown. Above the type styles, so a chosen colour or sign beats the one a type
-     * would have given it — the note was styled by hand, and by hand wins — and below the
-     * ghost, which is a statement about the note rather than a decoration on it.
+     * markdown. After the type styles, so a chosen colour or sign beats the one a type
+     * would have given it — the note was styled by hand, and by hand wins.
      *
      * `[?key]` — has a truthy value — and never `[key != ""]`, which also matches every
      * node that has no such key at all, and paints the whole graph with an undefined.
@@ -466,6 +452,9 @@ function styleSheet(look: Look): cytoscape.StylesheetJson {
       selector: "node:parent",
       style: {
         "background-color": folderHex,
+        // Said again rather than inherited: with names off, a box is the one thing that
+        // keeps its own, because nothing can point at it to ask (`events: no`, below).
+        label: "data(label)",
         // Almost see-through: the box is a boundary, and whatever it sits on top of
         // (another box, an edge passing under) has to stay readable through it.
         "background-opacity": 0.07,
@@ -552,51 +541,18 @@ function styleSheet(look: Look): cytoscape.StylesheetJson {
     {
       selector: "edge[label]",
       style: {
-        label: "data(label)",
+        label: name,
         "font-size": 9,
         color: ink,
         "text-rotation": "autorotate",
-        "text-background-color": ground,
-        "text-background-opacity": 0.85,
-        "text-background-padding": "2px",
-        "text-background-shape": "roundrectangle",
+        ...plate,
       },
     },
     /*
-     * The marks a right-click can put on things (see `applyMarks`). A ghost is parked, not
-     * gone: the node turns grey and wears the ghost itself, ringed by long dashes — long
-     * on purpose, a dash you can read from across the canvas where a dot is just fuzz.
-     * The edge version is the same statement drawn along a line. A radiating edge is the
-     * line counterpart of a radiating note — the same green, with `syncEdgeBeat` walking
-     * the dashes along it so the flow reads as flowing.
+     * The mark a right-click can put on a connection (see `applyMarks`): a radiating edge
+     * is the line counterpart of a radiating note — the same green, with `syncEdgeBeat`
+     * walking the dashes along it so the flow reads as flowing.
      */
-    {
-      selector: "node.ghost",
-      style: {
-        "pie-size": "0%",
-        "background-color": GHOST_GREY,
-        "background-opacity": 1,
-        "background-image": GHOST_ICON,
-        "background-image-opacity": 1,
-        "background-fit": "none",
-        "background-width": "74%",
-        "background-height": "74%",
-        "border-width": 2,
-        "border-color": "#8b949e",
-        "border-style": "dashed",
-        "border-dash-pattern": [9, 6],
-        color: "#8b949e",
-      },
-    },
-    {
-      selector: "edge.ghost",
-      style: {
-        "line-style": "dashed",
-        "line-dash-pattern": [12, 8],
-        "line-color": "#6e7681",
-        "target-arrow-color": "#6e7681",
-      },
-    },
     {
       selector: "edge.radiate",
       style: {
@@ -606,15 +562,41 @@ function styleSheet(look: Look): cytoscape.StylesheetJson {
         "target-arrow-color": "#3fb950",
       },
     },
-    { selector: "node.active", style: { "border-width": 3, "border-color": ink } },
     { selector: ".faded", style: { opacity: 0.25 } },
-    // The arrow is recoloured with the line everywhere, or a highlighted edge keeps a red
-    // head that reads as a different edge crossing it.
+    /*
+     * A folder box's own way of standing back, for the same moment. It cannot use `.faded`
+     * — `opacity` on a box is inherited by everything inside it, which is precisely the
+     * problem this exists to avoid — so it dims each of its own three parts instead: the
+     * fill, the fence and the name. Nothing there is a property of the notes inside.
+     */
     {
-      selector: ".highlight",
+      selector: "node.faded-box",
+      style: { "background-opacity": 0.03, "border-opacity": 0.25, "text-opacity": 0.3 },
+    },
+    /*
+     * The spotlight the pointer carries: what a hovered note is joined to, and what it is
+     * joined by. Everything outside it is dimmed (`.faded`), which on its own only says
+     * where NOT to look — so the lit group is lit rather than merely left behind.
+     *
+     * An edge takes the ink and thickens. The arrow is recoloured with the line, or a lit
+     * edge keeps a red head that reads as a different edge crossing it.
+     */
+    {
+      selector: "edge.highlight",
       style: { "line-color": ink, "target-arrow-color": ink, width: 2, "arrow-scale": 1.3 },
     },
-    // The connection whose note is the open tab — the edge's answer to the node's ring.
+    /*
+     * A note takes a ring in the same ink and says its name in bold. The ring, not a
+     * colour: a note's fill is its tags' answer (or its own chosen one), and a spotlight
+     * that repainted it would be overwriting what the note is with where the pointer is.
+     */
+    {
+      selector: "node.highlight",
+      style: { "border-width": 2, "border-color": ink, "border-opacity": 1, "font-weight": "bold" },
+    },
+    // The note whose file is the open tab, and the connection whose note is. After the
+    // spotlight, so a pointer passing over the thing you are editing does not thin its ring.
+    { selector: "node.active", style: { "border-width": 3, "border-color": ink } },
     {
       selector: "edge.active",
       style: { "line-color": ink, "target-arrow-color": ink, width: 3, "arrow-scale": 1.1 },
@@ -656,18 +638,31 @@ function styleSheet(look: Look): cytoscape.StylesheetJson {
       selector: "node.frame-anchor",
       style: { width: 1, height: 1, "background-opacity": 0, label: "", events: "no" },
     },
+    /*
+     * With names off, this is how one is asked for: `.named` is put on whatever the pointer
+     * is on and on everything that says what it is — its neighbours, and the links between
+     * them (see the hover handlers in `wire`). Last in the sheet, so it beats the blank the
+     * rules above left; and only present at all while names are off, since with them on every
+     * node is already saying its own and the class would mean nothing.
+     */
+    ...(look.captions
+      ? []
+      : [
+          { selector: "node.named", style: { label: "data(label)", ...plate } },
+          { selector: "edge.named[label]", style: { label: "data(label)" } },
+        ]),
   ];
 }
 
 /* ------------------------------------------------------------------- marks --- */
 
 /**
- * The statuses a right-click can set: radiating (the live end of the vault) or ghost
- * (parked). A node's mark lives in its own markdown — `active:: true` / `ghost:: true` —
- * so it travels with the folder. An edge has no file of its own unless it has been
- * described, so edge marks live in this window's own storage instead, keyed by edge id.
+ * The one status a right-click can set on a connection: radiating, the line counterpart of
+ * a radiating note. A note keeps what it looks like in its own markdown (`sign::`,
+ * `anim::` and the rest — see `parseStyle`), but an edge has no file of its own unless it
+ * has been described, so edge marks live in this window's own storage, keyed by edge id.
  */
-export type Mark = "radiate" | "ghost";
+export type Mark = "radiate";
 
 const MARKS_KEY = "obsidian-lite:edge-marks";
 
@@ -676,7 +671,7 @@ function readEdgeMarks(): Record<string, Mark> {
     const kept = JSON.parse(localStorage.getItem(MARKS_KEY) ?? "{}") as Record<string, unknown>;
     const out: Record<string, Mark> = {};
     for (const [id, mark] of Object.entries(kept)) {
-      if (mark === "radiate" || mark === "ghost") out[id] = mark;
+      if (mark === "radiate") out[id] = mark;
     }
     return out;
   } catch {
@@ -888,8 +883,6 @@ export function buildElements(docs: Doc[], described: ReadonlySet<string> = new 
         // Likewise always present: `sync` patches the keys a definition carries, so an
         // empty string is what takes a sign back off a note that has just lost one.
         ...styleData(parseStyle(doc.text)),
-        // Its grey twin, same bargain: `ghost:: true` in the note, 0 when the line goes.
-        ghost: parseGhost(doc.text) ? 1 : 0,
         // A conversation node opens its link directly, so the URL rides on the node —
         // a click must not wait on a file read (popup blockers honour only the click).
         ...(type === "gemini" ? { gurl: URL_RE.exec(doc.text)?.[0] ?? "" } : {}),
@@ -1735,12 +1728,29 @@ export class GraphView {
       const node = event.target as NodeSingular;
       if (this.draftSource || node.data("kind") !== "file") return;
       const neighborhood = node.closedNeighborhood();
-      cy.elements().difference(neighborhood).addClass("faded");
-      neighborhood.edges().addClass("highlight");
+      // The boxes the lit notes are in stand with them: a spotlight on a note should say
+      // where the note lives, not cut it out of its folder.
+      const lit = neighborhood.union(neighborhood.nodes().ancestors());
+      /*
+       * The folder boxes are dimmed by their own class, and never by `.faded`: cytoscape
+       * multiplies a node's opacity by every ancestor's, so fading the box a note sits in
+       * fades the note inside it. A box is nobody's neighbour, so every box was in the
+       * dimmed set — which is why hovering a note inside one dimmed the note being pointed
+       * at, its name, and any neighbour sharing its folder, instead of lighting them up.
+       */
+      cy.elements().difference(lit).difference(":parent").addClass("faded");
+      cy.nodes(":parent").difference(lit).addClass("faded-box");
+      // Both halves of the spotlight: the notes themselves as well as the links between
+      // them. Not the ancestors — a box is the room, not one of the things lit in it.
+      neighborhood.addClass("highlight");
+      // A vault with names off asks for them by pointing: the note's own, its neighbours',
+      // and what the links between them are called. That is the same neighbourhood the
+      // highlight already works out, so it is the same one that speaks.
+      if (this.namesOnDemand()) neighborhood.addClass("named");
     });
     cy.on("mouseout", "node", () => {
       if (this.draftSource) return;
-      cy.elements().removeClass("faded").removeClass("highlight");
+      this.clearSpotlight();
     });
 
     // Nothing on the line itself says it can be opened, so the status bar says it.
@@ -1751,10 +1761,17 @@ export class GraphView {
       this.handlers.onHint(
         edge.data("described") ? `Open "${title}"` : `Click to describe the flow: ${title}`,
       );
+      // The line's own name, and the two notes it joins — a relation read off a bare line
+      // ("built with") says nothing without both ends of it.
+      if (this.namesOnDemand()) {
+        edge.addClass("named");
+        edge.connectedNodes().addClass("named");
+      }
     });
     cy.on("mouseout", "edge", () => {
       if (this.draftSource || this.drag) return;
       this.handlers.onHint(null);
+      this.clearSpotlight();
     });
 
     /* --- dragging notes between folders, with resistance at every border --- */
@@ -1840,7 +1857,13 @@ export class GraphView {
     if (!drag) return;
     this.clearDropMarks(cy);
 
-    const entering = this.folderAt(cy, pointer, (id) => id === drag.parent);
+    // A box the note is ALREADY in is not a box it is entering. Its own folder, and — for a
+    // folder inside a folder — every box that folder sits in: the pointer is inside all of
+    // them at once, so skipping only the innermost one left the note "entering" its own
+    // grandparent from the first pixel of every drag, and a nudge refiled it one level up.
+    const enclosing = (id: string): boolean =>
+      drag.parent !== null && (id === drag.parent || drag.parent.startsWith(id + "/"));
+    const entering = this.folderAt(cy, pointer, enclosing);
     if (entering) {
       const bb = this.frameRect(cy, entering.id());
       const depth = Math.min(pointer.x - bb.x1, bb.x2 - pointer.x, pointer.y - bb.y1, bb.y2 - pointer.y);
@@ -2118,6 +2141,30 @@ export class GraphView {
   }
 
   /**
+   * Whether this vault has taken the names off the canvas, so a name is something the
+   * pointer asks for. Read from the settings each time rather than cached: the switch is
+   * in the same window as the colours, and the answer has to change with it.
+   */
+  private namesOnDemand(): boolean {
+    return !this.settings.look().captions;
+  }
+
+  /**
+   * Back to the resting canvas: nothing dimmed, nothing lit, nothing speaking that was
+   * only speaking because the pointer was on it. Every way out of a hover ends here —
+   * the pointer leaving, a link draft starting under it, the settings window opening
+   * over it — because a spotlight left behind is one nothing will ever come and clear.
+   */
+  private clearSpotlight(): void {
+    this.cy
+      ?.elements()
+      .removeClass("faded")
+      .removeClass("faded-box")
+      .removeClass("highlight")
+      .removeClass("named");
+  }
+
+  /**
    * Re-paints the canvas in the vault's chosen colours (Settings → General). A restyle
    * rather than a rebuild: nothing about WHICH notes are on screen or where they sit has
    * changed, and a rebuild would throw away the arrangement to put it straight back.
@@ -2126,6 +2173,9 @@ export class GraphView {
     const look = this.settings.look();
     this.container.style.background = canvasHex(look.bg);
     this.cy?.style(styleSheet(look));
+    // A hover interrupted by the settings window never got its mouseout, so whatever it
+    // left lit or speaking is cleared here — otherwise it would still be lit, unpointed-at.
+    this.clearSpotlight();
     // The folders' own colours are painted onto node data, which the new sheet reads —
     // and the badges sit on top of the canvas rather than in it.
     this.paintFolders();
@@ -2187,42 +2237,15 @@ export class GraphView {
     }
   }
 
-  /** The mark a note wears, as the live graph has it — what the menu offers to change. */
-  nodeMark(path: string): Mark | null {
-    const node = this.cy?.getElementById(path);
-    if (!node || node.empty()) return null;
-    if (node.data("radiating")) return "radiate";
-    return node.data("ghost") ? "ghost" : null;
-  }
-
-  /**
-   * Sets (or clears) a note's mark on the live graph, so the look answers the
-   * right-click that asked for it rather than waiting for the next rebuild. Marks are
-   * exclusive — a note cannot be the live end of the vault and on ice at once. The mark
-   * itself is a line in the note's markdown — `setActive` / `setGhost` in `links.ts`.
-   */
-  setNodeMark(path: string, mark: Mark | null): void {
-    const node = this.cy?.getElementById(path);
-    if (!node || node.empty()) return;
-    node.data("anim", mark === "radiate" ? "pulse" : "");
-    node.data("radiating", mark === "radiate" ? 1 : 0);
-    node.data("ghost", mark === "ghost" ? 1 : 0);
-    this.drawPulses();
-    this.applyMarks();
-  }
-
   /**
    * Dresses a note on the live graph, so the canvas answers the pick in the panel rather
-   * than waiting for the write to the vault behind it to come back round. A note being
-   * animated is no longer parked, so the ghost comes off — the two say opposite things.
+   * than waiting for the write to the vault behind it to come back round.
    */
   setNodeStyle(path: string, style: NodeStyle): void {
     const node = this.cy?.getElementById(path);
     if (!node || node.empty()) return;
     for (const [key, value] of Object.entries(styleData(style))) node.data(key, value);
-    if (style.anim) node.data("ghost", 0);
     this.drawPulses();
-    this.applyMarks();
   }
 
   /** The mark a connection wears. */
@@ -2240,23 +2263,17 @@ export class GraphView {
   }
 
   /**
-   * Dresses every node and edge to its mark. Classes rather than data selectors, so the
+   * Dresses every connection to its mark. A class rather than a data selector, so the
    * whole wardrobe comes off at once when the integration is toggled away — the marks
-   * themselves stay put, in the notes and in the store, for when it comes back.
+   * themselves stay put in the store, for when it comes back.
    */
   private applyMarks(): void {
     const cy = this.cy;
     if (!cy) return;
     const on = this.settings.enabled("active");
     cy.batch(() => {
-      cy.nodes().forEach((node) => {
-        // Radiating wins a contradiction typed by hand; `nodeMark` reads it the same way.
-        node.toggleClass("ghost", on && !!node.data("ghost") && !node.data("radiating"));
-      });
       cy.edges().forEach((edge) => {
-        const mark = on ? this.edgeMarks[edge.id()] : undefined;
-        edge.toggleClass("ghost", mark === "ghost");
-        edge.toggleClass("radiate", mark === "radiate");
+        edge.toggleClass("radiate", on && this.edgeMarks[edge.id()] === "radiate");
       });
     });
     this.syncEdgeBeat();
@@ -2982,7 +2999,7 @@ export class GraphView {
 
   private startDraft(source: NodeSingular, kind: DraftKind = "note", row: number | null = null): void {
     if (!this.cy) return;
-    this.cy.elements().removeClass("faded").removeClass("highlight");
+    this.clearSpotlight();
     this.draftSource = source.id();
     this.draftKind = kind;
     this.draftRow = row;

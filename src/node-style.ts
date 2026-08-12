@@ -44,11 +44,24 @@ const SUN_RAYS = [0, 45, 90, 135, 180, 225, 270, 315]
   })
   .join("");
 
+/** The cog's teeth: eight stubs standing out of its rim, generated like the sun's rays. */
+const COG_TEETH = [0, 45, 90, 135, 180, 225, 270, 315]
+  .map((angle) => {
+    const radians = (angle * Math.PI) / 180;
+    const point = (reach: number): string =>
+      `${(32 + Math.cos(radians) * reach).toFixed(1)} ${(32 + Math.sin(radians) * reach).toFixed(1)}`;
+    return line(`M${point(16)} L${point(29)}`, 9);
+  })
+  .join("");
+
 /**
- * The dozen signs a note can wear. Simple shapes on purpose: a node is twenty pixels
- * across at the zoom a whole vault is read at, and anything with detail in it turns to
- * fuzz there. Each is a statement somebody might want to make about a note at a glance —
- * this one matters, this one is hot, this one is done, this one is a question.
+ * The signs a note can wear. Two kinds, in the order they are offered: first what a note
+ * IS about the vault — this one matters, this one is hot, this one is done, this one is a
+ * question — and then what it is ABOUT: a book, an experiment, an idea, a person.
+ *
+ * Simple shapes on purpose: a node is twenty pixels across at the zoom a whole vault is
+ * read at, and anything with detail in it turns to fuzz there. Each one has to be
+ * recognisable as a silhouette, because at that size a silhouette is all it is.
  */
 export const SIGNS: Array<{ key: string; name: string; body: string }> = [
   {
@@ -65,12 +78,18 @@ export const SIGNS: Array<{ key: string; name: string; body: string }> = [
   {
     key: "flame",
     name: "Flame",
-    body: `<path d="M32 5c9 13 18 18 18 31.5a18 18 0 0 1-36 0C14 27 20 24 24 17c1.5 5 4 8 8 9-1-8-1-15 0-21Z" fill="INK"/>`,
+    // The core is cut out rather than drawn: a flame is a shape with something brighter
+    // inside it, and on a coloured node "brighter" is the node's own colour showing through.
+    body:
+      `<path fill-rule="evenodd" fill="INK" d="M32 5c9 13 18 18 18 31.5a18 18 0 0 1-36 0C14 27 20 24 24 17c1.5 5 4 8 8 9-1-8-1-15 0-21Z` +
+      `M32 33c4.5 4.5 7.5 8 7.5 12a7.5 7.5 0 0 1-15 0c0-4 3-7.5 7.5-12Z"/>`,
   },
   {
     key: "leaf",
     name: "Leaf",
-    body: `<path d="M54 10c0 28-16 45-42 44C10 28 26 10 54 10Z" fill="INK"/>`,
+    body:
+      `<path fill-rule="evenodd" fill="INK" d="M54 10c0 28-16 45-42 44C10 28 26 10 54 10Z` +
+      `M48 16C34 24 22 37 15 50l3.5 2.2C25.5 40 37 27.5 50.5 18.6Z"/>`,
   },
   {
     key: "moon",
@@ -108,6 +127,160 @@ export const SIGNS: Array<{ key: string; name: string; body: string }> = [
     key: "bang",
     name: "Bang",
     body: `<path d="M27.5 8h9l-1.7 30h-5.6z" fill="INK"/><circle cx="32" cy="50" r="5" fill="INK"/>`,
+  },
+  /*
+   * What a note is ABOUT, rather than how it stands: reading, an experiment, an idea, the
+   * machinery of something. These are the ones you reach for to say "this note is a book"
+   * or "this one is a trial" — a subject rather than a status, and the same engraving.
+   */
+  {
+    key: "book",
+    name: "Book",
+    // Two leaves meeting at a spine, with the spine left as a gap the node's own colour
+    // shows through — a single filled shape reads as a brick at twenty pixels.
+    body:
+      `<path fill="INK" d="M31 20C25 14.5 17 11.5 8 11v34c9 .5 17 3.5 23 9Z"/>` +
+      `<path fill="INK" d="M33 20C39 14.5 47 11.5 56 11v34c-9 .5-17 3.5-23 9Z"/>`,
+  },
+  {
+    key: "flask",
+    name: "Experiment",
+    // The conical flask, which is what a trial looks like everywhere: a lipped neck and
+    // a body that flares to a flat base.
+    body:
+      `<rect x="23" y="4" width="18" height="5.5" rx="2.75" fill="INK"/>` +
+      `<path fill="INK" d="M26 9h12v13l15 26.5a5.5 5.5 0 0 1-4.8 8.5H15.8A5.5 5.5 0 0 1 11 48.5L26 22Z"/>`,
+  },
+  {
+    key: "bulb",
+    name: "Idea",
+    body:
+      `<path fill="INK" d="M32 5a18.5 18.5 0 0 0-10.5 33.7V44h21v-5.3A18.5 18.5 0 0 0 32 5Z"/>` +
+      `<rect x="21.5" y="46.5" width="21" height="5.5" rx="2.75" fill="INK"/>` +
+      `<rect x="25" y="54.5" width="14" height="5.5" rx="2.75" fill="INK"/>`,
+  },
+  {
+    key: "cog",
+    name: "Machinery",
+    // Teeth are strokes round a ring with a hole cut in it, the same trick the eye uses.
+    body:
+      COG_TEETH +
+      `<path fill-rule="evenodd" fill="INK" d="M32 13a19 19 0 1 0 0 38 19 19 0 0 0 0-38Z` +
+      `M32 25a7 7 0 1 1 0 14 7 7 0 0 1 0-14Z"/>`,
+  },
+  {
+    key: "clock",
+    name: "Time",
+    body:
+      `<path fill-rule="evenodd" fill="INK" d="M32 5a27 27 0 1 0 0 54 27 27 0 0 0 0-54Z` +
+      `M32 12.5a19.5 19.5 0 1 1 0 39 19.5 19.5 0 0 1 0-39Z"/>` +
+      line("M32 20v13h10", 6),
+  },
+  {
+    key: "lock",
+    name: "Private",
+    body:
+      `<path d="M22 30v-7a10 10 0 0 1 20 0v7" fill="none" stroke="INK" stroke-width="6.5" stroke-linecap="round"/>` +
+      `<rect x="13" y="29" width="38" height="28" rx="6" fill="INK"/>`,
+  },
+  {
+    key: "key",
+    name: "Key",
+    body:
+      `<path fill-rule="evenodd" fill="INK" d="M32 4a13.5 13.5 0 1 0 0 27 13.5 13.5 0 0 0 0-27Z` +
+      `M32 12.5a5 5 0 1 1 0 10 5 5 0 0 1 0-10Z"/>` +
+      line("M32 31v27", 7) +
+      line("M32 40h10", 6) +
+      line("M32 49h8", 6),
+  },
+  {
+    key: "code",
+    name: "Code",
+    body: line("M23 17 9 32 23 47", 8) + line("M41 17 55 32 41 47", 8),
+  },
+  {
+    key: "chat",
+    name: "Conversation",
+    body: `<rect x="6" y="11" width="52" height="33" rx="7" fill="INK"/><path d="M18 42h15L18 59z" fill="INK"/>`,
+  },
+  {
+    key: "target",
+    name: "Target",
+    // Outer ring, then a hole, then the bullseye: three subpaths and `evenodd` do it in
+    // one path, so the rings are gaps rather than a lighter ink.
+    body:
+      `<path fill-rule="evenodd" fill="INK" d="M32 4a28 28 0 1 0 0 56 28 28 0 0 0 0-56Z` +
+      `M32 12a20 20 0 1 1 0 40 20 20 0 0 1 0-40Z` +
+      `M32 19a13 13 0 1 0 0 26 13 13 0 0 0 0-26Z"/>`,
+  },
+  {
+    key: "chart",
+    name: "Numbers",
+    body:
+      `<rect x="9" y="34" width="12" height="22" rx="2.5" fill="INK"/>` +
+      `<rect x="26" y="21" width="12" height="35" rx="2.5" fill="INK"/>` +
+      `<rect x="43" y="8" width="12" height="48" rx="2.5" fill="INK"/>`,
+  },
+  {
+    key: "trend",
+    name: "Trend",
+    body: line("M8 46 24 30 34 40 56 18", 7) + `<path d="M56 32V16H40z" fill="INK"/>`,
+  },
+  {
+    key: "person",
+    name: "Person",
+    body: `<circle cx="32" cy="20" r="11.5" fill="INK"/><path d="M11 59c0-11.6 9.4-21 21-21s21 9.4 21 21z" fill="INK"/>`,
+  },
+  {
+    key: "rocket",
+    name: "Launch",
+    body:
+      `<path fill="INK" d="M32 4c8 8 12 18 12 29H20c0-11 4-21 12-29Z"/>` +
+      `<path fill="INK" d="M20 36c-5 3-8 8-8 14l8-3zM44 36c5 3 8 8 8 14l-8-3z"/>` +
+      `<path fill="INK" d="M26 39h12l-6 19z"/>`,
+  },
+  {
+    key: "cube",
+    name: "Thing",
+    // An isometric box: the top face, then the two sides, drawn as separate shapes so the
+    // edges between them read as edges.
+    body:
+      `<path fill="INK" d="M32 4 57 17 32 30 7 17Z"/>` +
+      `<path fill="INK" d="M6 21 30 33.5V60L6 47Z"/>` +
+      `<path fill="INK" d="M58 21 34 33.5V60l24-13Z"/>`,
+  },
+  {
+    key: "calendar",
+    name: "Date",
+    body:
+      line("M19 5v11", 6) +
+      line("M45 5v11", 6) +
+      `<path fill-rule="evenodd" fill="INK" d="M13 12h38a6 6 0 0 1 6 6v33a6 6 0 0 1-6 6H13a6 6 0 0 1-6-6V18a6 6 0 0 1 6-6Z` +
+      `M7 25h50v4.5H7Z"/>`,
+  },
+  {
+    key: "mail",
+    name: "Message",
+    body:
+      `<path fill-rule="evenodd" fill="INK" d="M11 14h42a6 6 0 0 1 6 6v24a6 6 0 0 1-6 6H11a6 6 0 0 1-6-6V20a6 6 0 0 1 6-6Z` +
+      `M9 19l23 16 23-16 3.5 4.7L32 41.5 5.5 23.7Z"/>`,
+  },
+  {
+    key: "tag",
+    name: "Label",
+    body:
+      `<path fill-rule="evenodd" fill="INK" d="M6 8h24l28 28-22 22L8 30Z` +
+      `M20 15a5.5 5.5 0 1 0 0 11 5.5 5.5 0 0 0 0-11Z"/>`,
+  },
+  {
+    key: "drop",
+    name: "Drop",
+    body: `<path fill="INK" d="M32 4c11 14 18 22 18 31a18 18 0 0 1-36 0c0-9 7-17 18-31Z"/>`,
+  },
+  {
+    key: "shield",
+    name: "Guarded",
+    body: `<path fill="INK" d="M32 4 55 12v18c0 14-9.5 24-23 30C18.5 54 9 44 9 30V12Z"/>`,
   },
 ];
 
@@ -325,7 +498,10 @@ export function showStylePicker(
       // Dimmed rather than gone while there is nothing to colour: a row that comes and
       // goes would move everything under it each time the animation is switched.
       `<div class="style-row${style.anim ? "" : " off"}"><h5>Animation colour</h5>` +
-      colours("animColour", style.animColour, { title: "Green", fill: PULSE_DEFAULT }) +
+      // `anim-colour`, hyphenated: an HTML attribute is lower-cased on its way into the
+      // DOM, so `data-animColour` would arrive as `dataset.animcolour` and the click that
+      // set it would be read as no choice at all — which is how every pulse came out green.
+      colours("anim-colour", style.animColour, { title: "Green", fill: PULSE_DEFAULT }) +
       `</div>`,
     (data) => {
       const { sign, colour, anim, animColour } = data;

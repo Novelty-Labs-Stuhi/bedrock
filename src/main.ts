@@ -1,21 +1,21 @@
 import "./style.css";
-import { GraphView, type Client, type Doc, type Mark, type SessionState } from "./graph";
+import { GraphView, type Client, type Doc, type SessionState } from "./graph";
 import {
   LinkResolver,
   labelledLink,
   parseField,
   parseStyle,
+  pinText,
   relinkText,
   setField,
-  setGhost,
   setStyle,
+  unlinkText,
   type NodeStyle,
 } from "./links";
 import { showFolderStylePicker, showStylePicker } from "./node-style";
 import { askChoice, askConfirm, askText } from "./dialog";
 import { EDGE_DIR, edgeNotePath, edgeNoteTemplate, edgeTitle, isEdgeNote, renamedEdgeNote } from "./edges";
 import { showMenu, type MenuItem } from "./menu";
-import { mountHelp } from "./help";
 import {
   SettingsStore,
   applyTheme,
@@ -94,13 +94,10 @@ const ui = {
   splitter: el("splitter"),
   cy: el("cy"),
   status: el("status"),
-  help: el("help"),
-  helpPanel: el("help-panel"),
   settings: el<HTMLButtonElement>("settings"),
   settingsPanel: el("settings-modal"),
 };
 
-mountHelp(ui.help, ui.helpPanel);
 
 type PaneUI = {
   root: HTMLElement;
@@ -234,14 +231,7 @@ const graphView = new GraphView(ui.cy, {
       items.push({ label: "Link to a webpage…", run: () => graphView.startLink(path, "web") });
     }
     if (settings.enabled("active")) {
-      const mark = graphView.nodeMark(path);
-      items.push(
-        { label: "Style…", run: () => void styleNode(path, client) },
-        {
-          label: mark === "ghost" ? "Bring it back" : "Make it a ghost",
-          run: () => void markNode(path, mark === "ghost" ? null : "ghost"),
-        },
-      );
+      items.push({ label: "Style…", run: () => void styleNode(path, client) });
     }
     items.push(
       { label: `Rename "${noteName(path)}"`, run: () => renameOnGraph(path) },
@@ -250,24 +240,18 @@ const graphView = new GraphView(ui.cy, {
     showMenu(client, items);
   },
   onEdgeMenu: (source, target, label, client) => {
-    // The same statuses a note can wear, on the line between two of them. Opening the
-    // connection's own note stays a click on the line; the menu offers it too, so the
-    // right button is never a dead end.
+    // The pulse a note can wear, on the line between two of them. Opening the connection's
+    // own note stays a click on the line; the menu offers it too, so the right button is
+    // never a dead end.
     const items: MenuItem[] = [
       { label: `Open "${edgeTitle(source, target)}"`, run: () => void openEdgeNote(source, target, label) },
     ];
     if (settings.enabled("active")) {
       const mark = graphView.edgeMark(source, target);
-      items.push(
-        {
-          label: mark === "radiate" ? "Stop radiating" : "Make it radiate",
-          run: () => graphView.setEdgeMark(source, target, mark === "radiate" ? null : "radiate"),
-        },
-        {
-          label: mark === "ghost" ? "Bring it back" : "Make it a ghost",
-          run: () => graphView.setEdgeMark(source, target, mark === "ghost" ? null : "ghost"),
-        },
-      );
+      items.push({
+        label: mark === "radiate" ? "Stop radiating" : "Make it radiate",
+        run: () => graphView.setEdgeMark(source, target, mark === "radiate" ? null : "radiate"),
+      });
     }
     showMenu(client, items);
   },
@@ -329,7 +313,49 @@ const filePaths = (): string[] => entries.filter((e) => e.kind === "file").map((
  */
 async function readDocs(): Promise<Doc[]> {
   const drawn = filePaths().filter((path) => !isCardPath(path));
-  return Promise.all(drawn.map(async (path) => ({ path, text: await vault.read(path) })));
+  const docs = await Promise.all(drawn.map(async (path) => ({ path, text: await vault.read(path) })));
+  waiting = waitedFor(docs); // the graph's own read is also the answer `freshPath` needs
+  return docs;
+}
+
+/**
+ * The names something in the vault is already WAITING FOR: the target of every [[link]] that
+ * resolves to nothing. Left behind by a note that was deleted, or typed for one that has not
+ * been written yet. Read off the same pass the graph is drawn from, so it is as current as the
+ * canvas the gesture is happening on.
+ */
+let waiting = new Set<string>();
+
+function waitedFor(docs: Doc[]): Set<string> {
+  const resolver = new LinkResolver(filePaths());
+  const names = new Set<string>();
+  for (const doc of docs) {
+    for (const target of linkTargets(doc.text)) {
+      const base = target.split("#")[0].trim();
+      if (!base || resolver.resolve(base)) continue;
+      // The bare name, however the link spelled it: a dangling `[[Untitled]]` is answered by
+      // an Untitled in ANY folder, because that is how a bare link resolves.
+      names.add(noteName(base).toLowerCase());
+    }
+  }
+  return names;
+}
+
+/**
+ * A path for a note the app is naming ITSELF — "Untitled", "Gemini chat", a page's host or its
+ * title. Free like `uniquePath`, and free as well of the names something is already waiting for.
+ *
+ * A generated name is handed out again and again, and that is where connections from nowhere
+ * came from. Draw a link to a new node, leave it "Untitled", delete it: the note it came from
+ * keeps `[[Untitled]]`, pointing at nothing. The next Untitled the app makes answers that link
+ * — and worse, when it is given its real name the rename carries the dead link along with it,
+ * so a note nobody touched ends up pointing at something made minutes later, under a name that
+ * looks entirely deliberate.
+ */
+function freshPath(dir: string, base: string, except?: string): string {
+  const taken = filePaths().filter((path) => path !== except);
+  const reserved = [...waiting].map((name) => join(dir, `${name}.md`));
+  return uniquePath([...taken, ...reserved], dir, base, ".md");
 }
 
 /**
@@ -595,7 +621,7 @@ function openGraph(): void {
 
 /** Creates `Untitled.md` at once and opens the tree's rename field on it. */
 async function newNote(dir = sidebar.activeDir): Promise<void> {
-  const path = uniquePath(filePaths(), dir, "Untitled", ".md");
+  const path = freshPath(dir, "Untitled");
   await vault.createFile(path, "");
   await refresh();
   await openFile(path);
@@ -653,6 +679,80 @@ async function relinkVault(moves: Map<string, string>): Promise<number> {
 }
 
 /**
+ * Takes the links to notes that have just been deleted out of every other note.
+ *
+ * A rename carries a note's incoming links along with it; a delete has to take them away. Left
+ * behind, the line points at a note that is not there — it draws nothing, so the vault reads as
+ * though the connection went with the note, and it lies there until something is given that
+ * name again. That is what `waiting` then has to steer new notes around; better that there is
+ * nothing to steer around.
+ *
+ * Only links that would be left dangling are touched: one that still finds a note of its own (a
+ * name the vault has twice, say) is somebody's link to THAT note and stays. `before` is the
+ * vault's paths as they were, the deleted ones included — without them there is no telling which
+ * links used to point at what has gone. Returns how many notes were rewritten.
+ */
+async function unlinkVault(gone: Set<string>, before: string[]): Promise<number> {
+  if (!gone.size) return 0;
+  const was = new LinkResolver(before);
+  const now = new LinkResolver(filePaths());
+  const dead = (target: string): boolean => {
+    const from = was.resolve(target);
+    return !!from && gone.has(from) && now.resolve(target) === null;
+  };
+  let touched = 0;
+  for (const path of filePaths()) {
+    const text = await vault.read(path);
+    const next = unlinkText(text, dead);
+    if (next === text) continue;
+    await vault.write(path, next);
+    touched++;
+  }
+  // Same bargain as `relinkVault`: the loop rewrote the card files on disk like any other note,
+  // and the cards' cache has to hear about it or a later card edit writes the dead link back.
+  stickies.rewriteTexts((text) => unlinkText(text, dead));
+  return touched;
+}
+
+/**
+ * A note about to appear at `path` must not take links off the notes that have them. A bare
+ * `[[Domain]]` means whichever Domain is filed nearest the root, so a new one named Domain and
+ * filed nearer the root walks off with every one of those links — the new node draws edges
+ * nobody gave it, and the old one loses the same edges in the same instant.
+ *
+ * Each of those links is pinned to what it means TODAY, written out as a full path, so the line
+ * goes on saying what its author meant. Nothing is ever removed here: a link that resolves to
+ * nothing is left alone, because writing `[[Roadmap]]` and making Roadmap afterwards is how a
+ * note is linked before it exists, and that has to go on working. What stops a DEAD link being
+ * inherited is that it should not be lying there — see `unlinkVault` — and that the names the
+ * app hands out itself step around the ones being waited for — see `freshPath`.
+ *
+ * Returns how many notes were rewritten.
+ */
+async function pinShadowedLinks(path: string): Promise<number> {
+  const paths = filePaths();
+  if (!isMarkdown(path) || paths.includes(path)) return 0;
+  const was = new LinkResolver(paths);
+  const now = new LinkResolver([...paths, path]);
+  const pin = (target: string): string | null => {
+    // Only a link that changes hands, and only one that had a note of its own to begin with.
+    if (now.resolve(target) !== path) return null;
+    const held = was.resolve(target);
+    return held && held !== path ? held.replace(/\.md$/i, "") : null;
+  };
+  let touched = 0;
+  for (const note of paths) {
+    const text = await vault.read(note);
+    const next = pinText(text, pin);
+    if (next === text) continue;
+    await vault.write(note, next);
+    touched++;
+  }
+  stickies.rewriteTexts((text) => pinText(text, pin));
+  return touched;
+}
+
+/**
  * A connection note is named after the notes at its two ends, so renaming either of them
  * has to carry the file along — otherwise the description of how two notes are wired
  * together is orphaned by renaming one of them. Filing a note into a folder changes no
@@ -680,6 +780,19 @@ async function carryEdgeNotes(moves: Map<string, string>): Promise<void> {
 const relinked = (count: number): string =>
   count ? ` — relinked ${count} note${count === 1 ? "" : "s"}` : "";
 
+/**
+ * " — 2 older links left where they were": links this name would otherwise have walked off
+ * with. Said out loud, because the app has just edited notes nobody asked it to open.
+ */
+const pinned = (count: number): string =>
+  count
+    ? ` — ${count} older link${count === 1 ? "" : "s"} left where ${count === 1 ? "it was" : "they were"}`
+    : "";
+
+/** " — unlinked from 3 notes", after a delete took its incoming links with it. */
+const unlinkedFrom = (count: number): string =>
+  count ? ` — unlinked from ${count} note${count === 1 ? "" : "s"}` : "";
+
 /** Points every open tab at a path that just moved, in both panes. */
 function retargetTabs(from: string, to: string): void {
   for (const p of panes) {
@@ -703,6 +816,8 @@ async function applyRename(path: string, kind: "file" | "dir", name: string): Pr
     return path;
   }
   await flushAll();
+  // Before the name lands: the links elsewhere that this name would quietly take over.
+  const shadowed = kind === "file" ? await pinShadowedLinks(next) : 0;
   const moves = movesFor(path, next, kind);
   if (kind === "file") graphView.carryPosition(path, next);
   else {
@@ -722,7 +837,7 @@ async function applyRename(path: string, kind: "file" | "dir", name: string): Pr
   }
   const count = await relinkVault(moves);
   await syncAfterStructuralChange();
-  ui.status.textContent = `renamed to ${next}${relinked(count)}`;
+  ui.status.textContent = `renamed to ${next}${relinked(count)}${pinned(shadowed)}`;
   return next;
 }
 
@@ -866,9 +981,22 @@ async function syncAfterStructuralChange(): Promise<void> {
 
 async function deleteEntry(path: string, kind: "file" | "dir"): Promise<void> {
   if (!(await askConfirm(`Delete ${path}?`))) return;
+  // An open buffer would write the links back over the top of the pass below.
+  await flushAll();
+  const gone = new Set(
+    kind === "file"
+      ? [path]
+      : entries.filter((e) => e.kind === "file" && e.path.startsWith(path + "/")).map((e) => e.path),
+  );
+  const before = filePaths();
   await vault.remove(path, kind);
+  entries = await vault.entries();
+  // A deleted note takes its incoming links with it, or they lie in wait for the next note
+  // to be given its name — which is how a connection nobody drew turns up on a new node.
+  const unlinked = await unlinkVault(gone, before);
   await refresh();
   await showAll();
+  ui.status.textContent = `deleted ${path}${unlinkedFrom(unlinked)}`;
 }
 
 async function pickFolder(): Promise<void> {
@@ -1268,7 +1396,7 @@ async function refreshSidebar(): Promise<void> {
 
 /** Click (or menu) on empty canvas / inside a folder box: spawn a note there. */
 async function createNoteAt(at: { x: number; y: number }, folder: string | null): Promise<void> {
-  const path = uniquePath(filePaths(), folder ?? "", "Untitled", ".md");
+  const path = freshPath(folder ?? "", "Untitled");
   await vault.createFile(path, `# ${noteName(path)}\n\n`);
   await refreshSidebar();
   graphView.commitNode(path, noteName(path), folder ?? undefined, at);
@@ -2101,9 +2229,7 @@ function writeStyle(path: string, style: NodeStyle): void {
   styling = styling.then(async () => {
     await flushAll();
     const text = await vault.read(path);
-    // Animating a note un-parks it, in the file as well as on the canvas: a ghost left
-    // behind in the markdown would put the note back on ice at the next rebuild.
-    const next = style.anim ? setGhost(setStyle(text, style), false) : setStyle(text, style);
+    const next = setStyle(text, style);
     if (next !== text) {
       if (!(await tryVault(`could not style ${noteName(path)}`, () => vault.write(path, next)))) return;
       // Open in a pane: the fields appear in the editor too, caret and undo history intact.
@@ -2111,37 +2237,6 @@ function writeStyle(path: string, style: NodeStyle): void {
     }
     graphStale = true;
   });
-}
-
-/**
- * Right-click → "Make it a ghost": the note is parked — grey, dimmed and dotted. A line
- * in the note's own markdown (`ghost:: true`) like everything else the canvas knows about
- * it. A ghost does not animate: being on ice and being the live end of the vault are
- * opposite statements, so the pulse comes off with the same write.
- */
-async function markNode(path: string, mark: Mark | null): Promise<void> {
-  const before = graphView.nodeMark(path);
-  graphView.setNodeMark(path, mark);
-  await flushAll(); // the note may be open and mid-edit — don't write over its own buffer
-  const text = await vault.read(path);
-  const style = parseStyle(text);
-  const next = setGhost(
-    setStyle(text, { ...style, anim: mark === "ghost" ? "" : style.anim }),
-    mark === "ghost",
-  );
-  if (next !== text) {
-    if (!(await tryVault(`could not mark ${noteName(path)}`, () => vault.write(path, next)))) {
-      graphView.setNodeMark(path, before); // the vault refused; the look must not claim otherwise
-      return;
-    }
-    // Open in a pane: the field appears in the editor too, caret and undo history intact.
-    for (let i = 0; i < panes.length; i++) if (pathOf(panes[i]) === path) editors[i].sync(next);
-  }
-  graphStale = true;
-  ui.status.textContent =
-    mark === "ghost"
-      ? `${noteName(path)} is a ghost — right-click it to bring it back`
-      : `${noteName(path)} is back to itself`;
 }
 
 /* ---------------------------------------------------------------- gemini --- */
@@ -2291,7 +2386,7 @@ async function createGeminiAt(
   // file to clean up later, and the sign-in is one button away in Settings.
   if (!(await geminiReady())) return;
   const dir = folder ?? "";
-  const path = uniquePath(filePaths(), dir, "Gemini chat", ".md");
+  const path = freshPath(dir, "Gemini chat");
   await vault.createFile(path, geminiTemplate(noteName(path)));
   entries = [...entries, { path, kind: "file" }]; // so the rename's collision check sees it
   if (source) {
@@ -2371,7 +2466,7 @@ async function createFsAt(
   const target = await bridge.pickPath(kind);
   if (!target) return; // the picker was dismissed — nothing made
   const dir = folder ?? "";
-  const path = uniquePath(filePaths(), dir, fsBasename(target), ".md");
+  const path = freshPath(dir, fsBasename(target));
   await vault.createFile(path, fsTemplate(kind, target));
   entries = [...entries, { path, kind: "file" }];
   if (source) {
@@ -2496,7 +2591,7 @@ async function createWebAt(
     return;
   }
   const dir = folder ?? "";
-  const path = uniquePath(filePaths(), dir, webHost(url), ".md");
+  const path = freshPath(dir, webHost(url));
   await vault.createFile(path, webTemplate(url));
   entries = [...entries, { path, kind: "file" }];
   if (source) {
@@ -2538,13 +2633,9 @@ async function adoptWebPage(path: string, url: string, born: string): Promise<st
   if (!(await vault.exists(path))) return path; // deleted while the site was thinking
   const wanted = asFileName(found.title);
   if (!wanted || wanted === born || noteName(path) !== born) return path;
-  // A second bookmark on the same page is "Hacker News 2", not the host it started as.
-  const free = uniquePath(
-    filePaths().filter((other) => other !== path),
-    dirname(path),
-    wanted,
-    ".md",
-  );
+  // A second bookmark on the same page is "Hacker News 2", not the host it started as. The
+  // title is the site's choice, not anybody here's, so it steps around a waited-for name too.
+  const free = freshPath(dirname(path), wanted, path);
   return (await applyRename(path, "file", noteName(free))) ?? path;
 }
 
@@ -2913,7 +3004,7 @@ async function createClaudeAt(
   // and asking anyway would make it a suggestion. Only a vault that has NOT been told asks —
   // and only where the shell can answer, since a browser has no folders to offer.
   const where = settings.claudeFolder() || (window.bedrock ? await askClaudeFolder() : null);
-  const path = uniquePath(filePaths(), dir, CLAUDE_NAME, ".md");
+  const path = freshPath(dir, CLAUDE_NAME);
   await vault.createFile(path, claudeTemplate(where));
   entries = [...entries, { path, kind: "file" }]; // so the rename's collision check sees it
   if (source) {
@@ -3060,7 +3151,7 @@ async function finishLink(source: string, target: string, label: string | null):
 async function linkToNewNote(source: string, at: { x: number; y: number }, folder: string | null): Promise<void> {
   // The note belongs to the box it was dropped in; only fall back to the source's folder at the root.
   const dir = folder ?? "";
-  const path = uniquePath(filePaths(), dir, "Untitled", ".md");
+  const path = freshPath(dir, "Untitled");
   await vault.createFile(path, `# ${noteName(path)}\n\n`);
   entries = [...entries, { path, kind: "file" }]; // so the rename's collision check sees it
   graphView.commitLink(source, path, { label: noteName(path), parent: dir || undefined, at });
