@@ -138,18 +138,6 @@ export const setActive = (text: string, on: boolean): string =>
   setField(text, "active", on ? "true" : null);
 
 /**
- * The opposite end of the vault: `ghost:: true`. A ghosted note is parked — still on the
- * graph, but grey, dimmed and dotted, so what is live reads against what is on ice.
- */
-export function parseGhost(text: string): boolean {
-  const value = parseField(text, "ghost");
-  return value !== null && !OFF.has(value.toLowerCase());
-}
-
-export const setGhost = (text: string, on: boolean): string =>
-  setField(text, "ghost", on ? "true" : null);
-
-/**
  * A note's LOOK on the canvas, four independent choices, each an inline field of its own:
  *
  *     sign:: star
@@ -169,8 +157,6 @@ export const setGhost = (text: string, on: boolean): string =>
  * `setStyle` writes the American one and clears the British, so a note never carries two.
  */
 export type NodeStyle = { icon: string; colour: string; anim: string; animColour: string };
-
-export const NO_STYLE: NodeStyle = { icon: "", colour: "", anim: "", animColour: "" };
 
 const KEY_RE = /^#?[\w-]+$/;
 
@@ -237,6 +223,74 @@ export function relinkText(
     const next = base.includes("/") ? to.replace(/\.md$/i, "") : noteName(to);
     return `[[${next}${heading}${alias}]]`;
   });
+}
+
+/** A link's target without the `#heading` tail, which resolution never looks at. */
+const linkBase = (target: string): string => {
+  const t = target.trim();
+  const hash = t.indexOf("#");
+  return hash >= 0 ? t.slice(0, hash) : t;
+};
+
+/**
+ * Rewrites how a link is SPELLED without changing what it points at. `pinned` is asked what a
+ * target should be written as and answers null to leave it alone — so a bare `[[Domain]]`, about
+ * to be taken over by a new note of the same name, can be written out as `[[ideas/Domain]]` and
+ * go on meaning the note it has always meant. `#heading` / `|alias` tails ride along untouched.
+ */
+export function pinText(text: string, pinned: (target: string) => string | null): string {
+  return text.replace(REWRITE_RE, (whole, rawTarget: string, alias = "") => {
+    const target = rawTarget.trim();
+    const to = pinned(linkBase(target));
+    if (!to) return whole;
+    const hash = target.indexOf("#");
+    return `[[${to}${hash >= 0 ? target.slice(hash) : ""}${alias}]]`;
+  });
+}
+
+/*
+ * A link on a line of its own, with or without the relation name the app writes in front of it
+ * (`built with:: [[X]]`) — the shape of every line the app itself has ever written into a note.
+ * Take the link out of one of these and there is nothing left on the line worth keeping.
+ * `![[picture.png]]` cannot match: an embed's `!` is in neither the prefix nor the marker.
+ */
+const LINK_LINE_RE = /^[\s>*+-]*(?:\d+[.)]\s*)?(?:[^:\n][^:\n]{0,58}?\s*::\s*)?\[\[([^\][|]+)(?:\|[^\][]*)?\]\]\s*$/;
+
+/**
+ * Takes every link the caller disowns back out of a note's markdown.
+ *
+ * A deleted note has to take its incoming references with it, the way a renamed one takes them
+ * along. Left behind, the line points at a note that is not there: it draws nothing, so it reads
+ * as gone — and is then handed to the next note to be given that name, as a connection nobody
+ * drew. That is where the edges from nowhere came from.
+ *
+ * A line that was nothing but the link goes entirely, because the app wrote it when the
+ * connection was drawn. A link inside a sentence leaves its words behind — that one is prose.
+ */
+export function unlinkText(text: string, gone: (target: string) => boolean): string {
+  const lines = text.split("\n");
+  const out: string[] = [];
+  let closing = false; // a line has just gone; the gap it sat in has to close behind it
+  for (const line of lines) {
+    const alone = LINK_LINE_RE.exec(line);
+    if (alone && gone(linkBase(alone[1]))) {
+      // The line sat on its own between blanks; leave one, not two. With nothing above it
+      // there is nothing to take back, so the blank below goes instead.
+      if (out.length && out[out.length - 1].trim() === "") out.pop();
+      else closing = !out.length;
+      continue;
+    }
+    if (closing) {
+      closing = false;
+      if (line.trim() === "") continue;
+    }
+    out.push(
+      line.replace(REWRITE_RE, (whole, rawTarget: string, alias = "") =>
+        gone(linkBase(rawTarget)) ? (alias ? alias.slice(1).trim() : rawTarget.trim()) : whole,
+      ),
+    );
+  }
+  return out.join("\n");
 }
 
 /**

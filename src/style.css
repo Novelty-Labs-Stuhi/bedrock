@@ -602,7 +602,7 @@ button.twisty:hover {
   min-width: 0;
   display: flex;
   flex-direction: column;
-  /* The help button and its panel are positioned against this corner. */
+  /* The corner the format bar and the graph's own overlays are positioned against. */
   position: relative;
 }
 
@@ -669,85 +669,6 @@ button.twisty:hover {
   background: var(--line);
 }
 
-/* --------------------------------------------------------------- help --- */
-
-/*
- * Sits in the status bar's own corner: always reachable, never in the way. It is drawn
- * as a real button rather than a faint glyph — the one control that has to be found by
- * somebody who does not yet know how anything here works cannot be the subtlest one.
- */
-.help-btn {
-  position: absolute;
-  right: 8px;
-  bottom: 2px;
-  z-index: 6;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 20px;
-  height: 20px;
-  padding: 0;
-  border-radius: 50%;
-  font-size: 12px;
-  font-weight: 600;
-  line-height: 1;
-  color: var(--text);
-  background: var(--btn);
-  border: 1px solid var(--line);
-}
-.help-btn:hover,
-.help-btn.on {
-  color: #fff;
-  background: var(--accent);
-  border-color: var(--accent);
-}
-
-.help-panel {
-  position: absolute;
-  right: 8px;
-  bottom: 30px;
-  z-index: 6;
-  width: 370px;
-  max-height: min(72vh, 560px);
-  overflow-y: auto;
-  padding: 12px 14px 14px;
-  background: var(--bg-side);
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  box-shadow: 0 8px 28px rgb(0 0 0 / 45%);
-  font-size: 12px;
-}
-
-.help-panel h4 {
-  margin: 14px 0 6px;
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--muted);
-}
-.help-panel h4:first-child {
-  margin-top: 0;
-}
-
-/* Two columns from a definition list: the key sized to its content, the meaning
-   taking the rest — so nothing has to be measured or truncated. */
-.help-panel dl {
-  display: grid;
-  grid-template-columns: max-content 1fr;
-  gap: 4px 10px;
-  margin: 0;
-}
-.help-panel dt {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
-  color: var(--accent);
-  white-space: nowrap;
-}
-.help-panel dd {
-  margin: 0;
-  color: var(--muted);
-}
 
 #panes {
   flex: 1;
@@ -1019,8 +940,7 @@ button.twisty:hover {
 
 #status {
   border-top: 1px solid var(--line);
-  /* Right side is kept clear of the help button, so a long path never runs under it. */
-  padding: 4px 34px 4px 10px;
+  padding: 4px 10px;
   font-size: 11px;
   color: var(--muted);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -1177,7 +1097,7 @@ button.twisty:hover {
   display: none;
   flex-direction: column;
   gap: 10px;
-  width: 268px;
+  width: 320px;
   padding: 10px;
   border: 1px solid var(--line);
   border-radius: 6px;
@@ -1232,6 +1152,14 @@ button.twisty:hover {
    a node will wear it, rather than a black mark on a black button. */
 .style-swatch[data-sign]:not([data-sign=""]) {
   background-color: #7f868f;
+}
+
+/* The signs run to a couple of dozen, so they are drawn a size down: nine to a row keeps
+   the whole set to four rows, and the panel a panel rather than a column. */
+.style-swatch[data-sign] {
+  width: 28px;
+  height: 28px;
+  background-size: 66%;
 }
 
 .style-swatch:hover {
