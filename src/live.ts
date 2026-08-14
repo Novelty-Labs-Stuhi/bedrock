@@ -26,6 +26,7 @@ import {
   WidgetType,
 } from "@codemirror/view";
 import { assetUrl, cachedAsset, missingMarker } from "./images";
+import { MathRender, activeMathSpan, mathSpans, type MathSpan } from "./math";
 import { basename, isImage, type Vault } from "./vault";
 
 /** What the layer needs from the app: which note is open, and what to read its bytes from. */
@@ -187,6 +188,9 @@ const WIKILINK = /\[\[[^\][]+\]\]/g;
  */
 const INLINE = /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|(~~[^~\n]+~~)|(==[^=\n]+==)|(\*[^*\n]+\*)/g;
 
+/** Backticks alone — claimed before formulas so `$x$` inside code stays literal. */
+const INLINE_CODE = /`[^`\n]+`/g;
+
 /** Per capture group of `INLINE`: how many characters the marker is, and what it means. */
 const KINDS = [
   { pad: 1, cls: "cm-code" },
@@ -212,7 +216,8 @@ const decodePath = (src: string): string => {
 function decorateLine(
   line: { from: number; to: number; text: string },
   out: Range<Decoration>[],
-  ctx: { note: string; vault: Vault },
+  atoms: Range<Decoration>[],
+  ctx: { note: string; vault: Vault; math: MathSpan | null },
 ): void {
   const text = line.text;
   const taken: Span[] = [];
@@ -245,6 +250,39 @@ function decorateLine(
     taken.push({ from: at, to: at + m[0].length });
   }
 
+  /*
+   * Inline code before formulas: `` `$x$` `` is a code span that happens to hold dollar signs,
+   * not a formula wrapped in backticks. Claiming the backticks first keeps math out of them;
+   * the later INLINE pass still draws the code (already in `taken`, so free() skips a second go).
+   */
+  for (const m of text.matchAll(INLINE_CODE)) {
+    const at = m.index ?? 0;
+    if (!free(at, m[0].length)) continue;
+    const from = line.from + at;
+    const to = from + m[0].length;
+    out.push(HIDE.range(from, from + 1));
+    out.push(Decoration.mark({ class: "cm-code" }).range(from + 1, to - 1));
+    out.push(HIDE.range(to - 1, to));
+    taken.push({ from: at, to: at + m[0].length });
+  }
+
+  /*
+   * Formulas claim their ranges next, for the same reason embeds do: `$a * b * c$` holds a
+   * perfectly good pair of asterisks that must not become italics, and the `_` in `$x_1$` is a
+   * subscript rather than the start of anything. The formula currently open as a field is the
+   * one exception — `math.ts` is already drawing over that range, and two widgets replacing the
+   * same characters is an error rather than a race.
+   */
+  for (const span of mathSpans(line)) {
+    if (!free(span.from - line.from, span.to - span.from)) continue;
+    if (ctx.math && span.from < ctx.math.to && span.to > ctx.math.from) continue;
+    const widget = new MathRender(span.latex, span.display);
+    const deco = Decoration.replace({ widget }).range(span.from, span.to);
+    out.push(deco);
+    atoms.push(deco);
+    taken.push({ from: span.from - line.from, to: span.to - line.from });
+  }
+
   const heading = HEADING.exec(text);
   if (heading) {
     out.push(Decoration.line({ class: `cm-hd cm-h${heading[1].length}` }).range(line.from));
@@ -272,14 +310,57 @@ function decorateLine(
   }
 }
 
+/**
+ * What a line inside the revealed block still gets: its formulas, still drawn.
+ *
+ * Revealing a block means showing its markers, and for every other piece of markdown that is the
+ * whole story — `**` is two characters wide either way, so the line barely moves. A formula is
+ * not a marker wrapped around text, it is a different picture of it: `$\frac12$` is nine
+ * characters standing in for a fraction twice the height of the line. Swapping between them as
+ * the caret arrives is exactly the reflow this file went to block-sized reveals to avoid.
+ *
+ * Nor is there anything left to reveal *for*. Revealing exists so a marker can be edited as the
+ * characters it is, and for a formula that is what the LaTeX box inside the field is — opened by
+ * clicking the formula, holding the same characters, and able to draw what they mean while you
+ * type. LaTeX too broken to draw still falls back to its own source, so nothing is unreachable.
+ */
+function decorateRevealedMath(
+  line: { from: number; to: number; text: string },
+  out: Range<Decoration>[],
+  atoms: Range<Decoration>[],
+  ctx: { math: MathSpan | null },
+): void {
+  // Same rule as decorateLine: dollars inside backticks are code, not math.
+  const code: Span[] = [];
+  for (const m of line.text.matchAll(INLINE_CODE)) {
+    const at = m.index ?? 0;
+    code.push({ from: at, to: at + m[0].length });
+  }
+  for (const span of mathSpans(line)) {
+    // The one already open as a field — `math.ts` is drawing that range itself.
+    if (ctx.math && span.from < ctx.math.to && span.to > ctx.math.from) continue;
+    const localFrom = span.from - line.from;
+    const localTo = span.to - line.from;
+    if (code.some((c) => localFrom < c.to && localTo > c.from)) continue;
+    const widget = new MathRender(span.latex, span.display);
+    const deco = Decoration.replace({ widget }).range(span.from, span.to);
+    out.push(deco);
+    atoms.push(deco);
+  }
+}
+
+/** Everything on screen: what to draw, and which of it the caret crosses in one step. */
+type Built = { decorations: DecorationSet; atoms: DecorationSet };
+
 /** The decorations for what is on screen. Off-screen lines cost nothing. */
-function build(view: EditorView, ctx: LiveContext): DecorationSet {
+function build(view: EditorView, ctx: LiveContext): Built {
   const state = view.state;
   const fences = fencedSpans(state);
   // An editor nobody is typing in has no block to reveal: the note reads as finished text.
   const open = view.hasFocus ? revealed(state, fences) : [];
   const out: Range<Decoration>[] = [];
-  const here = { note: ctx.note(), vault: ctx.vault() };
+  const atoms: Range<Decoration>[] = [];
+  const here = { note: ctx.note(), vault: ctx.vault(), math: activeMathSpan(state) };
 
   for (const range of view.visibleRanges) {
     let pos = range.from;
@@ -287,33 +368,50 @@ function build(view: EditorView, ctx: LiveContext): DecorationSet {
       const line = state.doc.lineAt(pos);
       pos = line.to + 1;
       if (!line.text.trim()) continue;
-      if (open.some((span) => overlaps(span, line.from, line.to))) continue;
       if (fences.some((span) => overlaps(span, line.from, line.to))) continue;
-      decorateLine(line, out, here);
+      if (open.some((span) => overlaps(span, line.from, line.to))) {
+        decorateRevealedMath(line, out, atoms, here);
+        continue;
+      }
+      decorateLine(line, out, atoms, here);
     }
   }
   // Sorted on the way in: a line's decorations are produced in the order that reads best,
   // not the order the range set needs.
-  return Decoration.set(out, true);
+  return { decorations: Decoration.set(out, true), atoms: Decoration.set(atoms, true) };
 }
 
 export function livePreview(ctx: LiveContext): Extension {
   return ViewPlugin.fromClass(
     class {
-      decorations: DecorationSet;
+      built: Built;
 
       constructor(view: EditorView) {
-        this.decorations = build(view, ctx);
+        this.built = build(view, ctx);
       }
 
       update(update: ViewUpdate): void {
         const moved = update.docChanged || update.selectionSet;
         if (moved || update.viewportChanged || update.focusChanged) {
-          this.decorations = build(update.view, ctx);
+          this.built = build(update.view, ctx);
         }
       }
     },
-    { decorations: (plugin) => plugin.decorations },
+    {
+      decorations: (plugin) => plugin.built.decorations,
+      /*
+       * A drawn formula is one thing on the page, so it is one step for the caret: `$\frac12$`
+       * is nine characters in the file, and without this, crossing it means nine presses of the
+       * arrow key through positions that are not anywhere on screen. Backspace takes the whole
+       * formula for the same reason.
+       *
+       * Only the formulas. The hidden markers around a heading or a bit of bold are the *same*
+       * text you are editing, with the `#` or the `**` tucked away; skipping them would make
+       * the caret jump over the words themselves.
+       */
+      provide: (plugin) =>
+        EditorView.atomicRanges.of((view) => view.plugin(plugin)?.built.atoms ?? Decoration.none),
+    },
   );
 }
 

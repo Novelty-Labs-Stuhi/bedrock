@@ -923,6 +923,168 @@ button.twisty:hover {
   min-height: 1.7em;
 }
 
+/* ---------------------------------------------------------------- math --- */
+
+/* A drawn formula sits in the line like a word. Nothing here picks a font: the KaTeX faces are
+   MathLive's own, imported in `mathlive.ts` so that Vite bundles them instead of a CDN. */
+.cm-math {
+  cursor: pointer;
+}
+
+.cm-math-display {
+  display: block;
+  margin: 6px 0;
+  text-align: center;
+}
+
+/* The library is still loading, or the LaTeX does not parse yet. The note's own characters are
+   the honest thing to show — and the same thing the block would show with the caret in it. */
+.cm-math-raw {
+  color: var(--muted);
+}
+
+/* The field is the one place in the app where you are editing something other than characters,
+   so it says so: a ring around exactly the formula that is live, and the LaTeX next to it. */
+.cm-mathfield {
+  display: inline-flex;
+  align-items: stretch;
+  gap: 6px;
+  vertical-align: baseline;
+  max-width: 100%;
+}
+
+/*
+ * MathLive carries two palettes and picks between them on the *operating system's* colour
+ * scheme, which has nothing to do with which theme this app is wearing: on a dark Mac it drew a
+ * near-black slab round the sub-expression holding the caret, on a light note. The glyph colour
+ * is worse still — that one it hardcodes, so a formula came out black on a dark canvas.
+ *
+ * So none of it is left to MathLive. Every variable it switches on `prefers-color-scheme` is
+ * named here and answered from the app's own palette, and the glyph colour twice, because the
+ * container inside the shadow root sets its own and only a `::part` reaches it.
+ */
+.cm-mathfield math-field {
+  flex: 0 1 auto;
+  min-width: 3ch;
+  padding: 1px 4px;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  background: var(--bg-hover);
+  color: var(--text);
+  --caret-color: var(--text);
+  --primary: var(--accent);
+  /* A template's empty slot arrives selected, so this is what paints it — the accent made a
+     bright red block out of "type here". The note's own selection colours instead, which is
+     what selecting anything else in the app already looks like. */
+  --selection-background-color: var(--sel-strong);
+  --selection-color: var(--text);
+  /* MathLive shades the sub-expression the caret sits in. Off: the border already says which
+     formula is live and the caret says where you are inside it, and a slab that moves as you
+     type is noise in the middle of a sentence. Named rather than left alone, or the OS's
+     colour scheme picks it again. */
+  --contains-highlight-background-color: transparent;
+  --contains-highlight-color: var(--text);
+  --text-highlight-background-color: transparent;
+  /* The other empty slots a template leaves behind — `\frac{#0}{#0}` puts two on screen and
+     only one of them is selected. Grey, so they read as "type here" rather than as content. */
+  --box-placeholder-color: var(--muted);
+  --box-placeholder-pressed-color: var(--muted);
+  --placeholder-color: var(--muted);
+  --smart-fence-color: var(--muted);
+  --smart-fence-opacity: 0.6;
+}
+
+.cm-mathfield math-field::part(container) {
+  color: var(--text);
+}
+
+/* Not a second source of truth — it shows and edits the same formula the field holds, and
+   whichever of the two you type into, the other follows. */
+.cm-mathfield-latex {
+  flex: 1 1 14ch;
+  min-width: 8ch;
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.85em;
+}
+
+.cm-mathfield-latex:focus {
+  outline: none;
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.cm-mathfield-display {
+  display: flex;
+  margin: 6px 0;
+}
+
+/* MathLive hangs two buttons inside its own shadow root. Neither belongs in a note: the menu
+   offers commands about a formula that the note has no other way to reach, and the keyboard is
+   for touch devices. `menuItems = []` empties the menu but leaves the button that opens it. */
+.cm-mathfield math-field::part(menu-toggle),
+.cm-mathfield math-field::part(virtual-keyboard-toggle) {
+  display: none;
+}
+
+/*
+ * Unlike the format bar this one does not float: it takes a row of its own at the top of the
+ * pane, so it never covers the note it is writing into. The editor host becomes a column for as
+ * long as a formula is open and gives the row back the moment it closes.
+ */
+.editor.with-math-bar {
+  display: flex;
+  flex-direction: column;
+}
+
+.editor.with-math-bar > .cm-editor {
+  height: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.math-bar {
+  flex: 0 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px;
+  padding: 5px 8px;
+  background: var(--bg-side);
+  border-bottom: 1px solid var(--line);
+}
+
+/* Symbols on one line, templates on the next — the order in each is deliberate, and a single
+   reflowing row loses it as soon as the pane is resized. */
+.math-bar-break {
+  flex: 0 0 100%;
+  height: 0;
+}
+
+.math-bar button {
+  flex: 0 0 auto;
+  min-width: 28px;
+  height: 26px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1;
+}
+.math-bar button:hover {
+  background: var(--bg-hover);
+}
+.math-bar button:active {
+  background: var(--accent);
+  color: #fff;
+}
+
 .embed-missing {
   display: inline-block;
   padding: 6px 10px;
