@@ -9,6 +9,12 @@ const os = require("node:os");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 
+// The app menu, the About item and the alerts all say whatever the app is called, and
+// run from the repo that is "Electron" — the name belongs to the binary until something
+// claims it. Said here rather than left to the packaged build, so `electron .` is Bedrock
+// too. Must be before `ready`: the menu is built from the name once.
+app.setName("Bedrock");
+
 const DIST = path.join(__dirname, "..", "dist");
 // Packaged builds carry the icon in the bundle; this covers running from the repo.
 const DEV_ICON = path.join(__dirname, "..", "build", "icon.png");
@@ -33,7 +39,7 @@ function createWindow() {
     height: 820,
     minWidth: 720,
     minHeight: 460,
-    title: "bedrock",
+    title: "Bedrock",
     backgroundColor: "#1e1e1e",
     ...(process.platform !== "darwin" && !app.isPackaged ? { icon: DEV_ICON } : {}),
     webPreferences: {

@@ -57,9 +57,17 @@ export type Look = {
   folder: string;
   /** Whether a folder box is drawn with a line round it at all. */
   fence: boolean;
+  /**
+   * Whether notes and connections wear their names all the time. Off, the graph is read
+   * as shapes and a name is something you go and ask for: the pointer on a note names it,
+   * its neighbours and the links between them, and the pointer on a link names that link.
+   * A folder box keeps its name either way — a box cannot be hovered (see the `events: no`
+   * in the stylesheet), so a nameless one would have no way of ever saying what it is.
+   */
+  captions: boolean;
 };
 
-const LOOK_DEFAULT: Look = { bg: "", node: "", edge: "", folder: "", fence: true };
+const LOOK_DEFAULT: Look = { bg: "", node: "", edge: "", folder: "", fence: true, captions: true };
 
 /**
  * Backgrounds are their own palette, and not the notes' one: a hue picked to be told
@@ -260,6 +268,7 @@ export class SettingsStore {
         if (typeof value === "string") this.looks[key] = value;
       }
       if (typeof parsed.look?.fence === "boolean") this.looks.fence = parsed.look.fence;
+      if (typeof parsed.look?.captions === "boolean") this.looks.captions = parsed.look.captions;
       for (const key of Object.keys(SETUP_DEFAULT) as Array<keyof Setup>) {
         const value = parsed.setup?.[key];
         if (typeof value === "string") this.setups[key] = value as never;
@@ -370,7 +379,7 @@ const FEATURES: Row[] = [
   {
     feature: "active",
     name: "Note styles",
-    what: "right-click a note to give it a sign, a colour and a pulse — or park it as a ghost",
+    what: "right-click a note to give it a sign, a colour and a pulse",
   },
   { feature: "stickies", name: "Stickies", what: "loose text pinned to the canvas" },
 ];
@@ -521,7 +530,11 @@ export function mountSettings(
       ) +
       `<label class="setting"><input type="checkbox" data-look="fence"${look.fence ? " checked" : ""} />` +
       `<span><b>Fence round folders</b><small>off leaves a patch of coloured ground with a name on it` +
-      ` — a folder that styled its own fence still gets one</small></span></label>`
+      ` — a folder that styled its own fence still gets one</small></span></label>` +
+      `<label class="setting"><input type="checkbox" data-look="captions"${look.captions ? " checked" : ""} />` +
+      `<span><b>Names on the canvas</b><small>off reads the graph as shapes: put the pointer on a note` +
+      ` to name it, its neighbours and the links between them, or on a link to name that link` +
+      ` — folder names stay, a box has no other way to say what it is</small></span></label>`
     );
   };
 
@@ -564,6 +577,10 @@ export function mountSettings(
     const box = event.target as HTMLInputElement;
     if (box.dataset.look === "fence") {
       store.setLook({ fence: box.checked });
+      return;
+    }
+    if (box.dataset.look === "captions") {
+      store.setLook({ captions: box.checked });
       return;
     }
     const feature = box.dataset.feature as Feature | undefined;

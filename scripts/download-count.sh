@@ -23,7 +23,12 @@ if [ "${1:-}" = "--total" ]; then
        FROM ($SQL)"
 fi
 
-# bq has no --account flag; CLOUDSDK_CORE_ACCOUNT is the documented equivalent.
-env "CLOUDSDK_CORE_ACCOUNT=$ACCOUNT" \
-  bq --project_id "$PROJECT" --location "$REGION" \
-  query --use_legacy_sql=false --format pretty "$SQL"
+# Piped in rather than passed as an argument: the query starts with a "--" comment,
+# which bq parses as an unknown flag and then dies with a RecursionError inside its
+# own did-you-mean suggester, saying nothing about the real problem.
+#
+# bq has no --account flag either; CLOUDSDK_CORE_ACCOUNT is the documented
+# equivalent. --quiet keeps its progress lines out of the output.
+printf '%s\n' "$SQL" | env "CLOUDSDK_CORE_ACCOUNT=$ACCOUNT" \
+  bq --quiet --headless --project_id "$PROJECT" --location "$REGION" \
+  query --use_legacy_sql=false --format pretty
