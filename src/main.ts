@@ -198,12 +198,14 @@ const graphView = new GraphView(ui.cy, {
     if (!window.open(url, "_blank", "noopener")) ui.status.textContent = `the browser blocked ${url}`;
   },
   onOpenEdge: (source, target, label) => void openEdgeNote(source, target, label),
+  onOpenFreeform: (path, board) => void openFreeformNode(path, board),
   onLinkExisting: (source, target) => linkNotes(source, target),
   onLinkNew: (source, at, folder, kind) => {
     if (kind === "gemini") void createGeminiAt(at, folder, source);
     else if (kind === "claude") void createClaudeAt(at, folder, source);
     else if (kind === "file" || kind === "folder") void createFsAt(at, folder, kind, source);
     else if (kind === "web") void createWebAt(at, folder, source);
+    else if (kind === "freeform") void createFreeformAt(at, folder, source);
     else void linkToNewNote(source, at, folder);
   },
   onReparent: (path, folder) => void moveEntry(path, "file", folder, true),
@@ -229,6 +231,9 @@ const graphView = new GraphView(ui.cy, {
     }
     if (settings.enabled("web")) {
       items.push({ label: "Link to a webpage…", run: () => graphView.startLink(path, "web") });
+    }
+    if (settings.enabled("freeform")) {
+      items.push({ label: "Link to a Freeform board…", run: () => graphView.startLink(path, "freeform") });
     }
     if (settings.enabled("active")) {
       items.push({ label: "Style…", run: () => void styleNode(path, client) });
@@ -293,6 +298,12 @@ const graphView = new GraphView(ui.cy, {
     }
     if (settings.enabled("web")) {
       items.push({ label: "Link a webpage…", run: () => void createWebAt(at, folder) });
+    }
+    if (settings.enabled("freeform")) {
+      items.push(
+        { label: "New Freeform board", run: () => void createFreeformAt(at, folder) },
+        { label: "Link a Freeform board…", run: () => void linkFreeformAt(at, folder) },
+      );
     }
     showMenu(client, items);
   },
@@ -809,8 +820,12 @@ function retargetTabs(from: string, to: string): void {
 /** Applies a name typed inline, in the tree or on a graph node. Returns the path it ended up at. */
 async function applyRename(path: string, kind: "file" | "dir", name: string): Promise<string | null> {
   const current = kind === "file" ? noteName(path) : basename(path);
-  if (!name || name === current) return path;
-  const next = join(dirname(path), kind === "file" && !isMarkdown(name) ? `${name}.md` : name);
+  // Every name lands here — typed, or taken from a page's own title — so this is the one place
+  // that has to hold the line: nothing in the vault is ever called something a [[link]] cannot
+  // spell. See `tidyName`.
+  const wanted = tidyName(name);
+  if (!wanted || wanted === current) return path;
+  const next = join(dirname(path), kind === "file" && !isMarkdown(wanted) ? `${wanted}.md` : wanted);
   if (next !== path && (filePaths().includes(next) || entries.some((e) => e.path === next))) {
     ui.status.textContent = `${next} already exists — not renamed`;
     return path;
@@ -1356,9 +1371,15 @@ async function insertCitation(source: string, target: string, label: string | nu
   if (source === target) return;
   const text = await vault.read(source);
   const resolver = new LinkResolver(filePaths());
-  if (linkTargets(text).some((t) => resolver.resolve(t) === target)) return;
+  const spelling = target.replace(/\.md$/i, "");
+  // Resolved, or spelled the same. A link the vault cannot resolve is still a link that is
+  // already in the note: without the second test, a target nothing can resolve — a name with a
+  // space on the end, once — was written in again on every attempt, the same dead line twice.
+  if (linkTargets(text).some((t) => resolver.resolve(t) === target || t.trim() === spelling.trim())) {
+    return;
+  }
   const gap = text === "" || text.endsWith("\n\n") ? "" : text.endsWith("\n") ? "\n" : "\n\n";
-  await vault.write(source, `${text}${gap}${labelledLink(label, target.replace(/\.md$/i, ""))}\n`);
+  await vault.write(source, `${text}${gap}${labelledLink(label, spelling)}\n`);
 }
 
 /**
@@ -1822,6 +1843,63 @@ function integrationPage(feature: Feature): SetupPage | null {
       return { status, ready, lines };
     }
 
+    case "freeform": {
+      if (!bridge) {
+        return {
+          status: "desktop app only",
+          lines: [
+            {
+              label: "Why",
+              value: "boards are opened and made through the Mac's own Shortcuts and URL scheme, which a browser tab cannot reach — npm start",
+            },
+          ],
+        };
+      }
+      if (freeformState && !freeformState.app) {
+        return {
+          status: "no Freeform here",
+          lines: [
+            {
+              label: "Freeform",
+              value: "not on this Mac. It comes with macOS 13 and later, and nothing here can work without it.",
+            },
+          ],
+        };
+      }
+      const has = freeformState?.shortcut ?? false;
+      const lines: SetupLine[] = [
+        {
+          label: "What this is",
+          value:
+            "notes that point at Freeform boards. Bedrock keeps only the pointer — a board's id and name — and the boards stay Freeform's own, in iCloud. Nothing is hosted here.",
+        },
+        {
+          label: "Shortcut",
+          value: has
+            ? `“${FREEFORM_SHORTCUT}” is in your Shortcuts library — making a board runs it`
+            : "Apple's one door into making a board is the Shortcuts app, so Bedrock ships a signed shortcut. Installing opens it there — a single Add Shortcut click, which Apple keeps for you on purpose.",
+          ...(has ? {} : { action: { id: "install", label: "Install…" } }),
+        },
+        {
+          label: "Try it",
+          value:
+            freeformWord ||
+            (has
+              ? "makes a real board called “Bedrock connected” and opens it — proof the whole road works"
+              : "install the shortcut first; then this makes a real board and opens it"),
+          ...(has ? { action: { id: "test", label: "Try it" } } : {}),
+        },
+      ];
+      const status = !freeformState
+        ? "not read yet"
+        : !has
+          ? "shortcut needed"
+          : settings.enabled("freeform")
+            ? "ready"
+            : "try it";
+      return { status, ready: has, lines };
+    }
+
     default:
       return null;
   }
@@ -1839,6 +1917,8 @@ function runIntegrationAction(feature: Feature, action: string): void {
   else if (feature === "gemini" && action.startsWith("window-")) setGeminiWindow(action.slice(7));
   else if (feature === "gemini" && action === "signin") void signIntoGemini();
   else if (feature === "gemini" && action === "signout") void signOutOfGemini();
+  else if (feature === "freeform" && action === "install") void installFreeformShortcut();
+  else if (feature === "freeform" && action === "test") void testFreeform();
   else if (feature === "git" && action === "folder") void setVaultRoot();
   else if (feature === "git" && action === "commit") void commitVault();
   else if (feature === "git" && action === "remote") void setGitRemote();
@@ -1934,6 +2014,80 @@ async function terminalReady(): Promise<boolean> {
     redrawSettings();
   }
   return !!tmuxPath;
+}
+
+/* ---------------------------------------------------- freeform's own page --- */
+
+/** The shortcut's name everywhere: the shipped file, the library, `shortcuts run`. */
+const FREEFORM_SHORTCUT = "New Freeform Board (Bedrock)";
+
+/**
+ * Whether Freeform is on this Mac and whether the shortcut is in the library — the two
+ * facts the page reports. Read from the shell rather than remembered, because the
+ * shortcut is added in another app entirely, while this one is running.
+ */
+let freeformState: { app: boolean; shortcut: boolean } | null = null;
+
+/** The last try's outcome, worded for the page. Empty until somebody presses the button. */
+let freeformWord = "";
+
+async function refreshFreeform(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  freeformState = await bridge.freeformStatus().catch(() => null);
+  redrawSettings();
+}
+
+/**
+ * Opens Shortcuts' import dialog, then watches for the add — the one click that has to
+ * happen in another app, which this page should notice by itself rather than grow a
+ * refresh button for.
+ */
+async function installFreeformShortcut(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  try {
+    await bridge.freeformInstall();
+  } catch (err) {
+    ui.status.textContent = `Freeform: ${(err as Error).message}`;
+    return;
+  }
+  ui.status.textContent = "Freeform: Shortcuts opened — click Add Shortcut there; this page will notice";
+  for (let tries = 0; tries < 40; tries++) {
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    const status = await bridge.freeformStatus().catch(() => null);
+    if (!status) return;
+    if (status.shortcut) {
+      freeformState = status;
+      ui.status.textContent = "Freeform: shortcut installed — try it";
+      redrawSettings();
+      return;
+    }
+  }
+}
+
+/**
+ * The activation: make a real board, watch it appear, open it. Passing is the proof the
+ * whole road works — shortcut, Freeform, index, URL scheme — so passing is also what
+ * switches the integration on.
+ */
+async function testFreeform(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  freeformWord = "creating a board…";
+  redrawSettings();
+  try {
+    const board = await bridge.freeformCreate("Bedrock connected");
+    if (!board) throw new Error("the shortcut ran, but no new board showed up in Freeform's index");
+    settings.set("freeform", true);
+    freeformWord = `made “${board.title}” just now — it should be open on your screen`;
+    ui.status.textContent = "Freeform: connected";
+    void bridge.freeformOpen(board.id);
+  } catch (err) {
+    freeformWord = (err as Error).message;
+    ui.status.textContent = `Freeform: ${freeformWord}`;
+  }
+  redrawSettings();
 }
 
 /* ------------------------------------------------------ gemini's own page --- */
@@ -2568,9 +2722,27 @@ const webHost = (url: string): string => {
   }
 };
 
-/** A page title is somebody else's text: it has to survive being used as a file name. */
-const asFileName = (title: string): string =>
-  title.replace(/[\\/:*?"<>|[\]#^]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 60);
+/**
+ * No leading or trailing space or dot. A file whose name ends in a space cannot be linked to at
+ * all: every `[[link]]` is read trimmed, so the name written into the note never finds the file
+ * again — and because it never resolves, the app cannot tell it is already there and writes it
+ * a second time on the next attempt. Trailing dots go for the same reason, plus Windows will
+ * not keep one; a leading dot would make the note a hidden file.
+ */
+const tidyName = (name: string): string => name.replace(/^[\s.]+/, "").replace(/[\s.]+$/, "");
+
+/**
+ * A page title is somebody else's text: it has to survive being used as a file name. A post is
+ * the awkward case — it has no title, so the whole first paragraph arrives as one — which is
+ * why the cut comes before the tidy, and at a word boundary where there is one to take.
+ */
+const asFileName = (title: string): string => {
+  const clean = title.replace(/[\\/:*?"<>|[\]#^]+/g, " ").replace(/\s+/g, " ").trim();
+  if (clean.length <= 60) return tidyName(clean);
+  const cut = clean.slice(0, 60);
+  const space = cut.lastIndexOf(" ");
+  return tidyName(space > 30 ? cut.slice(0, space) : cut);
+};
 
 /**
  * "Link a webpage…" — from the canvas menu, or from a link draft released on empty space
@@ -2717,6 +2889,195 @@ async function openWebNode(path: string, url: string | null): Promise<void> {
   // here. Only a plain browser returning null means a popup was actually blocked.
   const opened = window.open(url, "_blank", "noopener");
   say(opened || window.bedrock ? `${noteName(path)} → ${url}` : `the browser blocked ${url}`);
+}
+
+/* -------------------------------------------------------- freeform boards --- */
+
+/**
+ * A board note is a pointer in the webpage note's mould: the board's uuid, and nothing
+ * said on its behalf. The uuid is what `freeform://board?id=` opens; the board itself —
+ * every sticky and stroke on it — stays Freeform's own, in iCloud. A note without a
+ * `board::` line is a board that has not been made yet, which a click makes.
+ */
+const freeformTemplate = (board: string): string =>
+  board ? `type:: freeform\n\nboard:: ${board}\n` : `type:: freeform\n`;
+
+/**
+ * Whether a board action may go ahead: the app on this Mac, the shortcut in the library.
+ * Asked of the shell each time rather than of a flag, so installing the shortcut takes
+ * effect without a restart — and refused with directions rather than half-done.
+ */
+async function freeformReady(): Promise<boolean> {
+  const bridge = window.bedrock;
+  if (!bridge) {
+    ui.status.textContent = "Freeform boards need the desktop app — npm start";
+    return false;
+  }
+  const status = await bridge.freeformStatus().catch(() => null);
+  freeformState = status;
+  if (!status?.app || !status.shortcut) {
+    ui.status.textContent = !status?.app
+      ? "Freeform is not on this Mac — it comes with macOS 13 and later"
+      : "Freeform: install the shortcut first — Settings → Integrations → Freeform";
+    redrawSettings();
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Makes the board a note stands for — named what the note is named — writes the uuid
+ * home into the note, and opens the board on screen.
+ */
+async function makeFreeformBoard(path: string): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  ui.status.textContent = `Freeform: creating “${noteName(path)}”…`;
+  let board: FreeformBoard | null = null;
+  try {
+    board = await bridge.freeformCreate(noteName(path));
+  } catch (err) {
+    ui.status.textContent = `Freeform: ${(err as Error).message}`;
+    return;
+  }
+  if (!board) {
+    ui.status.textContent = "Freeform: the shortcut ran, but no new board showed up";
+    return;
+  }
+  await flushAll(); // the note may be open and mid-edit; the write must not clobber
+  await vault.write(path, setField(await vault.read(path), "board", board.id));
+  graphView.setFreeformBoard(path, board.id);
+  graphStale = true;
+  for (let i = 0; i < panes.length; i++) if (pathOf(panes[i]) === path) await renderPage(i);
+  void bridge.freeformOpen(board.id);
+  ui.status.textContent = `${noteName(path)} → its own board, open in Freeform`;
+}
+
+/**
+ * Click on a board node: open the board in Freeform. A note whose board was never made
+ * (the shortcut failed, or the line was stripped by hand) gets one made from its own
+ * name instead — the node heals itself rather than just complaining.
+ */
+async function openFreeformNode(path: string, board: string | null): Promise<void> {
+  // One tick later, for the same reason `openFsNode` waits: the click's own free
+  // handler clears the hint right after this, and the message has to outlive that.
+  const say = (message: string): void => {
+    window.setTimeout(() => {
+      ui.status.textContent = message;
+    }, 0);
+  };
+  const bridge = window.bedrock;
+  if (!bridge) {
+    say("Freeform boards need the desktop app — npm start");
+    return;
+  }
+  if (board) {
+    const opened = await bridge.freeformOpen(board);
+    say(opened ? `${noteName(path)} → Freeform` : `the note's board:: line is not a board id`);
+    return;
+  }
+  if (!(await freeformReady())) return;
+  await makeFreeformBoard(path);
+}
+
+/**
+ * "New Freeform board" — from the canvas menu, or from a link draft released on empty
+ * space (`source` is then the note the arrow came from). The note comes first and gets
+ * its name, and committing the name is what makes the board: it is born called what the
+ * note is called, opens on screen, and its uuid is written home.
+ */
+async function createFreeformAt(
+  at: { x: number; y: number },
+  folder: string | null,
+  source: string | null = null,
+): Promise<void> {
+  if (!(await freeformReady())) return;
+  const dir = folder ?? "";
+  const path = uniquePath(filePaths(), dir, "Freeform board", ".md");
+  await vault.createFile(path, freeformTemplate(""));
+  entries = [...entries, { path, kind: "file" }]; // so the rename's collision check sees it
+  if (source) {
+    graphView.commitLink(source, path, {
+      label: noteName(path),
+      parent: dir || undefined,
+      at,
+      type: "freeform",
+    });
+  } else {
+    graphView.commitNode(path, noteName(path), dir || undefined, at, "freeform");
+  }
+  graphStale = true;
+  await refreshSidebar();
+  ui.status.textContent = `created ${path} — name it, and the board is made to match`;
+  graphView.renameNode(path, (name) => {
+    void (async () => {
+      const finalPath = name ? ((await applyRename(path, "file", name)) ?? path) : path;
+      if (!source) {
+        await makeFreeformBoard(finalPath);
+        return;
+      }
+      // Linked board: the connection gets its name FIRST. Making the board opens
+      // Freeform over everything, and a window grabbing focus mid-word is how a label
+      // gets lost — all the naming happens at home, then the board is made.
+      graphView.promptConnection(source, finalPath, (label) => {
+        void (async () => {
+          await finishLink(source, finalPath, label);
+          await makeFreeformBoard(finalPath);
+        })();
+      });
+    })();
+  });
+}
+
+/**
+ * "Link a Freeform board…" — the boards already in Freeform, latest edit first, and the
+ * one picked becomes a node named after it. Boards can share a title over there, so the
+ * list numbers the doubles rather than guessing which one was meant.
+ */
+async function linkFreeformAt(
+  at: { x: number; y: number },
+  folder: string | null,
+  source: string | null = null,
+): Promise<void> {
+  if (!(await freeformReady())) return;
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  ui.status.textContent = "Freeform: reading your boards…";
+  const boards = await bridge.freeformBoards(30).catch(() => []);
+  if (!boards.length) {
+    ui.status.textContent = "Freeform: no boards to link — make one first";
+    return;
+  }
+  const byLabel = new Map<string, FreeformBoard>();
+  for (const board of boards) {
+    const title = board.title || "Untitled";
+    let label = title;
+    for (let n = 2; byLabel.has(label); n++) label = `${title} (${n})`;
+    byLabel.set(label, board);
+  }
+  const picked = await askChoice("Which board should the note point at?", [...byLabel.keys()], "Cancel");
+  if (picked === null) return;
+  const board = byLabel.get(picked);
+  if (!board) return;
+  const dir = folder ?? "";
+  const path = uniquePath(filePaths(), dir, asFileName(board.title || "Untitled"), ".md");
+  await vault.createFile(path, freeformTemplate(board.id));
+  entries = [...entries, { path, kind: "file" }];
+  if (source) {
+    graphView.commitLink(source, path, {
+      label: noteName(path),
+      parent: dir || undefined,
+      at,
+      type: "freeform",
+      url: board.id,
+    });
+    graphView.promptConnection(source, path, (label) => void finishLink(source, path, label));
+  } else {
+    graphView.commitNode(path, noteName(path), dir || undefined, at, "freeform", board.id);
+  }
+  graphStale = true;
+  ui.status.textContent = `${noteName(path)} → its board in Freeform`;
+  await refreshSidebar();
 }
 
 /* ---------------------------------------------------------------- claude --- */
@@ -3203,6 +3564,7 @@ ui.settings.addEventListener("click", () => {
   void refreshGeminiStatus();
   void refreshTmux();
   void refreshGit();
+  void refreshFreeform();
 });
 settings.onChange = applyFeatures;
 settings.onLook = applyLook;

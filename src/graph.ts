@@ -280,6 +280,14 @@ const GLOBE_ICON =
   );
 
 /**
+ * What a Freeform board node wears: Freeform's own icon, lifted from the app bundle
+ * (AppIcon.icns, scaled to 128px and inlined) rather than redrawn — a board node should
+ * read as THAT app at a glance, and the app already drew itself better than we would.
+ */
+const FREEFORM_ICON =
+  "data:image/png;base64,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";
+
+/**
  * Styles by note TYPE — the `type:: …` line a file ends with. Untyped notes are
  * tag-pie circles; a typed one wears its type on its sleeve — a Gemini
  * conversation IS the Gemini app icon. New types slot in here and get their
@@ -339,6 +347,15 @@ const TYPE_STYLES: Record<string, Record<string, unknown>> = {
     "background-fit": "contain",
     "background-color": "#eef1f5",
     "background-opacity": 1,
+    "pie-size": "0%",
+  },
+  // A Freeform board: the whiteboard tile, and a click opens the board in Freeform
+  // itself — the note behind it holds only the pointer.
+  freeform: {
+    shape: "round-rectangle",
+    "background-image": FREEFORM_ICON,
+    "background-fit": "cover",
+    "background-opacity": 0,
     "pie-size": "0%",
   },
 };
@@ -406,6 +423,12 @@ function styleSheet(look: Look): cytoscape.StylesheetJson {
         "text-valign": "center",
         "text-halign": "right",
         "text-margin-x": 4,
+        // A note named after a webpage carries whatever that page calls itself, and a post
+        // calls itself by its first paragraph. Left to run, the name is a line of text laid
+        // across the canvas over everything behind it; the tree and the tab still say it in
+        // full, so the node says as much of it as a node has room for.
+        "text-wrap": "ellipsis",
+        "text-max-width": "150px",
         "min-zoomed-font-size": 8,
         width: 20,
         height: 20,
@@ -897,6 +920,9 @@ export function buildElements(docs: Doc[], described: ReadonlySet<string> = new 
               wicon: GLOBE_ICON,
             }
           : {}),
+        // A board node opens its board the same way: the uuid rides the node. Empty is
+        // a note whose board has not been made yet — a click makes it (see main.ts).
+        ...(type === "freeform" ? { fboard: parseField(doc.text, "board") ?? "" } : {}),
         // Same bargain for a session note: its id rides the node, so a click can go
         // straight to `claude://resume` without a read first. Empty until the Claude app
         // has minted one — that is a note that has never been run.
@@ -947,7 +973,7 @@ export type Client = { x: number; y: number };
  * What a link draft is aimed at making when it lands on empty space: an ordinary note, or
  * one of the typed notes that stand for something outside the vault.
  */
-export type DraftKind = "note" | "gemini" | "claude" | "file" | "folder" | "web";
+export type DraftKind = "note" | "gemini" | "claude" | "file" | "folder" | "web" | "freeform";
 
 /**
  * What a Claude session is doing, as the corner of its node reports it. `unseen` is the
@@ -971,6 +997,7 @@ const DRAFT_NAMES: Record<DraftKind, string> = {
   web: "webpage",
   file: "file link",
   folder: "folder link",
+  freeform: "Freeform board",
 };
 
 export type GraphHandlers = {
@@ -997,6 +1024,11 @@ export type GraphHandlers = {
    * note carries none) — it opens in the real browser, like every other web link here.
    */
   onOpenWeb: (path: string, url: string | null) => void;
+  /**
+   * Click on a Freeform board node: hand over the board uuid stored on the node — null
+   * for a note whose board was never made, which is an invitation to make it.
+   */
+  onOpenFreeform: (path: string, board: string | null) => void;
   /**
    * An edit made in an issue card: the note's new markdown, and what (if anything) of
    * it Linear should be told about. The graph has already redrawn — this is the write.
@@ -1652,6 +1684,12 @@ export class GraphView {
       // stays reachable from the tree.
       if (ntype === "web" && this.settings.enabled("web")) {
         this.handlers.onOpenWeb(node.id(), (node.data("wurl") as string) || null);
+        return;
+      }
+      // A board node is a whiteboard's doorway: clicking it opens the board in Freeform.
+      // The note behind it is only the pointer, and stays reachable from the tree.
+      if (ntype === "freeform" && this.settings.enabled("freeform")) {
+        this.handlers.onOpenFreeform(node.id(), (node.data("fboard") as string) || null);
         return;
       }
       // An issue node is a folded checklist: clicking unfolds it over the canvas
@@ -3164,6 +3202,12 @@ export class GraphView {
     if (node && node.nonempty()) node.data("fspath", target);
   }
 
+  /** Likewise for a board made after its note — the node opens it at once. */
+  setFreeformBoard(path: string, board: string): void {
+    const node = this.cy?.getElementById(path);
+    if (node && node.nonempty()) node.data("fboard", board);
+  }
+
   /** Likewise for a re-typed address, when the note was left without one. */
   setWebUrl(path: string, url: string): void {
     const node = this.cy?.getElementById(path);
@@ -3376,7 +3420,13 @@ export class GraphView {
         size: nodeSize(0),
         ntype: type ?? "",
         // `url` is whatever the node opens; which key it rides on is the type's business.
-        ...(url ? (type === "web" ? { wurl: url, wicon: this.webIcons.get(url) ?? GLOBE_ICON } : { gurl: url }) : {}),
+        ...(url
+          ? type === "web"
+            ? { wurl: url, wicon: this.webIcons.get(url) ?? GLOBE_ICON }
+            : type === "freeform"
+              ? { fboard: url }
+              : { gurl: url }
+          : {}),
         ...(fspath ? { fspath } : {}),
       },
       position: this.freeSpot(parent, at),
@@ -3461,7 +3511,9 @@ export class GraphView {
           ...(newNode.url
             ? newNode.type === "web"
               ? { wurl: newNode.url, wicon: this.webIcons.get(newNode.url) ?? GLOBE_ICON }
-              : { gurl: newNode.url }
+              : newNode.type === "freeform"
+                ? { fboard: newNode.url }
+                : { gurl: newNode.url }
             : {}),
           ...(newNode.fspath ? { fspath: newNode.fspath } : {}),
         },

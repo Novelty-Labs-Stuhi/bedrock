@@ -33,6 +33,11 @@ contextBridge.exposeInMainWorld("bedrock", {
   linearStatus: () => ipcRenderer.invoke("linear-status"),
   linearForget: () => ipcRenderer.invoke("linear-forget"),
   linearCall: (query, variables) => ipcRenderer.invoke("linear-call", query, variables),
+  freeformStatus: () => ipcRenderer.invoke("freeform-status"),
+  freeformBoards: (limit) => ipcRenderer.invoke("freeform-boards", limit),
+  freeformCreate: (title) => ipcRenderer.invoke("freeform-create", title),
+  freeformOpen: (id) => ipcRenderer.invoke("freeform-open", id),
+  freeformInstall: () => ipcRenderer.invoke("freeform-install"),
 
   // Sessions run by the CLI, under tmux. `termStatus` is what the settings window gates
   // the whole mode on; the rest is the window that draws one.
