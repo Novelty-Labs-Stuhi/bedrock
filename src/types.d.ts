@@ -81,6 +81,21 @@ interface Window {
     /** One GraphQL call, with the stored key added by the shell. */
     linearCall(query: string, variables?: unknown): Promise<unknown>;
 
+    /** Whether Freeform is on this Mac, and whether Bedrock's shortcut — Apple's only
+        door into making a board — is in the Shortcuts library. */
+    freeformStatus(): Promise<{ app: boolean; shortcut: boolean }>;
+    /** The boards Freeform knows of, latest edit first — read off the index Freeform
+        keeps for its widget, never off its database. */
+    freeformBoards(limit?: number): Promise<FreeformBoard[]>;
+    /** Makes a board by running the shipped shortcut, and resolves with the board once
+        it shows up in the index — or null if the run succeeded but nothing appeared. */
+    freeformCreate(title: string): Promise<FreeformBoard | null>;
+    /** Opens THE board, in Freeform, over its URL scheme. False for a malformed id. */
+    freeformOpen(id: string): Promise<boolean>;
+    /** Opens Shortcuts' import dialog on the shipped shortcut — the one Add Shortcut
+        click Apple keeps for the person. Rejects with what the OS said went wrong. */
+    freeformInstall(): Promise<boolean>;
+
     /** Whether sessions can be run in a terminal here: where tmux is (null when it is not
         installed), and how it could be got. The whole mode is gated on this. */
     termStatus(): Promise<{ tmux: string | null; installer: "brew" | null; platform: string }>;
@@ -109,6 +124,16 @@ interface Window {
     onTermEnded(fn: () => void): void;
   };
 }
+
+/** A Freeform board as the pointer Bedrock keeps: never the board itself. */
+type FreeformBoard = {
+  /** The uuid Freeform minted — what `freeform://board?id=` opens. */
+  id: string;
+  title: string;
+  /** Last edit, epoch milliseconds. */
+  at: number;
+  shared: boolean;
+};
 
 /** The vault's repository as git describes it. `repo` is false both when the folder has
     never been initialised and when it merely sits inside somebody else's checkout. */

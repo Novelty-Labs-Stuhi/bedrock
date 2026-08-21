@@ -1754,6 +1754,111 @@ ipcMain.handle("claude-status", (_event, ids) => {
   return out;
 });
 
+/*
+ * Freeform. Apple gives it no API — no scripting dictionary, nothing to link against.
+ * What it does give: a URL scheme (`freeform://board?id=<uuid>`) that opens a board,
+ * a board index the app keeps beside its own database (Snapshot.plist — every board's
+ * uuid, title and last edit, readable), and App Intents (create board, and more) that
+ * only the Shortcuts app can reach. So "make a board" is: run a shortcut Bedrock ships
+ * as a signed file, then read the index to see which board is new. The boards stay
+ * entirely Freeform's own, in iCloud — what crosses into Bedrock is a pointer.
+ */
+const FREEFORM_APP = "/System/Applications/Freeform.app";
+const FREEFORM_SHORTCUT = "New Freeform Board (Bedrock)";
+const FREEFORM_SNAPSHOT = path.join(
+  os.homedir(),
+  "Library/Group Containers/group.com.apple.freeform/Snapshot.plist",
+);
+
+/** One command, promised. `input` goes to its stdin, which is how a shortcut takes text. */
+const command = (bin, args, input) =>
+  new Promise((resolve, reject) => {
+    const child = execFile(bin, args, { timeout: 60000 }, (err, stdout, stderr) =>
+      err ? reject(new Error(String(stderr || err.message).trim())) : resolve(String(stdout)),
+    );
+    if (input !== undefined) child.stdin.end(input);
+  });
+
+/**
+ * The index is a binary plist full of dates, which JSON.parse and `plutil -convert json`
+ * both refuse — osascript's JavaScript is the one tool always on a Mac that reads it
+ * whole. A board can appear in several sections (recents, all, a folder), so the walk
+ * keeps whichever sighting was edited last.
+ */
+const FREEFORM_LIST = `
+ObjC.import("Foundation");
+const tree = ObjC.deepUnwrap($.NSArray.arrayWithContentsOfFile(${JSON.stringify(FREEFORM_SNAPSHOT)}));
+const out = {};
+function walk(node) {
+  const board = node.item && node.item.board && node.item.board.board;
+  if (board && board.boardIdentifier) {
+    const id = board.boardIdentifier.storage.boardUUID;
+    const at = board.lastEdited instanceof Date ? board.lastEdited.getTime() : 0;
+    if (!out[id] || out[id].at < at) out[id] = { title: String(board.title || ""), at, shared: !!board.isShared };
+  }
+  (node.children || []).forEach(walk);
+}
+(tree || []).forEach(walk);
+JSON.stringify(out);`;
+
+/** Every board Freeform knows of, latest edit first: `{ id, title, at, shared }`. */
+async function freeformBoards() {
+  const raw = await command("osascript", ["-l", "JavaScript", "-e", FREEFORM_LIST]);
+  return Object.entries(JSON.parse(raw || "{}"))
+    .map(([id, board]) => ({ id, ...board }))
+    .sort((a, b) => b.at - a.at);
+}
+
+ipcMain.handle("freeform-status", async () => {
+  if (process.platform !== "darwin") return { app: false, shortcut: false };
+  let shortcut = false;
+  try {
+    shortcut = (await command("shortcuts", ["list"])).split("\n").includes(FREEFORM_SHORTCUT);
+  } catch {
+    /* no shortcuts CLI — an old macOS, which also has no Freeform */
+  }
+  return { app: fs.existsSync(FREEFORM_APP), shortcut };
+});
+
+ipcMain.handle("freeform-boards", async (_event, limit = 40) => {
+  try {
+    return (await freeformBoards()).slice(0, Math.max(1, Number(limit) || 40));
+  } catch {
+    return [];
+  }
+});
+
+ipcMain.handle("freeform-create", async (_event, rawTitle) => {
+  const title = String(rawTitle ?? "").trim() || "Untitled";
+  const before = new Set((await freeformBoards().catch(() => [])).map((board) => board.id));
+  await command("shortcuts", ["run", FREEFORM_SHORTCUT], title);
+  // The run resolving means Freeform made the board; the index is written a beat later.
+  for (let tries = 0; tries < 20; tries++) {
+    const fresh = (await freeformBoards().catch(() => [])).find((board) => !before.has(board.id));
+    if (fresh) return fresh;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return null;
+});
+
+ipcMain.handle("freeform-open", (_event, id) => {
+  const uuid = String(id || "").toUpperCase();
+  if (!/^[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}$/.test(uuid)) return false;
+  void shell.openExternal(`freeform://board?id=${uuid}`);
+  return true;
+});
+
+ipcMain.handle("freeform-install", async () => {
+  // The signed shortcut ships inside the app's archive, where Shortcuts cannot reach —
+  // a copy in the real filesystem is what gets opened. Opening it is Shortcuts' import
+  // dialog: one Add Shortcut click, which Apple keeps for the person on purpose.
+  const target = path.join(os.tmpdir(), `${FREEFORM_SHORTCUT}.shortcut`);
+  fs.copyFileSync(path.join(__dirname, "freeform", `${FREEFORM_SHORTCUT}.shortcut`), target);
+  const error = await shell.openPath(target);
+  if (error) throw new Error(error);
+  return true;
+});
+
 app.whenReady().then(() => {
   protocol.handle("app", serve);
   if (process.platform === "darwin" && !app.isPackaged && fs.existsSync(DEV_ICON)) {

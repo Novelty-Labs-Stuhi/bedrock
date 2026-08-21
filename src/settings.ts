@@ -10,7 +10,16 @@
 import { swatchRow } from "./node-style";
 import type { Vault } from "./vault";
 
-export type Feature = "stickies" | "linear" | "git" | "gemini" | "claude" | "files" | "web" | "active";
+export type Feature =
+  | "stickies"
+  | "linear"
+  | "git"
+  | "gemini"
+  | "claude"
+  | "files"
+  | "web"
+  | "active"
+  | "freeform";
 
 export const CONFIG_FILE = ".notes/config.json";
 
@@ -31,6 +40,7 @@ const DEFAULTS: Record<Feature, boolean> = {
   files: false,
   web: false,
   active: false,
+  freeform: false,
 };
 
 /** Linear took the todos' place, so a vault that had todos on keeps its checklists. */
@@ -402,6 +412,11 @@ const INTEGRATIONS: Row[] = [
     what: "conversation notes — rectangles that open the chat in the browser",
   },
   { feature: "git", name: "GitHub", what: "commit the vault and push it to a GitHub remote, from this page (desktop app)" },
+  {
+    feature: "freeform",
+    name: "Freeform",
+    what: "board notes — link Apple's whiteboards and make new ones from here (desktop app, Mac)",
+  },
 ];
 
 /**
