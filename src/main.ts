@@ -809,8 +809,12 @@ function retargetTabs(from: string, to: string): void {
 /** Applies a name typed inline, in the tree or on a graph node. Returns the path it ended up at. */
 async function applyRename(path: string, kind: "file" | "dir", name: string): Promise<string | null> {
   const current = kind === "file" ? noteName(path) : basename(path);
-  if (!name || name === current) return path;
-  const next = join(dirname(path), kind === "file" && !isMarkdown(name) ? `${name}.md` : name);
+  // Every name lands here — typed, or taken from a page's own title — so this is the one place
+  // that has to hold the line: nothing in the vault is ever called something a [[link]] cannot
+  // spell. See `tidyName`.
+  const wanted = tidyName(name);
+  if (!wanted || wanted === current) return path;
+  const next = join(dirname(path), kind === "file" && !isMarkdown(wanted) ? `${wanted}.md` : wanted);
   if (next !== path && (filePaths().includes(next) || entries.some((e) => e.path === next))) {
     ui.status.textContent = `${next} already exists — not renamed`;
     return path;
@@ -1356,9 +1360,15 @@ async function insertCitation(source: string, target: string, label: string | nu
   if (source === target) return;
   const text = await vault.read(source);
   const resolver = new LinkResolver(filePaths());
-  if (linkTargets(text).some((t) => resolver.resolve(t) === target)) return;
+  const spelling = target.replace(/\.md$/i, "");
+  // Resolved, or spelled the same. A link the vault cannot resolve is still a link that is
+  // already in the note: without the second test, a target nothing can resolve — a name with a
+  // space on the end, once — was written in again on every attempt, the same dead line twice.
+  if (linkTargets(text).some((t) => resolver.resolve(t) === target || t.trim() === spelling.trim())) {
+    return;
+  }
   const gap = text === "" || text.endsWith("\n\n") ? "" : text.endsWith("\n") ? "\n" : "\n\n";
-  await vault.write(source, `${text}${gap}${labelledLink(label, target.replace(/\.md$/i, ""))}\n`);
+  await vault.write(source, `${text}${gap}${labelledLink(label, spelling)}\n`);
 }
 
 /**
@@ -2568,9 +2578,27 @@ const webHost = (url: string): string => {
   }
 };
 
-/** A page title is somebody else's text: it has to survive being used as a file name. */
-const asFileName = (title: string): string =>
-  title.replace(/[\\/:*?"<>|[\]#^]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 60);
+/**
+ * No leading or trailing space or dot. A file whose name ends in a space cannot be linked to at
+ * all: every `[[link]]` is read trimmed, so the name written into the note never finds the file
+ * again — and because it never resolves, the app cannot tell it is already there and writes it
+ * a second time on the next attempt. Trailing dots go for the same reason, plus Windows will
+ * not keep one; a leading dot would make the note a hidden file.
+ */
+const tidyName = (name: string): string => name.replace(/^[\s.]+/, "").replace(/[\s.]+$/, "");
+
+/**
+ * A page title is somebody else's text: it has to survive being used as a file name. A post is
+ * the awkward case — it has no title, so the whole first paragraph arrives as one — which is
+ * why the cut comes before the tidy, and at a word boundary where there is one to take.
+ */
+const asFileName = (title: string): string => {
+  const clean = title.replace(/[\\/:*?"<>|[\]#^]+/g, " ").replace(/\s+/g, " ").trim();
+  if (clean.length <= 60) return tidyName(clean);
+  const cut = clean.slice(0, 60);
+  const space = cut.lastIndexOf(" ");
+  return tidyName(space > 30 ? cut.slice(0, space) : cut);
+};
 
 /**
  * "Link a webpage…" — from the canvas menu, or from a link draft released on empty space

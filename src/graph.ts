@@ -406,6 +406,12 @@ function styleSheet(look: Look): cytoscape.StylesheetJson {
         "text-valign": "center",
         "text-halign": "right",
         "text-margin-x": 4,
+        // A note named after a webpage carries whatever that page calls itself, and a post
+        // calls itself by its first paragraph. Left to run, the name is a line of text laid
+        // across the canvas over everything behind it; the tree and the tab still say it in
+        // full, so the node says as much of it as a node has room for.
+        "text-wrap": "ellipsis",
+        "text-max-width": "150px",
         "min-zoomed-font-size": 8,
         width: 20,
         height: 20,
