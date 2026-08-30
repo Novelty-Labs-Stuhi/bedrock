@@ -1497,6 +1497,15 @@ export class GraphView {
        * behind it, and a repaint only happens when something actually moves.
        */
       pixelRatio: Math.max(2, window.devicePixelRatio || 1),
+      /*
+       * While the view itself is moving — a wheel zoom, a two-finger pan — the canvas
+       * is drawn once to a texture and the texture is scaled, instead of re-rendering
+       * a few hundred icon tiles, bezier arrows and labels at 2× supersampling on every
+       * wheel tick. The moment the gesture ends it re-renders sharp. This is the
+       * difference between a big vault zooming at a crawl and zooming at frame rate;
+       * the price is a moment of softness mid-gesture, which the eye reads as motion.
+       */
+      textureOnViewport: true,
       // Nothing consumes cytoscape's own selection, and its shift+drag box would
       // fight the group tool's rectangle.
       boxSelectionEnabled: false,
@@ -2272,14 +2281,28 @@ export class GraphView {
 
   /* --------------------------------------------------- frame resize handles --- */
 
-  /** Everything the app itself paints above the canvas, in one pass. */
+  /** One overlay pass per painted frame, however many things asked for one. */
+  private overlayQueued = false;
+
+  /**
+   * Everything the app itself paints above the canvas, in one pass — coalesced onto
+   * the next animation frame. A wheel zoom fires dozens of events per second, and each
+   * used to reposition every badge, sticky, pulse and frame handle synchronously; now
+   * however many asks arrive between two frames, the work happens once, when the frame
+   * is actually drawn.
+   */
   private drawOverlay(): void {
-    this.drawHandles();
-    this.placeStickies();
-    this.drawPulses();
-    this.placeIssueCard();
-    this.drawIssueBadges();
-    this.drawSessionBadges();
+    if (this.overlayQueued) return;
+    this.overlayQueued = true;
+    requestAnimationFrame(() => {
+      this.overlayQueued = false;
+      this.drawHandles();
+      this.placeStickies();
+      this.drawPulses();
+      this.placeIssueCard();
+      this.drawIssueBadges();
+      this.drawSessionBadges();
+    });
   }
 
   /** Re-applies the feature toggles to everything drawn above the canvas. */
