@@ -625,6 +625,8 @@ function styleSheet(look: Look): cytoscape.StylesheetJson {
       style: {
         label: name,
         "font-size": 9,
+        // The same bargain the node labels strike: unreadable is not worth drawing.
+        "min-zoomed-font-size": 7,
         color: ink,
         "text-rotation": "autorotate",
         ...plate,
@@ -1498,14 +1500,16 @@ export class GraphView {
        */
       pixelRatio: Math.max(2, window.devicePixelRatio || 1),
       /*
-       * While the view itself is moving — a wheel zoom, a two-finger pan — the canvas
-       * is drawn once to a texture and the texture is scaled, instead of re-rendering
-       * a few hundred icon tiles, bezier arrows and labels at 2× supersampling on every
-       * wheel tick. The moment the gesture ends it re-renders sharp. This is the
-       * difference between a big vault zooming at a crawl and zooming at frame rate;
-       * the price is a moment of softness mid-gesture, which the eye reads as motion.
+       * Off at rest, and flipped per gesture (see the wheel listener in `wire`): while
+       * ZOOMING IN the canvas is drawn once to a texture and the texture is scaled,
+       * instead of re-rendering a few hundred icon tiles, bezier arrows and labels at
+       * 2× supersampling on every wheel tick — and zooming in is the one gesture where
+       * a photograph of the screen is always the truth, because magnifying can never
+       * reveal anything that was not already on it. Panning and zooming out DO reveal,
+       * so they render live: the newly uncovered ground fills with real notes, and both
+       * are the cheap direction anyway — what comes into view is drawn small.
        */
-      textureOnViewport: true,
+      textureOnViewport: false,
       // Nothing consumes cytoscape's own selection, and its shift+drag box would
       // fight the group tool's rectangle.
       boxSelectionEnabled: false,
@@ -1979,6 +1983,38 @@ export class GraphView {
       this.followRename();
       this.followConnection();
     });
+
+    /*
+     * The per-gesture texture switch. Cytoscape owns one flag for every viewport
+     * gesture, but its renderer reads it afresh on every pass — so flipping it between
+     * events splits the gestures. A wheel tick that zooms IN draws from the photograph
+     * (magnifying can never reveal anything, and it is the expensive direction); a tick
+     * that zooms OUT renders live, so the ground it uncovers fills with real notes; and
+     * a drag-pan starts by switching live for the same reason. Reaching into the
+     * renderer is off the public API, so not finding the flag just means everything
+     * renders live — correct, only slower.
+     */
+    try {
+      const renderer = (cy as unknown as { renderer(): { textureOnViewport?: boolean } }).renderer();
+      if (renderer && "textureOnViewport" in renderer) {
+        this.container.addEventListener(
+          "wheel",
+          (event) => {
+            renderer.textureOnViewport = event.deltaY < 0;
+          },
+          { capture: true, passive: true },
+        );
+        this.container.addEventListener(
+          "pointerdown",
+          () => {
+            renderer.textureOnViewport = false;
+          },
+          { capture: true, passive: true },
+        );
+      }
+    } catch {
+      /* a future cytoscape hid its renderer — live everywhere is still right */
+    }
   }
 
   /**
