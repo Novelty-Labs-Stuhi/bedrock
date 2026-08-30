@@ -19,7 +19,10 @@ export type Feature =
   | "files"
   | "web"
   | "active"
-  | "freeform";
+  | "freeform"
+  | "notion"
+  | "applenotes"
+  | "word";
 
 export const CONFIG_FILE = ".notes/config.json";
 
@@ -41,6 +44,9 @@ const DEFAULTS: Record<Feature, boolean> = {
   web: false,
   active: false,
   freeform: false,
+  notion: false,
+  applenotes: false,
+  word: false,
 };
 
 /** Linear took the todos' place, so a vault that had todos on keeps its checklists. */
@@ -219,6 +225,17 @@ export type Setup = {
    * page asks for it before it offers to push.
    */
   gitRemote: string;
+  /**
+   * Where new Word documents are saved — a folder path, or "" for the default the shell
+   * keeps (Documents/word-bedrock). Word needs this question asked because a document,
+   * unlike a board or an Apple note, is a file: something has to say where it lives.
+   */
+  wordFolder: string;
+  /**
+   * Which Apple Notes folder new notes are made in — a folder name in the default
+   * account, or "" for the default the shell keeps (“Bedrock”).
+   */
+  notesFolder: string;
 };
 
 const SETUP_DEFAULT: Setup = {
@@ -230,6 +247,8 @@ const SETUP_DEFAULT: Setup = {
   linearProjectName: "",
   geminiWindow: "app",
   gitRemote: "",
+  wordFolder: "",
+  notesFolder: "",
 };
 
 export class SettingsStore {
@@ -416,6 +435,21 @@ const INTEGRATIONS: Row[] = [
     feature: "freeform",
     name: "Freeform",
     what: "board notes — link Apple's whiteboards and make new ones from here (desktop app, Mac)",
+  },
+  {
+    feature: "notion",
+    name: "Notion",
+    what: "page notes — link Notion pages and make new ones from here (desktop app)",
+  },
+  {
+    feature: "applenotes",
+    name: "Apple Notes",
+    what: "notes that point at Apple's notes — link them and make new ones from here (desktop app, Mac)",
+  },
+  {
+    feature: "word",
+    name: "Word",
+    what: "document notes — link Word documents and make new ones from here (desktop app, Mac)",
   },
 ];
 

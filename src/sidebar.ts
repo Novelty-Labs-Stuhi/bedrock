@@ -9,7 +9,6 @@ type TreeNode = { name: string; path: string; kind: "file" | "dir"; children: Tr
 export type SidebarHandlers = {
   onOpen: (path: string) => void;
   onSelectDir: (path: string) => void;
-  onNewNote: (dir: string) => void;
   /** Inline rename committed in the tree; `name` has no extension for notes. */
   onRename: (path: string, kind: "file" | "dir", name: string) => void;
   onDelete: (path: string, kind: "file" | "dir") => void;
@@ -185,7 +184,6 @@ export class Sidebar {
         (nameCell ?? `<span class="name" data-act="selectdir">${escapeHtml(node.name)}</span>`) +
         `<span class="count">${count || ""}</span>` +
         `<span class="actions">` +
-        `<button data-act="newnote" title="New note in this folder">＋</button>` +
         `<button data-act="rename" title="Rename">✎</button>` +
         `<button data-act="delete" title="Delete">✕</button>` +
         `</span></div>` +
@@ -227,11 +225,6 @@ export class Sidebar {
         if (this.activeDir) this.collapsed.delete(path);
         this.handlers.onSelectDir(this.activeDir);
         this.draw();
-        break;
-      case "newnote":
-        this.reveal(path);
-        this.handlers.onSelectDir(path);
-        this.handlers.onNewNote(path);
         break;
       case "rename":
         this.beginRename(path);

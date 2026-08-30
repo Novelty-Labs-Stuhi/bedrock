@@ -7,26 +7,41 @@
   </head>
   <body>
     <div id="app">
-      <aside id="sidebar">
+      <!-- Retired chrome: the tree still renders in here (the logic is load-bearing),
+           but the stylesheet never draws it. The app is the graph. -->
+      <aside id="sidebar" aria-hidden="true">
         <div class="vault">
           <button id="fold-side" class="rail-btn" title="Collapse sidebar">⟨</button>
           <span id="vault-name">local vault</span>
-          <button id="open-folder" title="Open a folder from disk">Open folder…</button>
         </div>
         <div class="toolbar">
-          <button id="new-note" title="New note in the selected folder">＋ Note</button>
           <button id="new-folder" title="New folder in the selected folder">＋ Folder</button>
           <button id="graph" title="Open graph view">Graph</button>
         </div>
         <div id="crumb">/</div>
         <nav id="tree"></nav>
-        <div class="side-foot">
-          <button id="settings" title="Settings">⚙ Settings</button>
-        </div>
       </aside>
-      <div id="side-resize" title="Drag to resize the sidebar"></div>
+      <div id="side-resize"></div>
 
       <main id="main">
+        <!-- Shown only in a plain browser tab; the desktop app has real menus for both. -->
+        <div id="float-controls">
+          <button id="open-folder" title="Open a folder from disk">Open vault…</button>
+          <button id="settings" title="Settings">⚙</button>
+        </div>
+
+        <!-- The front door. No vault opens by itself: the app starts here, and File →
+             Open Vault… comes back here (the picker needs a real click to open). -->
+        <div id="welcome">
+          <button id="welcome-open" class="welcome-btn">
+            <b>Open a vault</b>
+            <small>a folder of notes on this disk</small>
+          </button>
+          <button id="welcome-new" class="welcome-btn">
+            <b>Create a new vault</b>
+            <small>make a fresh folder right in the picker — New Folder, then Open</small>
+          </button>
+        </div>
         <div id="panes">
           <section class="pane" id="pane-0">
             <div class="tabbar">
