@@ -88,6 +88,17 @@ button:hover {
 
 /* ------------------------------------------------------------- sidebar --- */
 
+/*
+ * The tree is retired chrome: the app is the graph now, and everything the sidebar did
+ * lives in the menu bar, the canvas menus or the integrations. The element stays in the
+ * DOM — the tree logic still renders into it, and ripping that out is not worth the
+ * blast radius — but nothing draws it.
+ */
+#sidebar,
+#side-resize {
+  display: none !important;
+}
+
 #sidebar {
   width: var(--side-w);
   flex: 0 0 auto;
@@ -904,6 +915,13 @@ button.twisty:hover {
   color: var(--accent);
 }
 
+/* Formulas: `$$…$$` gets a centred line of its own; inline math sits in the text flow. */
+.cm-math-display {
+  display: block;
+  text-align: center;
+  margin: 4px 0;
+}
+
 /* Attachments: an embed never overflows the column, and a broken one says so. */
 .cm-embed img {
   max-width: 100%;
@@ -938,15 +956,81 @@ button.twisty:hover {
   outline-offset: -6px;
 }
 
+/* Retired entirely: nothing pops over the graph, not even a pill. The element stays —
+   half the app narrates into it — but what it says is never drawn. */
 #status {
-  border-top: 1px solid var(--line);
-  padding: 4px 10px;
-  font-size: 11px;
+  display: none;
+}
+
+/* No pages, no tabs: the strip (and its Split button) is retired chrome. The pane
+   machinery underneath stays, but the only thing a pane ever shows now is the graph. */
+.tabbar {
+  display: none !important;
+}
+
+/* The browser's stand-in for the menu bar the desktop app has: a small cluster in the
+   top-right corner, over the graph. The shell hides it and offers real menus instead. */
+#float-controls {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 5;
+  display: flex;
+  gap: 6px;
+}
+
+/* The shell hides it (real menus instead), and display:flex must not win that fight. */
+#float-controls[hidden] {
+  display: none;
+}
+
+/* The front door: two big answers, splitting the window between them. */
+#welcome {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  gap: 24px;
+  padding: 18vh 10vw;
+  background: var(--bg);
+}
+
+#welcome[hidden] {
+  display: none;
+}
+
+.welcome-btn {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--bg-side);
+}
+
+.welcome-btn b {
+  font-size: 22px;
+  font-weight: 600;
+}
+
+.welcome-btn small {
   color: var(--muted);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  font-size: 13px;
+  max-width: 26em;
+  line-height: 1.4;
+}
+
+.welcome-btn:hover {
+  background: var(--bg-hover);
+}
+
+#float-controls button {
+  font-size: 12px;
+  background: color-mix(in srgb, var(--bg-side) 82%, transparent);
+  backdrop-filter: blur(6px);
 }
 
 /* ------------------------------------------------------------- dialogs --- */
@@ -1054,7 +1138,7 @@ button.twisty:hover {
 
 /* ---------------------------------------------------------- context menu --- */
 
-#menu {
+.menu-panel {
   position: fixed;
   z-index: 60;
   display: none;
@@ -1067,11 +1151,19 @@ button.twisty:hover {
   box-shadow: 0 10px 26px rgba(0, 0, 0, 0.5);
 }
 
-#menu.open {
+.menu-panel.open {
   display: flex;
 }
 
+/* The submenu sits beside its row, one layer up so it never hides under the menu. */
+#submenu {
+  z-index: 61;
+}
+
 .menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   border: 0;
   background: transparent;
   color: var(--text);
@@ -1082,8 +1174,26 @@ button.twisty:hover {
   white-space: nowrap;
 }
 
-.menu-item:hover {
+.menu-item:hover,
+.menu-item.branch-open {
   background: var(--bg-hover);
+}
+
+/* The same tile the node wears on the graph, shrunk to a glyph. */
+.menu-icon {
+  width: 16px;
+  height: 16px;
+  border-radius: 3px;
+  flex: none;
+}
+
+.menu-label {
+  flex: 1;
+}
+
+.menu-arrow {
+  color: var(--muted);
+  margin-left: 12px;
 }
 
 /* -------------------------------------------------------------- node style --- */

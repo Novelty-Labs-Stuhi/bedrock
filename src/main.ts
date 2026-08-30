@@ -1,5 +1,5 @@
 import "./style.css";
-import { GraphView, type Client, type Doc, type SessionState } from "./graph";
+import { GraphView, TYPE_ICONS, type Client, type Doc, type DraftKind, type SessionState } from "./graph";
 import {
   LinkResolver,
   labelledLink,
@@ -14,7 +14,7 @@ import {
 } from "./links";
 import { showFolderStylePicker, showStylePicker } from "./node-style";
 import { askChoice, askConfirm, askText } from "./dialog";
-import { EDGE_DIR, edgeNotePath, edgeNoteTemplate, edgeTitle, isEdgeNote, renamedEdgeNote } from "./edges";
+import { EDGE_DIR, isEdgeNote, renamedEdgeNote } from "./edges";
 import { showMenu, type MenuItem } from "./menu";
 import {
   SettingsStore,
@@ -85,11 +85,12 @@ const ui = {
   sideResize: el("side-resize"),
   vaultName: el("vault-name"),
   openFolder: el<HTMLButtonElement>("open-folder"),
-  newNote: el<HTMLButtonElement>("new-note"),
   newFolder: el<HTMLButtonElement>("new-folder"),
   graph: el<HTMLButtonElement>("graph"),
   crumb: el("crumb"),
   tree: el("tree"),
+  floatControls: el("float-controls"),
+  welcome: el("welcome"),
   panes: el("panes"),
   splitter: el("splitter"),
   cy: el("cy"),
@@ -175,7 +176,6 @@ const sidebar = new Sidebar(ui.tree, {
   onSelectDir: (path) => {
     ui.crumb.textContent = "/" + path;
   },
-  onNewNote: (dir) => void newNote(dir),
   onRename: (path, kind, name) => void applyRename(path, kind, name),
   onDelete: (path, kind) => void deleteEntry(path, kind),
   onMenu: (path, _kind, at) =>
@@ -187,8 +187,27 @@ const sidebar = new Sidebar(ui.tree, {
   onMove: (path, kind, dir) => void moveEntry(path, kind, dir),
 });
 
+/** Bedrock's own folder in a menu: the blue frame a folder box is on the canvas —
+    deliberately not the yellow disk folder, which is a different thing entirely. */
+const BOX_ICON =
+  "data:image/svg+xml;utf8," +
+  encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="10" rx="2" fill="rgba(76,141,255,0.18)" stroke="#4c8dff" stroke-width="1.6"/></svg>',
+  );
+
+/** What "an existing note" looks like in a menu: the plain red circle a note is. */
+const NOTE_DOT =
+  "data:image/svg+xml;utf8," +
+  encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="#f92411"/></svg>',
+  );
+
 const graphView = new GraphView(ui.cy, {
-  onOpen: (path) => void openFile(path, graphPane()),
+  // There are no pages any more — the graph is the whole app, and a note is a pointer
+  // at something with its own home. A plain note has nowhere to go, and says so.
+  onOpen: () => {
+    ui.status.textContent = "a plain note has nothing behind it — its links are already on the graph";
+  },
   onOpenGemini: (path, url) => openGeminiNode(path, url),
   onOpenClaude: (path, session) => void openClaudeSession(path, session),
   onOpenPath: (path, target, kind) => void openFsNode(path, target, kind),
@@ -197,8 +216,11 @@ const graphView = new GraphView(ui.cy, {
   onOpenIssue: (url) => {
     if (!window.open(url, "_blank", "noopener")) ui.status.textContent = `the browser blocked ${url}`;
   },
-  onOpenEdge: (source, target, label) => void openEdgeNote(source, target, label),
+  onOpenEdge: (source, target) => relabelEdge(source, target),
   onOpenFreeform: (path, board) => void openFreeformNode(path, board),
+  onOpenNotion: (path, url) => void openNotionNode(path, url),
+  onOpenAppleNote: (path, note) => void openAppleNoteNode(path, note),
+  onOpenWord: (path, doc) => void openWordNode(path, doc),
   onLinkExisting: (source, target) => linkNotes(source, target),
   onLinkNew: (source, at, folder, kind) => {
     if (kind === "gemini") void createGeminiAt(at, folder, source);
@@ -206,50 +228,57 @@ const graphView = new GraphView(ui.cy, {
     else if (kind === "file" || kind === "folder") void createFsAt(at, folder, kind, source);
     else if (kind === "web") void createWebAt(at, folder, source);
     else if (kind === "freeform") void createFreeformAt(at, folder, source);
-    else void linkToNewNote(source, at, folder);
+    else if (kind === "notion") void createNotionAt(at, folder, source);
+    else if (kind === "applenote") void createAppleNoteAt(at, folder, source);
+    else if (kind === "word") void createWordAt(at, folder, source);
+    // A plain draft released on empty space used to grow a text note. Prose lives in
+    // Apple Notes now, so that gesture makes an Apple note — or says where notes went.
+    else if (settings.enabled("applenotes")) void createAppleNoteAt(at, folder, source);
+    else ui.status.textContent = "notes live in Apple Notes now — Settings → Integrations → Apple Notes";
   },
   onReparent: (path, folder) => void moveEntry(path, "file", folder, true),
   onRefolder: (path, folder) => void moveEntry(path, "dir", folder, true),
   onGroup: (picked, frame) => void groupIntoFolder(picked, frame),
   onNodeMenu: (path, client) => {
-    const items: MenuItem[] = [{ label: "Link to a note…", run: () => graphView.startLink(path) }];
-    if (settings.enabled("gemini")) {
-      items.push({ label: "Link to a Gemini chat…", run: () => graphView.startLink(path, "gemini") });
-    }
-    if (settings.enabled("claude")) {
-      items.push({ label: "Link to a Claude session…", run: () => graphView.startLink(path, "claude") });
-      // Only a session note can be plugged into one; on any other note it would mean nothing.
-      if (graphView.sessionNote(path)) {
-        items.push({ label: "Plug in a session…", run: () => void plugInSession(path) });
-      }
-    }
+    // One branch holds every kind of link, each wearing the tile its node would wear
+    // on the graph — an existing note first, then whichever integrations are on.
+    const link: MenuItem[] = [
+      { label: "Existing note…", icon: NOTE_DOT, run: () => graphView.startLink(path) },
+    ];
+    const draft = (kind: DraftKind, label: string): void => {
+      link.push({ label, icon: TYPE_ICONS[kind], run: () => graphView.startLink(path, kind) });
+    };
+    if (settings.enabled("gemini")) draft("gemini", "Gemini chat…");
+    if (settings.enabled("claude")) draft("claude", "Claude session…");
     if (settings.enabled("files")) {
-      items.push(
-        { label: "Link to a file…", run: () => graphView.startLink(path, "file") },
-        { label: "Link to a folder…", run: () => graphView.startLink(path, "folder") },
-      );
+      draft("file", "File…");
+      draft("folder", "Folder…");
     }
-    if (settings.enabled("web")) {
-      items.push({ label: "Link to a webpage…", run: () => graphView.startLink(path, "web") });
-    }
-    if (settings.enabled("freeform")) {
-      items.push({ label: "Link to a Freeform board…", run: () => graphView.startLink(path, "freeform") });
+    if (settings.enabled("web")) draft("web", "Webpage…");
+    if (settings.enabled("freeform")) draft("freeform", "Freeform board…");
+    if (settings.enabled("notion")) draft("notion", "Notion page…");
+    if (settings.enabled("applenotes")) draft("applenote", "Apple note…");
+    if (settings.enabled("word")) draft("word", "Word document…");
+    const items: MenuItem[] = [{ label: "Link", children: link }];
+    // Only a session note can be plugged into one; on any other note it would mean nothing.
+    if (settings.enabled("claude") && graphView.sessionNote(path)) {
+      items.push({ label: "Plug in a session…", run: () => void plugInSession(path) });
     }
     if (settings.enabled("active")) {
       items.push({ label: "Style…", run: () => void styleNode(path, client) });
     }
     items.push(
+      { label: "Copy path", run: () => void copyNotePath(path) },
       { label: `Rename "${noteName(path)}"`, run: () => renameOnGraph(path) },
       { label: `Delete "${noteName(path)}"`, run: () => void deleteEntry(path, "file") },
     );
     showMenu(client, items);
   },
-  onEdgeMenu: (source, target, label, client) => {
-    // The pulse a note can wear, on the line between two of them. Opening the connection's
-    // own note stays a click on the line; the menu offers it too, so the right button is
-    // never a dead end.
+  onEdgeMenu: (source, target, _label, client) => {
+    // The pulse a note can wear, on the line between two of them. Naming the line stays
+    // a click on it; the menu offers the same, so the right button is never a dead end.
     const items: MenuItem[] = [
-      { label: `Open "${edgeTitle(source, target)}"`, run: () => void openEdgeNote(source, target, label) },
+      { label: "Name this connection…", run: () => relabelEdge(source, target) },
     ];
     if (settings.enabled("active")) {
       const mark = graphView.edgeMark(source, target);
@@ -261,13 +290,59 @@ const graphView = new GraphView(ui.cy, {
     showMenu(client, items);
   },
   onCanvasMenu: (at, client, folder) => {
-    const items: MenuItem[] = [
-      { label: folder ? `New note in "${folder}"` : "New note", run: () => void createNoteAt(at, folder) },
-      // A folder with nothing in it has no box, so "new folder" IS the rectangle:
-      // pick the notes and the folder is made around them.
-      { label: "New folder", run: () => graphView.startGroup() },
-      { label: "Unstack notes", run: () => unstackNotes() },
-    ];
+    // One branch holds everything empty space can grow: new things, pointers at
+    // existing things ("Existing …" rows), and both kinds of folder — Bedrock's own
+    // box (the blue frame) and a folder on the disk (the yellow one). Each row wears
+    // its graph tile; switched-off integrations appear nowhere.
+    const create: MenuItem[] = [];
+    if (settings.enabled("applenotes")) {
+      create.push(
+        { label: "Apple note", icon: TYPE_ICONS.applenote, run: () => void createAppleNoteAt(at, folder) },
+        { label: "Existing Apple note…", icon: TYPE_ICONS.applenote, run: () => void linkAppleNoteAt(at, folder) },
+      );
+    }
+    if (settings.enabled("notion")) {
+      create.push(
+        { label: "Notion page", icon: TYPE_ICONS.notion, run: () => void createNotionAt(at, folder) },
+        { label: "Existing Notion page…", icon: TYPE_ICONS.notion, run: () => void linkNotionAt(at, folder) },
+      );
+    }
+    if (settings.enabled("word")) {
+      create.push(
+        { label: "Word document", icon: TYPE_ICONS.word, run: () => void createWordAt(at, folder) },
+        { label: "Existing Word document…", icon: TYPE_ICONS.word, run: () => void linkWordAt(at, folder) },
+      );
+    }
+    if (settings.enabled("freeform")) {
+      create.push(
+        { label: "Freeform board", icon: TYPE_ICONS.freeform, run: () => void createFreeformAt(at, folder) },
+        { label: "Existing Freeform board…", icon: TYPE_ICONS.freeform, run: () => void linkFreeformAt(at, folder) },
+      );
+    }
+    if (settings.enabled("gemini")) {
+      create.push({ label: "Gemini conversation", icon: TYPE_ICONS.gemini, run: () => void createGeminiAt(at, folder) });
+    }
+    if (settings.enabled("claude")) {
+      create.push({ label: "Claude session", icon: TYPE_ICONS.claude, run: () => void createClaudeAt(at, folder) });
+    }
+    if (settings.enabled("linear")) {
+      create.push({ label: "Linear issue", icon: TYPE_ICONS.linear, run: () => void createIssueAt(at, folder) });
+    }
+    if (settings.enabled("stickies")) create.push({ label: "Sticky", run: () => graphView.addSticky(at) });
+    if (settings.enabled("web")) {
+      create.push({ label: "Webpage…", icon: TYPE_ICONS.web, run: () => void createWebAt(at, folder) });
+    }
+    if (settings.enabled("files")) {
+      create.push(
+        { label: "File on disk…", icon: TYPE_ICONS.file, run: () => void createFsAt(at, folder, "file") },
+        { label: "Folder on disk…", icon: TYPE_ICONS.folder, run: () => void createFsAt(at, folder, "folder") },
+      );
+    }
+    // A folder with nothing in it has no box, so "folder" IS the rectangle: pick the
+    // notes and the folder is made around them.
+    create.push({ label: "Folder", icon: BOX_ICON, run: () => graphView.startGroup() });
+
+    const items: MenuItem[] = [{ label: "Create", children: create }];
     // Right-clicked inside a box: that box can be coloured, and told apart from the
     // others at a glance — which is most of what a folder is for on a canvas.
     if (folder) {
@@ -278,32 +353,6 @@ const graphView = new GraphView(ui.cy, {
             graphView.setFolderStyle(folder, style),
           ),
       });
-    }
-    // Switched-off integrations do not appear anywhere, the menu included.
-    if (settings.enabled("stickies")) items.push({ label: "New sticky", run: () => graphView.addSticky(at) });
-    if (settings.enabled("linear")) {
-      items.push({ label: "New Linear issue", run: () => void createIssueAt(at, folder) });
-    }
-    if (settings.enabled("gemini")) {
-      items.push({ label: "New Gemini conversation", run: () => void createGeminiAt(at, folder) });
-    }
-    if (settings.enabled("claude")) {
-      items.push({ label: "New Claude session", run: () => void createClaudeAt(at, folder) });
-    }
-    if (settings.enabled("files")) {
-      items.push(
-        { label: "Link a file…", run: () => void createFsAt(at, folder, "file") },
-        { label: "Link a folder…", run: () => void createFsAt(at, folder, "folder") },
-      );
-    }
-    if (settings.enabled("web")) {
-      items.push({ label: "Link a webpage…", run: () => void createWebAt(at, folder) });
-    }
-    if (settings.enabled("freeform")) {
-      items.push(
-        { label: "New Freeform board", run: () => void createFreeformAt(at, folder) },
-        { label: "Link a Freeform board…", run: () => void linkFreeformAt(at, folder) },
-      );
     }
     showMenu(client, items);
   },
@@ -419,17 +468,9 @@ function pinGraph(): void {
 
 /* -------------------------------------------------------------- rendering --- */
 
+/** The pill only speaks when something happened; at rest, the graph says everything. */
 function statusText(): string {
-  const tab = tabOf(pane());
-  if (!tab) return "Open or create a note";
-  if (tab.kind === "graph") {
-    const drawn = filePaths().filter((path) => !isCardPath(path)).length;
-    return `${drawn} notes — right-drag to link, click a connection to describe it`;
-  }
-  // A connection note's path is `.notes/edges/…`, which says nothing useful; what it is
-  // FOR does. Said here rather than at the moment it opens, so a later repaint keeps it.
-  if (isEdgeNote(tab.path)) return `${noteName(tab.path)} — how they connect, and what flows`;
-  return tab.path;
+  return "";
 }
 
 function render(): void {
@@ -603,14 +644,6 @@ async function closeTab(index: number, tab: number): Promise<void> {
 
 /* --------------------------------------------------------------- actions --- */
 
-/**
- * Where a note opened FROM the graph lands. The graph is pinned to the left pane, so with
- * a split open the note belongs on the other side: the whole point of the split is to keep
- * the canvas in view while you write, and opening over it would close the thing you split
- * to watch. With one pane there is nowhere else to put it.
- */
-const graphPane = (): number => (panes.length > 1 ? 1 : focused);
-
 async function openFile(path: string, where = focused): Promise<void> {
   await flushAll();
   const index = Math.min(where, panes.length - 1);
@@ -628,15 +661,6 @@ async function openFile(path: string, where = focused): Promise<void> {
 function openGraph(): void {
   pinGraph();
   focusTab(0, 0);
-}
-
-/** Creates `Untitled.md` at once and opens the tree's rename field on it. */
-async function newNote(dir = sidebar.activeDir): Promise<void> {
-  const path = freshPath(dir, "Untitled");
-  await vault.createFile(path, "");
-  await refresh();
-  await openFile(path);
-  sidebar.beginRename(path);
 }
 
 async function newFolder(dir = sidebar.activeDir): Promise<void> {
@@ -1039,6 +1063,8 @@ async function pickFolder(): Promise<void> {
   sidebar.reveal("");
   ui.crumb.textContent = "/";
   await refresh();
+  ui.welcome.hidden = true;
+  vaultOpen = true;
 }
 
 /* ----------------------------------------------------------------- paths --- */
@@ -1065,6 +1091,21 @@ async function copyText(text: string): Promise<void> {
  */
 /** The vault's location if it has already been given, without asking for it. */
 const knownVaultRoot = (): string | null => localStorage.getItem(ROOT_KEY + vault.name);
+
+/**
+ * The note's absolute path on this disk, onto the clipboard — for handing to anything
+ * outside the app. Absolute on purpose: a relative path only means something in here.
+ */
+async function copyNotePath(path: string): Promise<void> {
+  const root = knownVaultRoot();
+  if (!root) {
+    ui.status.textContent = `where "${vault.name}" lives on disk is not known yet — Settings → Integrations → GitHub → Vault folder`;
+    return;
+  }
+  const absolute = `${root.replace(/\/+$/, "")}/${path}`;
+  await copyText(absolute);
+  ui.status.textContent = `copied ${absolute}`;
+}
 
 async function vaultRoot(): Promise<string | null> {
   const stored = knownVaultRoot();
@@ -1383,30 +1424,40 @@ async function insertCitation(source: string, target: string, label: string | nu
 }
 
 /**
- * Click on an edge: open the markdown that describes that connection. A note says what a
- * thing is and how it works; its edges say how the things are wired together and what
- * flows between them. The file is written on first click, so the connection is described
- * by writing in it rather than by creating anything first.
+ * Click on an edge: name it, right on the line. There are no pages to open any more —
+ * the graph is the whole app — so what a connection means is its label, edited in place
+ * the same way it was given at birth.
  */
-async function openEdgeNote(source: string, target: string, label: string | null): Promise<void> {
-  const path = edgeNotePath(source, target);
-  const fresh = !(await vault.exists(path));
-  if (fresh) {
-    if (!(await tryVault(`could not describe ${edgeTitle(source, target)}`, () =>
-      vault.createFile(path, edgeNoteTemplate(source, target, label)),
-    ))) {
-      return;
-    }
-    graphView.setEdgeDescribed(source, target); // thicken the line now, not at the next rebuild
-    graphStale = true;
+function relabelEdge(source: string, target: string): void {
+  graphView.promptConnection(source, target, (label) => void applyEdgeLabel(source, target, label));
+}
+
+/**
+ * Writes the new label home. The link line in the source note is rewritten whole —
+ * which is the right thing for the standalone `label:: [[target]]` lines pointer notes
+ * carry, and the known price for a link somebody once buried mid-sentence.
+ */
+async function applyEdgeLabel(source: string, target: string, fresh: string | null): Promise<void> {
+  if (fresh === null) return; // Esc — leave it as it was
+  const label = fresh.trim() || null;
+  const text = await vault.read(source);
+  const resolver = new LinkResolver(filePaths());
+  const spelling = target.replace(/\.md$/i, "");
+  const lines = text.split("\n");
+  const at = lines.findIndex((line) =>
+    linkTargets(line).some((t) => resolver.resolve(t) === target || t.trim() === spelling.trim()),
+  );
+  if (at < 0) {
+    await insertCitation(source, target, label);
+  } else {
+    lines[at] = labelledLink(label, spelling);
+    await vault.write(source, lines.join("\n"));
   }
-  await openFile(path, graphPane());
-  // A brand-new connection note is empty apart from its heading — put the caret in it.
-  if (fresh) {
-    editors[focused].focus();
-    editors[focused].caretToEnd();
-  }
-  render();
+  graphView.setEdgeLabel(source, target, label);
+  graphStale = true;
+  ui.status.textContent = label
+    ? `${noteName(source)} —${label}→ ${noteName(target)}`
+    : `unnamed: ${noteName(source)} → ${noteName(target)}`;
 }
 
 /** Sidebar-only refresh — avoids render()'s graph fit, which would jump the viewport. */
@@ -1416,24 +1467,6 @@ async function refreshSidebar(): Promise<void> {
 }
 
 /** Click (or menu) on empty canvas / inside a folder box: spawn a note there. */
-async function createNoteAt(at: { x: number; y: number }, folder: string | null): Promise<void> {
-  const path = freshPath(folder ?? "", "Untitled");
-  await vault.createFile(path, `# ${noteName(path)}\n\n`);
-  await refreshSidebar();
-  graphView.commitNode(path, noteName(path), folder ?? undefined, at);
-  graphStale = true;
-  ui.status.textContent = `created ${path}`;
-  renameOnGraph(path);
-}
-
-/** Separates any notes left piled up by a layout cached before dragging refused to stack them. */
-function unstackNotes(): void {
-  const moved = graphView.unstackAll();
-  ui.status.textContent = moved
-    ? `moved ${moved} note${moved === 1 ? "" : "s"} off the ones underneath`
-    : "nothing was stacked";
-}
-
 /** Name field floating on the node itself, pre-selected. */
 function renameOnGraph(path: string): void {
   graphView.renameNode(path, (name) => {
@@ -1900,6 +1933,160 @@ function integrationPage(feature: Feature): SetupPage | null {
       return { status, ready: has, lines };
     }
 
+    case "notion": {
+      if (!bridge) {
+        return {
+          status: "desktop app only",
+          lines: [
+            {
+              label: "Why",
+              value: "the OAuth window and the keychain the token lives in are the shell's — npm start",
+            },
+          ],
+        };
+      }
+      const linked = notionState?.linked ?? false;
+      const workspace = notionState?.workspace ?? "";
+      const lines: SetupLine[] = [
+        {
+          label: "What this is",
+          value:
+            "page notes — notes that point at Notion pages. Bedrock keeps only the pointer (the page's own link), and the pages stay in Notion. A click opens the page where it lives.",
+        },
+        {
+          label: "Workspace",
+          value: notionWord
+            ? notionWord
+            : linked
+              ? `linked${workspace ? ` — ${workspace}` : ""}. Unlinking forgets the token; notes keep their page links.`
+              : "not linked yet. Linking opens Notion in your browser to ask you — the token lands in the OS keychain, never the vault.",
+          action: linked ? { id: "unlink", label: "Unlink" } : { id: "connect", label: "Link…" },
+        },
+        {
+          label: "How it talks",
+          value:
+            "over Notion's own MCP server (mcp.notion.com) — the door Notion built for AI apps, with nothing installed here and no API key to paste.",
+        },
+      ];
+      const status = !notionState ? "not read yet" : linked ? workspace || "linked" : "not linked";
+      return { status, ready: linked, lines };
+    }
+
+    case "applenotes": {
+      if (!bridge) {
+        return {
+          status: "desktop app only",
+          lines: [
+            {
+              label: "Why",
+              value: "notes are listed, made and opened through the Mac's own scripting door, which a browser tab cannot reach — npm start",
+            },
+          ],
+        };
+      }
+      if (appleNotesState && !appleNotesState.app) {
+        return {
+          status: "no Notes here",
+          lines: [
+            {
+              label: "Apple Notes",
+              value: "not on this Mac, and nothing here can work without it.",
+            },
+          ],
+        };
+      }
+      const on = settings.enabled("applenotes");
+      const notesFolder = setup.notesFolder;
+      const lines: SetupLine[] = [
+        {
+          label: "What this is",
+          value:
+            "notes that point at notes in Apple Notes. Bedrock keeps only the pointer — a note's id and name — and the notes stay Apple's own, in iCloud. Nothing is hosted here.",
+        },
+        {
+          label: "Permission",
+          value:
+            "unlike Freeform there is nothing to install: Notes answers to scripting directly. The first real action makes macOS ask whether Bedrock may drive Notes — one Allow click, which the OS remembers (and keeps under System Settings → Privacy & Security → Automation).",
+        },
+        {
+          label: "New notes land in",
+          value: notesFolder || `“${NOTES_DEFAULT_FOLDER}” — its own folder in Notes, made when first needed`,
+          action: { id: "folder", label: notesFolder ? "Change…" : "Choose…" },
+        },
+      ];
+      if (notesFolder) {
+        lines.push({
+          label: "",
+          value: `go back to the default, “${NOTES_DEFAULT_FOLDER}”`,
+          action: { id: "reset", label: "Forget it" },
+        });
+      }
+      lines.push({
+        label: "Try it",
+        value:
+          appleNotesWord ||
+          "makes a real note called “Bedrock connected” and opens it — proof the whole road works",
+        action: { id: "test", label: "Try it" },
+      });
+      const status = !appleNotesState ? "not read yet" : on ? "ready" : "try it";
+      return { status, ready: on, lines };
+    }
+
+    case "word": {
+      if (!bridge) {
+        return {
+          status: "desktop app only",
+          lines: [
+            {
+              label: "Why",
+              value: "documents are made and opened through the Mac's own scripting door, which a browser tab cannot reach — npm start",
+            },
+          ],
+        };
+      }
+      if (wordState && !wordState.app) {
+        return {
+          status: "no Word here",
+          lines: [
+            {
+              label: "Word",
+              value: "not on this Mac — it is Microsoft's app, not the system's, and nothing here can work without it.",
+            },
+          ],
+        };
+      }
+      const on = settings.enabled("word");
+      const folder = setup.wordFolder;
+      const lines: SetupLine[] = [
+        {
+          label: "What this is",
+          value:
+            "document notes — notes that point at Word files on this disk. A click opens the document in Word; the note keeps only the pointer (the file's path), and the file is yours like any other.",
+        },
+        {
+          label: "New documents land in",
+          value: folder || `${WORD_DEFAULT_FOLDER} — made when it is first needed`,
+          action: { id: "folder", label: folder ? "Change…" : "Choose…" },
+        },
+      ];
+      if (folder) {
+        lines.push({
+          label: "",
+          value: `go back to the default, ${WORD_DEFAULT_FOLDER}`,
+          action: { id: "reset", label: "Forget it" },
+        });
+      }
+      lines.push({
+        label: "Try it",
+        value:
+          wordWord ||
+          "makes a real document called “Bedrock connected”, saves it there and opens it in Word — the first run is when macOS asks its Allow question",
+        action: { id: "test", label: "Try it" },
+      });
+      const status = !wordState ? "not read yet" : on ? "ready" : "try it";
+      return { status, ready: on, lines };
+    }
+
     default:
       return null;
   }
@@ -1919,6 +2106,14 @@ function runIntegrationAction(feature: Feature, action: string): void {
   else if (feature === "gemini" && action === "signout") void signOutOfGemini();
   else if (feature === "freeform" && action === "install") void installFreeformShortcut();
   else if (feature === "freeform" && action === "test") void testFreeform();
+  else if (feature === "notion" && action === "connect") void connectNotion();
+  else if (feature === "notion" && action === "unlink") void unlinkNotion();
+  else if (feature === "applenotes" && action === "test") void testAppleNotes();
+  else if (feature === "applenotes" && action === "folder") void setUpNotesFolder();
+  else if (feature === "applenotes" && action === "reset") forgetNotesFolder();
+  else if (feature === "word" && action === "folder") void setUpWordFolder();
+  else if (feature === "word" && action === "reset") forgetWordFolder();
+  else if (feature === "word" && action === "test") void testWord();
   else if (feature === "git" && action === "folder") void setVaultRoot();
   else if (feature === "git" && action === "commit") void commitVault();
   else if (feature === "git" && action === "remote") void setGitRemote();
@@ -2088,6 +2283,239 @@ async function testFreeform(): Promise<void> {
     ui.status.textContent = `Freeform: ${freeformWord}`;
   }
   redrawSettings();
+}
+
+/* ------------------------------------------------------ notion's own page --- */
+
+/** Whether a workspace is linked and what it is called; null until the shell says. */
+let notionState: { linked: boolean; workspace: string } | null = null;
+
+/** The last link attempt's outcome, worded for the page. */
+let notionWord = "";
+
+async function refreshNotion(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  notionState = await bridge.notionStatus().catch(() => null);
+  redrawSettings();
+}
+
+/**
+ * The OAuth round trip: a browser tab asks, the shell catches the answer. Coming back
+ * linked is the proof the whole road works, so coming back linked is also what switches
+ * the integration on.
+ */
+async function connectNotion(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  notionWord = "waiting on the browser — allow Bedrock there…";
+  ui.status.textContent = "Notion: finish linking in the browser tab that opened";
+  redrawSettings();
+  try {
+    const { workspace } = await bridge.notionConnect();
+    settings.set("notion", true);
+    notionWord = "";
+    ui.status.textContent = `Notion: linked${workspace ? ` to ${workspace}` : ""}`;
+  } catch (err) {
+    notionWord = (err as Error).message;
+    ui.status.textContent = `Notion: ${notionWord}`;
+  }
+  await refreshNotion();
+}
+
+async function unlinkNotion(): Promise<void> {
+  if (!(await askConfirm("Unlink the Notion workspace? Notes keep their page links.", "Unlink"))) return;
+  await window.bedrock?.notionForget().catch(() => false);
+  notionWord = "";
+  ui.status.textContent = "Notion: unlinked — the token is forgotten";
+  await refreshNotion();
+}
+
+/**
+ * Whether a Notion action may go ahead, asked of the shell rather than of a flag, so
+ * the answer is never one unlink out of date.
+ */
+async function notionReady(): Promise<boolean> {
+  const bridge = window.bedrock;
+  if (!bridge) {
+    ui.status.textContent = "Notion pages need the desktop app — npm start";
+    return false;
+  }
+  const status = await bridge.notionStatus().catch(() => null);
+  notionState = status;
+  if (!status?.linked) {
+    ui.status.textContent = "Notion: link the workspace first — Settings → Integrations → Notion";
+    redrawSettings();
+    return false;
+  }
+  return true;
+}
+
+/* ------------------------------------------------- apple notes' own page --- */
+
+/** How the settings page names the default Notes folder — the shell owns the real one. */
+const NOTES_DEFAULT_FOLDER = "Bedrock";
+
+/** Whether Apple Notes is on this Mac; null until the shell says. Whether Bedrock may
+    drive it is macOS's secret until the first action asks, so it is not in here. */
+let appleNotesState: { app: boolean } | null = null;
+
+/**
+ * Which Notes folder new notes land in — asked over the folders Notes already has,
+ * with typing a fresh name always open (it is made on first use).
+ */
+async function setUpNotesFolder(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  let folders: string[] = [];
+  try {
+    folders = await bridge.notesFolders();
+  } catch (err) {
+    ui.status.textContent = `Apple Notes: ${(err as Error).message}`;
+    return;
+  }
+  const chosen = await askChoice(
+    "Which Notes folder should new notes land in?",
+    folders,
+    "A new folder…",
+    "Name the folder — it is made when first needed",
+    settings.setup().notesFolder || NOTES_DEFAULT_FOLDER,
+  );
+  if (!chosen) return;
+  settings.setSetup({ notesFolder: chosen });
+  ui.status.textContent = `Apple Notes: new notes land in “${chosen}”`;
+  redrawSettings();
+}
+
+function forgetNotesFolder(): void {
+  settings.setSetup({ notesFolder: "" });
+  ui.status.textContent = `Apple Notes: new notes land in “${NOTES_DEFAULT_FOLDER}”`;
+  redrawSettings();
+}
+
+/** The last try's outcome, worded for the page. */
+let appleNotesWord = "";
+
+async function refreshAppleNotes(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  appleNotesState = await bridge.notesStatus().catch(() => null);
+  redrawSettings();
+}
+
+/**
+ * The activation: make a real note, open it. The first run is also when macOS asks its
+ * Automation question, so passing proves the app, the permission and the road at once —
+ * and passing is what switches the integration on.
+ */
+async function testAppleNotes(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  appleNotesWord = "creating a note — macOS may ask you to allow this…";
+  redrawSettings();
+  try {
+    const note = await bridge.notesCreate(settings.setup().notesFolder, "Bedrock connected");
+    settings.set("applenotes", true);
+    appleNotesWord = `made “${note.title}” just now — it should be open on your screen`;
+    ui.status.textContent = "Apple Notes: connected";
+    void bridge.notesOpen(note.id);
+  } catch (err) {
+    appleNotesWord = (err as Error).message;
+    ui.status.textContent = `Apple Notes: ${appleNotesWord}`;
+  }
+  redrawSettings();
+}
+
+/** Whether an Apple Notes action may go ahead — the app on this Mac, and a shell to ask. */
+async function appleNotesReady(): Promise<boolean> {
+  const bridge = window.bedrock;
+  if (!bridge) {
+    ui.status.textContent = "Apple notes need the desktop app — npm start";
+    return false;
+  }
+  const status = await bridge.notesStatus().catch(() => null);
+  appleNotesState = status;
+  if (!status?.app) {
+    ui.status.textContent = "Apple Notes is not on this Mac";
+    redrawSettings();
+    return false;
+  }
+  return true;
+}
+
+/* -------------------------------------------------------- word's own page --- */
+
+/** How the settings page names the default save folder. The shell owns the real path
+    (under the home folder); this is that path as a person would say it. */
+const WORD_DEFAULT_FOLDER = "Documents/word-bedrock";
+
+/** Whether Word is on this Mac; null until the shell says. */
+let wordState: { app: boolean } | null = null;
+
+/** The last try's outcome, worded for the page. */
+let wordWord = "";
+
+async function refreshWord(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  wordState = await bridge.wordStatus().catch(() => null);
+  redrawSettings();
+}
+
+/** Where new documents land — asked with the OS's own folder picker, like git's root. */
+async function setUpWordFolder(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  const chosen = await bridge.pickPath("folder").catch(() => null);
+  if (!chosen) return;
+  settings.setSetup({ wordFolder: chosen });
+  ui.status.textContent = `Word: new documents land in ${chosen}`;
+  redrawSettings();
+}
+
+function forgetWordFolder(): void {
+  settings.setSetup({ wordFolder: "" });
+  ui.status.textContent = `Word: new documents land in ${WORD_DEFAULT_FOLDER}`;
+  redrawSettings();
+}
+
+/**
+ * The activation: make a real document, open it. The first run is when macOS asks its
+ * Automation question (and Word may ask its own about the folder), so passing proves
+ * the app, the permission and the save folder at once — and switches the integration on.
+ */
+async function testWord(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  wordWord = "creating a document — macOS may ask you to allow this…";
+  redrawSettings();
+  try {
+    const doc = await bridge.wordCreate(settings.setup().wordFolder, "Bedrock connected");
+    settings.set("word", true);
+    wordWord = `made “${doc.title}” just now — it should be open in Word`;
+    ui.status.textContent = "Word: connected";
+  } catch (err) {
+    wordWord = (err as Error).message;
+    ui.status.textContent = `Word: ${wordWord}`;
+  }
+  redrawSettings();
+}
+
+/** Whether a Word action may go ahead — the app on this Mac, and a shell to ask. */
+async function wordReady(): Promise<boolean> {
+  const bridge = window.bedrock;
+  if (!bridge) {
+    ui.status.textContent = "Word documents need the desktop app — npm start";
+    return false;
+  }
+  const status = await bridge.wordStatus().catch(() => null);
+  wordState = status;
+  if (!status?.app) {
+    ui.status.textContent = "Microsoft Word is not on this Mac";
+    redrawSettings();
+    return false;
+  }
+  return true;
 }
 
 /* ------------------------------------------------------ gemini's own page --- */
@@ -3080,6 +3508,490 @@ async function linkFreeformAt(
   await refreshSidebar();
 }
 
+/* ---------------------------------------------------------------- notion --- */
+
+/**
+ * A page note is a pointer in the board note's mould: the page's own address, and
+ * nothing said on its behalf. The page itself — every block on it — stays Notion's own.
+ * A note without a `page::` line is a page that has not been made yet; a click makes it.
+ */
+const notionTemplate = (url: string): string =>
+  url ? `type:: notion\n\npage:: ${url}\n` : `type:: notion\n`;
+
+/**
+ * Makes the page a note stands for — named what the note is named, private, at the
+ * workspace root — writes its address home into the note, and opens it.
+ */
+async function makeNotionPage(path: string): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  ui.status.textContent = `Notion: creating “${noteName(path)}”…`;
+  let page: NotionPage;
+  try {
+    page = await bridge.notionCreate(noteName(path));
+  } catch (err) {
+    ui.status.textContent = `Notion: ${(err as Error).message}`;
+    return;
+  }
+  await flushAll(); // the note may be open and mid-edit; the write must not clobber
+  await vault.write(path, setField(await vault.read(path), "page", page.url));
+  graphView.setNotionPage(path, page.url);
+  graphStale = true;
+  for (let i = 0; i < panes.length; i++) if (pathOf(panes[i]) === path) await renderPage(i);
+  void bridge.notionOpen(page.url);
+  ui.status.textContent = `${noteName(path)} → its own page, open in Notion`;
+}
+
+/**
+ * Click on a page node: open the page. A note whose page was never made (the call
+ * failed, or the line was stripped by hand) gets one made from its own name instead —
+ * the node heals itself rather than just complaining.
+ */
+async function openNotionNode(path: string, url: string | null): Promise<void> {
+  // One tick later, for the same reason `openFsNode` waits: the click's own free
+  // handler clears the hint right after this, and the message has to outlive that.
+  const say = (message: string): void => {
+    window.setTimeout(() => {
+      ui.status.textContent = message;
+    }, 0);
+  };
+  const bridge = window.bedrock;
+  if (!bridge) {
+    say("Notion pages need the desktop app — npm start");
+    return;
+  }
+  if (url) {
+    const opened = await bridge.notionOpen(url);
+    say(opened ? `${noteName(path)} → Notion` : `the note's page:: line is not a Notion address`);
+    return;
+  }
+  if (!(await notionReady())) return;
+  await makeNotionPage(path);
+}
+
+/**
+ * "New Notion page" — from the canvas menu, or from a link draft released on empty
+ * space. The note comes first and gets its name, and committing the name is what makes
+ * the page: it is born called what the note is called, and its address is written home.
+ */
+async function createNotionAt(
+  at: { x: number; y: number },
+  folder: string | null,
+  source: string | null = null,
+): Promise<void> {
+  if (!(await notionReady())) return;
+  const dir = folder ?? "";
+  const path = uniquePath(filePaths(), dir, "Notion page", ".md");
+  await vault.createFile(path, notionTemplate(""));
+  entries = [...entries, { path, kind: "file" }]; // so the rename's collision check sees it
+  if (source) {
+    graphView.commitLink(source, path, {
+      label: noteName(path),
+      parent: dir || undefined,
+      at,
+      type: "notion",
+    });
+  } else {
+    graphView.commitNode(path, noteName(path), dir || undefined, at, "notion");
+  }
+  graphStale = true;
+  await refreshSidebar();
+  ui.status.textContent = `created ${path} — name it, and the page is made to match`;
+  graphView.renameNode(path, (name) => {
+    void (async () => {
+      const finalPath = name ? ((await applyRename(path, "file", name)) ?? path) : path;
+      if (!source) {
+        await makeNotionPage(finalPath);
+        return;
+      }
+      // Linked page: the connection gets its name FIRST — making the page opens Notion
+      // over everything, and a window grabbing focus mid-word is how a label gets lost.
+      graphView.promptConnection(source, finalPath, (label) => {
+        void (async () => {
+          await finishLink(source, finalPath, label);
+          await makeNotionPage(finalPath);
+        })();
+      });
+    })();
+  });
+}
+
+/**
+ * "Link a Notion page…" — asks what to look for (nothing lists what is recent), offers
+ * what the workspace answered, and the one picked becomes a node named after it. Pages
+ * can share a title over there, so the list numbers the doubles rather than guessing.
+ */
+async function linkNotionAt(
+  at: { x: number; y: number },
+  folder: string | null,
+  source: string | null = null,
+): Promise<void> {
+  if (!(await notionReady())) return;
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  const query = await askText("Search Notion — empty lists what is recent", "", "Search");
+  if (query === null) return;
+  ui.status.textContent = "Notion: searching…";
+  let pages: NotionPage[];
+  try {
+    pages = await bridge.notionSearch(query);
+  } catch (err) {
+    ui.status.textContent = `Notion: ${(err as Error).message}`;
+    return;
+  }
+  if (!pages.length) {
+    ui.status.textContent = "Notion: nothing found to link";
+    return;
+  }
+  const byLabel = new Map<string, NotionPage>();
+  for (const page of pages) {
+    const title = page.title || "Untitled";
+    let label = title;
+    for (let n = 2; byLabel.has(label); n++) label = `${title} (${n})`;
+    byLabel.set(label, page);
+  }
+  const picked = await askChoice("Which page should the note point at?", [...byLabel.keys()], "Cancel");
+  if (picked === null) return;
+  const page = byLabel.get(picked);
+  if (!page) return;
+  const dir = folder ?? "";
+  const path = uniquePath(filePaths(), dir, asFileName(page.title || "Untitled"), ".md");
+  await vault.createFile(path, notionTemplate(page.url));
+  entries = [...entries, { path, kind: "file" }];
+  if (source) {
+    graphView.commitLink(source, path, {
+      label: noteName(path),
+      parent: dir || undefined,
+      at,
+      type: "notion",
+      url: page.url,
+    });
+    graphView.promptConnection(source, path, (label) => void finishLink(source, path, label));
+  } else {
+    graphView.commitNode(path, noteName(path), dir || undefined, at, "notion", page.url);
+  }
+  graphStale = true;
+  ui.status.textContent = `${noteName(path)} → its page in Notion`;
+  await refreshSidebar();
+}
+
+/* ----------------------------------------------------------- apple notes --- */
+
+/**
+ * The same pointer again: the id Apple minted, and nothing said on the note's behalf.
+ * The field is `note::` — a note here pointing at a note there, which is exactly what
+ * it is. Empty means "not made yet", which a click makes.
+ */
+const appleNoteTemplate = (id: string): string =>
+  id ? `type:: applenote\n\nnote:: ${id}\n` : `type:: applenote\n`;
+
+/**
+ * Makes the Apple note a note here stands for — titled what the note is named — writes
+ * the id home, and opens it in Notes. The first run ever is when macOS asks its
+ * Automation question, so a refusal is worded as directions, not a code.
+ */
+async function makeAppleNote(path: string): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  ui.status.textContent = `Apple Notes: creating “${noteName(path)}”…`;
+  let note: AppleNote;
+  try {
+    note = await bridge.notesCreate(settings.setup().notesFolder, noteName(path));
+  } catch (err) {
+    ui.status.textContent = `Apple Notes: ${(err as Error).message}`;
+    return;
+  }
+  await flushAll(); // the note may be open and mid-edit; the write must not clobber
+  await vault.write(path, setField(await vault.read(path), "note", note.id));
+  graphView.setAppleNote(path, note.id);
+  graphStale = true;
+  for (let i = 0; i < panes.length; i++) if (pathOf(panes[i]) === path) await renderPage(i);
+  void bridge.notesOpen(note.id).catch(() => false);
+  ui.status.textContent = `${noteName(path)} → its own note, open in Apple Notes`;
+}
+
+/** Click on an Apple note node: open the note in Notes, or make the one never made. */
+async function openAppleNoteNode(path: string, note: string | null): Promise<void> {
+  const say = (message: string): void => {
+    window.setTimeout(() => {
+      ui.status.textContent = message;
+    }, 0);
+  };
+  const bridge = window.bedrock;
+  if (!bridge) {
+    say("Apple notes need the desktop app — npm start");
+    return;
+  }
+  if (note) {
+    try {
+      const opened = await bridge.notesOpen(note);
+      say(opened ? `${noteName(path)} → Apple Notes` : `the note's note:: line is not an Apple note id`);
+    } catch (err) {
+      say(`Apple Notes: ${(err as Error).message}`);
+    }
+    return;
+  }
+  if (!(await appleNotesReady())) return;
+  await makeAppleNote(path);
+}
+
+/** "New Apple note" — the note here first, its name committed, the note there to match. */
+async function createAppleNoteAt(
+  at: { x: number; y: number },
+  folder: string | null,
+  source: string | null = null,
+): Promise<void> {
+  if (!(await appleNotesReady())) return;
+  const dir = folder ?? "";
+  const path = uniquePath(filePaths(), dir, "Apple note", ".md");
+  await vault.createFile(path, appleNoteTemplate(""));
+  entries = [...entries, { path, kind: "file" }]; // so the rename's collision check sees it
+  if (source) {
+    graphView.commitLink(source, path, {
+      label: noteName(path),
+      parent: dir || undefined,
+      at,
+      type: "applenote",
+    });
+  } else {
+    graphView.commitNode(path, noteName(path), dir || undefined, at, "applenote");
+  }
+  graphStale = true;
+  await refreshSidebar();
+  ui.status.textContent = `created ${path} — name it, and the note is made to match`;
+  graphView.renameNode(path, (name) => {
+    void (async () => {
+      const finalPath = name ? ((await applyRename(path, "file", name)) ?? path) : path;
+      if (!source) {
+        await makeAppleNote(finalPath);
+        return;
+      }
+      // Linked note: the connection gets its name FIRST — Notes opening over everything
+      // mid-word is how a label gets lost. All the naming at home, then the note is made.
+      graphView.promptConnection(source, finalPath, (label) => {
+        void (async () => {
+          await finishLink(source, finalPath, label);
+          await makeAppleNote(finalPath);
+        })();
+      });
+    })();
+  });
+}
+
+/**
+ * "Link an Apple note…" — the notes already over there, latest edit first, and the one
+ * picked becomes a node named after it. Titles repeat over there too, so the doubles
+ * are numbered rather than guessed between.
+ */
+async function linkAppleNoteAt(
+  at: { x: number; y: number },
+  folder: string | null,
+  source: string | null = null,
+): Promise<void> {
+  if (!(await appleNotesReady())) return;
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  ui.status.textContent = "Apple Notes: reading your notes…";
+  let notes: AppleNote[];
+  try {
+    notes = await bridge.notesList(30);
+  } catch (err) {
+    ui.status.textContent = `Apple Notes: ${(err as Error).message}`;
+    return;
+  }
+  if (!notes.length) {
+    ui.status.textContent = "Apple Notes: no notes to link — make one first";
+    return;
+  }
+  const byLabel = new Map<string, AppleNote>();
+  for (const note of notes) {
+    const title = note.title || "Untitled";
+    let label = title;
+    for (let n = 2; byLabel.has(label); n++) label = `${title} (${n})`;
+    byLabel.set(label, note);
+  }
+  const picked = await askChoice("Which note should this one point at?", [...byLabel.keys()], "Cancel");
+  if (picked === null) return;
+  const note = byLabel.get(picked);
+  if (!note) return;
+  const dir = folder ?? "";
+  const path = uniquePath(filePaths(), dir, asFileName(note.title || "Untitled"), ".md");
+  await vault.createFile(path, appleNoteTemplate(note.id));
+  entries = [...entries, { path, kind: "file" }];
+  if (source) {
+    graphView.commitLink(source, path, {
+      label: noteName(path),
+      parent: dir || undefined,
+      at,
+      type: "applenote",
+      url: note.id,
+    });
+    graphView.promptConnection(source, path, (label) => void finishLink(source, path, label));
+  } else {
+    graphView.commitNode(path, noteName(path), dir || undefined, at, "applenote", note.id);
+  }
+  graphStale = true;
+  ui.status.textContent = `${noteName(path)} → its note in Apple Notes`;
+  await refreshSidebar();
+}
+
+/* ------------------------------------------------------------------ word --- */
+
+/**
+ * A document note points at a file, so the pointer is a path — the one pointer here
+ * that names something of the user's own rather than something inside an app. Empty
+ * means "not made yet", which a click makes.
+ */
+const wordTemplate = (doc: string): string =>
+  doc ? `type:: word\n\ndoc:: ${doc}\n` : `type:: word\n`;
+
+/**
+ * Makes the document a note stands for — named what the note is named, saved where the
+ * vault said (or the default) — writes the path home, and Word opens it as it saves.
+ */
+async function makeWordDoc(path: string): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  ui.status.textContent = `Word: creating “${noteName(path)}”…`;
+  let doc: WordDoc;
+  try {
+    doc = await bridge.wordCreate(settings.setup().wordFolder, noteName(path));
+  } catch (err) {
+    ui.status.textContent = `Word: ${(err as Error).message}`;
+    return;
+  }
+  await flushAll(); // the note may be open and mid-edit; the write must not clobber
+  await vault.write(path, setField(await vault.read(path), "doc", doc.path));
+  graphView.setWordDoc(path, doc.path);
+  graphStale = true;
+  for (let i = 0; i < panes.length; i++) if (pathOf(panes[i]) === path) await renderPage(i);
+  ui.status.textContent = `${noteName(path)} → its own document, open in Word`;
+}
+
+/** Click on a Word node: open the document in Word, or make the one never made. A
+    pointer at a file that has since moved says so instead of opening nothing. */
+async function openWordNode(path: string, doc: string | null): Promise<void> {
+  const say = (message: string): void => {
+    window.setTimeout(() => {
+      ui.status.textContent = message;
+    }, 0);
+  };
+  const bridge = window.bedrock;
+  if (!bridge) {
+    say("Word documents need the desktop app — npm start");
+    return;
+  }
+  if (doc) {
+    try {
+      const answer = await bridge.wordOpen(doc);
+      say(
+        answer === "opened"
+          ? `${noteName(path)} → Word`
+          : `the document is not at ${doc} any more — it moved, or was deleted`,
+      );
+    } catch (err) {
+      say(`Word: ${(err as Error).message}`);
+    }
+    return;
+  }
+  if (!(await wordReady())) return;
+  await makeWordDoc(path);
+}
+
+/** "New Word document" — the note first, its name committed, the .docx made to match. */
+async function createWordAt(
+  at: { x: number; y: number },
+  folder: string | null,
+  source: string | null = null,
+): Promise<void> {
+  if (!(await wordReady())) return;
+  const dir = folder ?? "";
+  const path = uniquePath(filePaths(), dir, "Word document", ".md");
+  await vault.createFile(path, wordTemplate(""));
+  entries = [...entries, { path, kind: "file" }]; // so the rename's collision check sees it
+  if (source) {
+    graphView.commitLink(source, path, {
+      label: noteName(path),
+      parent: dir || undefined,
+      at,
+      type: "word",
+    });
+  } else {
+    graphView.commitNode(path, noteName(path), dir || undefined, at, "word");
+  }
+  graphStale = true;
+  await refreshSidebar();
+  ui.status.textContent = `created ${path} — name it, and the document is made to match`;
+  graphView.renameNode(path, (name) => {
+    void (async () => {
+      const finalPath = name ? ((await applyRename(path, "file", name)) ?? path) : path;
+      if (!source) {
+        await makeWordDoc(finalPath);
+        return;
+      }
+      // Linked document: the connection gets its name FIRST — Word opening over
+      // everything mid-word is how a label gets lost.
+      graphView.promptConnection(source, finalPath, (label) => {
+        void (async () => {
+          await finishLink(source, finalPath, label);
+          await makeWordDoc(finalPath);
+        })();
+      });
+    })();
+  });
+}
+
+/**
+ * "Link a Word document…" — Word's own recent list, latest first, no launch and no
+ * prompt to read it. The one picked becomes a node named after the file; names repeat
+ * across folders, so the doubles are numbered rather than guessed between.
+ */
+async function linkWordAt(
+  at: { x: number; y: number },
+  folder: string | null,
+  source: string | null = null,
+): Promise<void> {
+  if (!(await wordReady())) return;
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  ui.status.textContent = "Word: reading its recent documents…";
+  const docs = await bridge.wordRecent(30).catch(() => []);
+  if (!docs.length) {
+    ui.status.textContent = "Word: no recent documents to link — “New Word document” instead";
+    return;
+  }
+  const byLabel = new Map<string, WordDoc>();
+  for (const doc of docs) {
+    const title = doc.title || "Untitled";
+    let label = title;
+    for (let n = 2; byLabel.has(label); n++) label = `${title} (${n})`;
+    byLabel.set(label, doc);
+  }
+  const picked = await askChoice("Which document should the note point at?", [...byLabel.keys()], "Cancel");
+  if (picked === null) return;
+  const doc = byLabel.get(picked);
+  if (!doc) return;
+  const dir = folder ?? "";
+  const path = uniquePath(filePaths(), dir, asFileName(doc.title || "Untitled"), ".md");
+  await vault.createFile(path, wordTemplate(doc.path));
+  entries = [...entries, { path, kind: "file" }];
+  if (source) {
+    graphView.commitLink(source, path, {
+      label: noteName(path),
+      parent: dir || undefined,
+      at,
+      type: "word",
+      url: doc.path,
+    });
+    graphView.promptConnection(source, path, (label) => void finishLink(source, path, label));
+  } else {
+    graphView.commitNode(path, noteName(path), dir || undefined, at, "word", doc.path);
+  }
+  graphStale = true;
+  ui.status.textContent = `${noteName(path)} → its document in Word`;
+  await refreshSidebar();
+}
+
 /* ---------------------------------------------------------------- claude --- */
 
 /**
@@ -3503,35 +4415,6 @@ async function finishLink(source: string, target: string, label: string | null):
     : `linked ${noteName(source)} → ${noteName(target)}`;
 }
 
-/**
- * Right-drag landed on empty canvas: place the note where it was dropped, name it, then name the
- * connection. The node, the edge and the name field go up FIRST and the vault work follows — on a
- * real folder vault the `entries()` walk takes long enough that doing it first made the name field
- * appear seconds after the click, which read as the gesture having failed.
- */
-async function linkToNewNote(source: string, at: { x: number; y: number }, folder: string | null): Promise<void> {
-  // The note belongs to the box it was dropped in; only fall back to the source's folder at the root.
-  const dir = folder ?? "";
-  const path = freshPath(dir, "Untitled");
-  await vault.createFile(path, `# ${noteName(path)}\n\n`);
-  entries = [...entries, { path, kind: "file" }]; // so the rename's collision check sees it
-  graphView.commitLink(source, path, { label: noteName(path), parent: dir || undefined, at });
-  graphStale = true;
-  ui.status.textContent = `created ${path} — name it, then name the connection`;
-
-  // name the note → rename it on disk → name the connection → write the link.
-  // A dismissed name field (null) keeps "Untitled" and still moves on to the connection.
-  graphView.renameNode(path, (name) => {
-    void (async () => {
-      const finalPath = name ? ((await applyRename(path, "file", name)) ?? path) : path;
-      graphView.promptConnection(source, finalPath, (label) =>
-        void finishLink(source, finalPath, label),
-      );
-    })();
-  });
-  await refreshSidebar();
-}
-
 /** [[link]] click: open the target, creating the note if it does not exist yet. */
 async function followLink(target: string, where: number): Promise<void> {
   const from = pathOf(pane(where));
@@ -3550,7 +4433,6 @@ async function followLink(target: string, where: number): Promise<void> {
 /* ----------------------------------------------------------------- wiring --- */
 
 ui.openFolder.addEventListener("click", () => void pickFolder());
-ui.newNote.addEventListener("click", () => void newNote());
 ui.newFolder.addEventListener("click", () => void newFolder());
 ui.graph.addEventListener("click", () => openGraph());
 
@@ -3565,6 +4447,18 @@ ui.settings.addEventListener("click", () => {
   void refreshTmux();
   void refreshGit();
   void refreshFreeform();
+  void refreshNotion();
+  void refreshAppleNotes();
+  void refreshWord();
+});
+// The desktop app has a real menu bar — Settings… under the app's name (⌘,), Open
+// Vault… under File — so the floating corner cluster is only the browser's stand-in.
+ui.floatControls.hidden = !!window.bedrock;
+window.bedrock?.onMenu((what) => {
+  if (what === "settings") ui.settings.click();
+  // The folder picker refuses to open without a real click, so the menu item opens the
+  // front door instead — its buttons are real clicks, and Esc backs out over a vault.
+  else ui.welcome.hidden = false;
 });
 settings.onChange = applyFeatures;
 settings.onLook = applyLook;
@@ -3718,22 +4612,16 @@ window.addEventListener("beforeunload", () => {
 const escapeHtml = (s: string): string => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 const escapeAttr = (s: string): string => escapeHtml(s).replace(/"/g, "&quot;");
 
-// Open the first note before the first render, so launching the app doesn't solve
-// a graph layout the user never asked to see behind the note they land on.
-void (async () => {
-  await spatial.attach(vault);
-  await stickies.attach(vault);
-  await issueIds.attach(vault);
-  await settings.attach(vault);
-  await adoptLinearKey(); // a key stored on a previous run connects itself
-  applyFeatures();
-  entries = await vault.entries();
-  const first = filePaths()[0];
-  if (first) {
-    panes[0].tabs.push({ kind: "file", path: first });
-    panes[0].active = 1;
-    lastFile = first;
-  }
-  await refresh();
-  if (first) await renderPage(0);
-})();
+// No vault opens by itself — not the demo, not even the last one. The app starts at
+// the front door, and everything attaches when a real folder is picked (`pickFolder`).
+void adoptLinearKey(); // a key stored on a previous run connects itself
+
+/** Whether any real vault has been opened this run — what lets Esc close the door. */
+let vaultOpen = false;
+
+el("welcome-open").addEventListener("click", () => void pickFolder());
+el("welcome-new").addEventListener("click", () => void pickFolder());
+document.addEventListener("keydown", (event) => {
+  // The door can be closed over an open vault; before one is open there is nothing behind it.
+  if (event.key === "Escape" && vaultOpen && !ui.welcome.hidden) ui.welcome.hidden = true;
+});

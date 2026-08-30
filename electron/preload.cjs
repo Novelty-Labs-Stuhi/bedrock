@@ -38,6 +38,23 @@ contextBridge.exposeInMainWorld("bedrock", {
   freeformCreate: (title) => ipcRenderer.invoke("freeform-create", title),
   freeformOpen: (id) => ipcRenderer.invoke("freeform-open", id),
   freeformInstall: () => ipcRenderer.invoke("freeform-install"),
+  notesStatus: () => ipcRenderer.invoke("notes-status"),
+  notesList: (limit) => ipcRenderer.invoke("notes-list", limit),
+  notesCreate: (folder, title) => ipcRenderer.invoke("notes-create", folder, title),
+  notesFolders: () => ipcRenderer.invoke("notes-folders"),
+  notesOpen: (id) => ipcRenderer.invoke("notes-open", id),
+  notionConnect: () => ipcRenderer.invoke("notion-connect"),
+  notionStatus: () => ipcRenderer.invoke("notion-status"),
+  notionForget: () => ipcRenderer.invoke("notion-forget"),
+  notionSearch: (query) => ipcRenderer.invoke("notion-search", query),
+  notionCreate: (title) => ipcRenderer.invoke("notion-create", title),
+  notionOpen: (url) => ipcRenderer.invoke("notion-open", url),
+  wordStatus: () => ipcRenderer.invoke("word-status"),
+  wordRecent: (limit) => ipcRenderer.invoke("word-recent", limit),
+  wordCreate: (folder, title) => ipcRenderer.invoke("word-create", folder, title),
+  wordOpen: (path) => ipcRenderer.invoke("word-open", path),
+  // The menu bar's two renderer-side doors: Settings…, Open Vault….
+  onMenu: (fn) => ipcRenderer.on("menu", (_e, what) => fn(what)),
 
   // Sessions run by the CLI, under tmux. `termStatus` is what the settings window gates
   // the whole mode on; the rest is the window that draws one.

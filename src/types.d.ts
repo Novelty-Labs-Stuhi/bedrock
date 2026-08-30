@@ -96,6 +96,48 @@ interface Window {
         click Apple keeps for the person. Rejects with what the OS said went wrong. */
     freeformInstall(): Promise<boolean>;
 
+    /** Whether Apple Notes is on this Mac. Whether Bedrock may drive it is macOS's to
+        say, and macOS only says when asked — the first real action asks. */
+    notesStatus(): Promise<{ app: boolean }>;
+    /** The notes Apple Notes holds, latest edit first, the deleted ones left out.
+        Rejects with directions when macOS is keeping Bedrock away. */
+    notesList(limit?: number): Promise<AppleNote[]>;
+    /** Makes a note titled `title` in the named Notes folder ("" means the default,
+        “Bedrock”), making the folder too if it is not there yet. */
+    notesCreate(folder: string, title: string): Promise<AppleNote>;
+    /** The folders of the default account a new note could land in, the bin left out. */
+    notesFolders(): Promise<string[]>;
+    /** Opens THE note, in Apple Notes. False for a malformed id. */
+    notesOpen(id: string): Promise<boolean>;
+
+    /** Links a Notion workspace: OAuth in the real browser, the token into the OS
+        keychain. Resolves once the browser comes back; rejects if it never does. */
+    notionConnect(): Promise<{ workspace: string }>;
+    notionStatus(): Promise<{ linked: boolean; workspace: string }>;
+    notionForget(): Promise<boolean>;
+    /** The pages the workspace can see for `query` — empty lists what is recent. */
+    notionSearch(query?: string): Promise<NotionPage[]>;
+    /** Makes a page titled `title` (private, at the workspace root) and resolves with it. */
+    notionCreate(title: string): Promise<NotionPage>;
+    /** Opens THE page — the Notion app when it is installed, the browser otherwise.
+        False for an address that is not Notion's. */
+    notionOpen(url: string): Promise<boolean>;
+
+    /** Whether Microsoft Word is on this Mac — not a system app, so a real question. */
+    wordStatus(): Promise<{ app: boolean }>;
+    /** Word's own recent documents, latest first, read off the list it keeps beside its
+        preferences — no launch, no prompt. Ones that moved since are left out. */
+    wordRecent(limit?: number): Promise<WordDoc[]>;
+    /** Makes a .docx named `title` in `folder` ("" means the default,
+        Documents/word-bedrock), opens it in Word, and resolves with where it landed.
+        The name is uniquified rather than overwriting. */
+    wordCreate(folder: string, title: string): Promise<WordDoc>;
+    /** Opens THE document, in Word specifically — whatever app owns the double-click. */
+    wordOpen(path: string): Promise<"opened" | "missing">;
+
+    /** The menu bar speaking: Settings… or Open Vault… was picked. */
+    onMenu(fn: (what: "settings" | "open-vault") => void): void;
+
     /** Whether sessions can be run in a terminal here: where tmux is (null when it is not
         installed), and how it could be got. The whole mode is gated on this. */
     termStatus(): Promise<{ tmux: string | null; installer: "brew" | null; platform: string }>;
@@ -124,6 +166,34 @@ interface Window {
     onTermEnded(fn: () => void): void;
   };
 }
+
+/** An Apple note as the pointer Bedrock keeps: never the note itself. */
+type AppleNote = {
+  /** The CoreData id Apple minted (`x-coredata://…`) — what `show` opens. */
+  id: string;
+  title: string;
+  /** Last edit, epoch milliseconds. */
+  at: number;
+};
+
+/** A Word document as the pointer Bedrock keeps: a file of the user's own. */
+type WordDoc = {
+  /** Absolute path on this disk — what Word is handed to open it. */
+  path: string;
+  /** The basename with the extension shed. */
+  title: string;
+  /** Last use, epoch milliseconds. */
+  at: number;
+};
+
+/** A Notion page as the pointer Bedrock keeps: never the page itself. */
+type NotionPage = {
+  /** The 32-hex id Notion minted, pulled off the URL. */
+  id: string;
+  title: string;
+  /** The page's own address — what a click opens. */
+  url: string;
+};
 
 /** A Freeform board as the pointer Bedrock keeps: never the board itself. */
 type FreeformBoard = {

@@ -25,6 +25,8 @@ import {
   type ViewUpdate,
   WidgetType,
 } from "@codemirror/view";
+import katex from "katex";
+import "katex/dist/katex.min.css";
 import { assetUrl, cachedAsset, missingMarker } from "./images";
 import { basename, isImage, type Vault } from "./vault";
 
@@ -95,6 +97,35 @@ class Embed extends WidgetType {
   }
 
   /** A click has to reach the document, or there would be no way to get a caret back into it. */
+  ignoreEvent(): boolean {
+    return false;
+  }
+}
+
+/* ----------------------------------------------------------------- math --- */
+
+/** A rendered formula standing in for its `$…$` (or `$$…$$`, which typesets display-size). */
+class Formula extends WidgetType {
+  constructor(
+    private readonly tex: string,
+    private readonly display: boolean,
+  ) {
+    super();
+  }
+
+  eq(other: Formula): boolean {
+    return other.tex === this.tex && other.display === this.display;
+  }
+
+  toDOM(): HTMLElement {
+    const box = document.createElement("span");
+    box.className = this.display ? "cm-math cm-math-display" : "cm-math";
+    // `throwOnError: false` typesets what it can and shows the broken command in red —
+    // a formula mid-edit is malformed most of the time, and red beats an exception.
+    katex.render(this.tex, box, { throwOnError: false, displayMode: this.display });
+    return box;
+  }
+
   ignoreEvent(): boolean {
     return false;
   }
@@ -178,6 +209,13 @@ const RAW_LINK = Decoration.mark({ class: "cm-wikilink-raw" });
 const HEADING = /^(#{1,6})[ \t]+(?=\S)/;
 const EMBED = /!\[\[([^\][|]+)(?:\|([^\][]*))?\]\]|!\[([^\]]*)\]\(([^)\s]+)\)/g;
 const WIKILINK = /\[\[[^\][]+\]\]/g;
+/**
+ * `$$…$$` then `$…$`, so a display formula is never read as two inline ones. An inline `$`
+ * only opens against a non-space and only closes after one, and a closing `$` may not touch
+ * a digit — that keeps "costs $5 and $10 apiece" as prose instead of typesetting "5 and".
+ */
+const MATH = /\$\$([^$\n]+?)\$\$|\$(?!\s)([^$\n]+?)(?<!\s)\$(?!\d)/g;
+const CODE_SPAN = /`[^`\n]+`/g;
 
 /**
  * One pass, left to right, first match wins — so the markers found can never overlap and the
@@ -242,6 +280,25 @@ function decorateLine(
     const to = alone ? line.to : line.from + at + m[0].length;
     out.push(Decoration.replace({ widget }).range(from, to));
     if (alone) return; // the line is the picture — there is nothing else on it to decorate
+    taken.push({ from: at, to: at + m[0].length });
+  }
+
+  // Math runs before the inline pass and claims its ranges: a `*` or `==` inside a formula is
+  // TeX, not markdown. Inline code still wins over math — `` `$x$` `` shows its dollars —
+  // which needs a peek at the code spans here, since the code pass itself comes later.
+  const code = [...text.matchAll(CODE_SPAN)].map((m) => ({
+    from: m.index ?? 0,
+    to: (m.index ?? 0) + m[0].length,
+  }));
+  for (const m of text.matchAll(MATH)) {
+    const at = m.index ?? 0;
+    if (!free(at, m[0].length)) continue;
+    if (code.some((span) => at < span.to && at + m[0].length > span.from)) continue;
+    const display = m[1] !== undefined;
+    const tex = (display ? m[1] : m[2]) ?? "";
+    if (!tex.trim()) continue;
+    const widget = new Formula(tex, display);
+    out.push(Decoration.replace({ widget }).range(line.from + at, line.from + at + m[0].length));
     taken.push({ from: at, to: at + m[0].length });
   }
 
