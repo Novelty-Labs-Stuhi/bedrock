@@ -7,15 +7,21 @@ export type InlineEditor = {
   close: () => void;
 };
 
+/**
+ * `beside` hangs the field off its anchor to the right, vertically centred — where a
+ * node's own label sits — instead of centring it on the anchor, which is right for a
+ * point on a line and wrong for a circle the field would then cover.
+ */
 export function inlineEdit(
   host: HTMLElement,
   at: { left: number; top: number },
   value: string,
   onCommit: (value: string) => void,
   onCancel: () => void,
+  beside = false,
 ): InlineEditor {
   const input = document.createElement("input");
-  input.className = "inline-edit";
+  input.className = beside ? "inline-edit beside" : "inline-edit";
   input.type = "text";
   input.spellcheck = false;
   input.value = value;

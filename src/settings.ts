@@ -14,13 +14,14 @@ export type Feature =
   | "stickies"
   | "linear"
   | "git"
-  | "gemini"
+  | "antigravity"
   | "claude"
   | "files"
   | "web"
   | "active"
   | "freeform"
   | "notion"
+  | "slack"
   | "applenotes"
   | "word";
 
@@ -38,13 +39,14 @@ const DEFAULTS: Record<Feature, boolean> = {
   stickies: false,
   linear: false,
   git: false,
-  gemini: false,
+  antigravity: false,
   claude: false,
   files: false,
   web: false,
   active: false,
   freeform: false,
   notion: false,
+  slack: false,
   applenotes: false,
   word: false,
 };
@@ -201,8 +203,8 @@ export type Setup = {
   claudeFolder: string;
   /**
    * Where a session runs. "app" hands it to the Claude app over `claude://`. "terminal"
-   * runs the CLI under tmux and draws it in a window here — which is the lighter of the
-   * two, and the only one where the agent is genuinely independent of Bedrock.
+   * hands it to the CLI in your own terminal — which is the lighter of the two, and the
+   * only one where the agent is genuinely independent of Bedrock.
    */
   claudeWindow: "app" | "terminal";
   /** Linear's team and project ids, with the names kept alongside so the settings
@@ -211,13 +213,18 @@ export type Setup = {
   linearTeamName: string;
   linearProject: string;
   linearProjectName: string;
+  /** The one Slack channel threads start in — its id, with the name kept alongside for
+      the same reason Linear's are. One channel on purpose: a thread note points at a
+      thread, and where new ones begin is a property of the vault, not of each note. */
+  slackChannel: string;
+  slackChannelName: string;
   /**
-   * Where a Gemini chat opens. "app" is the window this app owns — it watches for the
-   * conversation URL and saves it into the note by itself, at the price of signing into
-   * Google once inside it. "browser" hands the link to your real browser, where you are
-   * already signed in, and the URL comes home by clipboard instead.
+   * Where a new Antigravity session runs when the note does not say — the same question
+   * `claudeFolder` answers, asked separately because the two are rarely the same folder:
+   * a vault runs its Claude sessions in the repo it is about, and its Antigravity ones
+   * wherever that agent is wanted.
    */
-  geminiWindow: "app" | "browser";
+  antigravityFolder: string;
   /**
    * The GitHub remote this vault pushes to — an `https://…` or `git@…` URL. A choice, not
    * a credential: it says WHICH repo, and the machine's own git says who you are and holds
@@ -245,7 +252,9 @@ const SETUP_DEFAULT: Setup = {
   linearTeamName: "",
   linearProject: "",
   linearProjectName: "",
-  geminiWindow: "app",
+  slackChannel: "",
+  slackChannelName: "",
+  antigravityFolder: "",
   gitRemote: "",
   wordFolder: "",
   notesFolder: "",
@@ -302,7 +311,6 @@ export class SettingsStore {
         const value = parsed.setup?.[key];
         if (typeof value === "string") this.setups[key] = value as never;
       }
-      if (this.setups.geminiWindow !== "browser") this.setups.geminiWindow = "app";
       if (this.setups.claudeWindow !== "terminal") this.setups.claudeWindow = "app";
       // Version 2 kept the Claude folder on its own; it is a setup like any other now.
       if (!this.setups.claudeFolder && typeof parsed.claude?.folder === "string") {
@@ -352,6 +360,11 @@ export class SettingsStore {
       changed = true;
     }
     if (changed) this.schedule();
+  }
+
+  /** The vault's default folder for new Antigravity sessions, or null when it has none. */
+  antigravityFolder(): string | null {
+    return this.setups.antigravityFolder || null;
   }
 
   /** The vault's default folder for new Claude sessions, or null when it has none. */
@@ -426,9 +439,9 @@ const INTEGRATIONS: Row[] = [
     what: "session notes — the node opens a coding session in the Claude app (desktop app)",
   },
   {
-    feature: "gemini",
-    name: "Gemini",
-    what: "conversation notes — rectangles that open the chat in the browser",
+    feature: "antigravity",
+    name: "Antigravity",
+    what: "session notes — the node opens an agent session in your own terminal (desktop app)",
   },
   { feature: "git", name: "GitHub", what: "commit the vault and push it to a GitHub remote, from this page (desktop app)" },
   {
@@ -440,6 +453,11 @@ const INTEGRATIONS: Row[] = [
     feature: "notion",
     name: "Notion",
     what: "page notes — link Notion pages and make new ones from here (desktop app)",
+  },
+  {
+    feature: "slack",
+    name: "Slack",
+    what: "thread notes — start a thread in one channel, or attach one going already; a click opens it in Slack (desktop app)",
   },
   {
     feature: "applenotes",

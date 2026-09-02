@@ -63,29 +63,6 @@ button:hover {
   display: none !important;
 }
 
-/* --------------------------------------------------------- session window --- */
-/* terminal.html: one xterm filling the window, and a line for when it is over. */
-
-.term-body {
-  padding: 6px 8px;
-  background: var(--bg);
-}
-
-#term {
-  position: absolute;
-  inset: 6px 8px;
-}
-
-#term-ended {
-  position: absolute;
-  inset: auto 0 0 0;
-  padding: 6px 10px;
-  background: var(--bg-side);
-  border-top: 1px solid var(--line);
-  color: var(--muted);
-  font-size: 12px;
-}
-
 /* ------------------------------------------------------------- sidebar --- */
 
 /*
@@ -1109,6 +1086,9 @@ button.twisty:hover {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  /* A list longer than the screen scrolls inside the card rather than growing past it. */
+  max-height: min(56vh, 420px);
+  overflow-y: auto;
 }
 
 .dialog-choice {
@@ -1127,6 +1107,41 @@ button.twisty:hover {
 .dialog-choice:focus {
   border-color: var(--accent);
   outline: none;
+}
+
+/* A searchable pick: the search box sits over the list; a row is the name and, dimmer
+   and to the right, whatever tells two alike apart; the keyboard's row is lit. */
+.dialog-pick {
+  width: min(480px, 90vw);
+}
+
+.dialog-search {
+  margin-bottom: 8px;
+}
+
+.dialog-pick .dialog-choice {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-family: inherit;
+  font-size: 13px;
+}
+
+.dialog-pick .dialog-choice small {
+  flex: none;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.dialog-choice.active {
+  border-color: var(--accent);
+  background: var(--sel);
+}
+
+.dialog-none {
+  padding: 8px 9px;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 /* Not one of the folders — typing your own is a different kind of answer. */
@@ -1155,9 +1170,38 @@ button.twisty:hover {
   display: flex;
 }
 
-/* The submenu sits beside its row, one layer up so it never hides under the menu. */
-#submenu {
-  z-index: 61;
+/*
+ * A submenu's last level lists real things — every page in a workspace, every session on
+ * this machine — so it has no natural length. Capped and scrolled rather than allowed to
+ * run off the screen: a menu taller than the window cannot be reached at either end.
+ */
+.menu-panel {
+  max-height: 320px;
+  max-width: 420px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+/* A row that is a heading, a "nothing here", or a list still being fetched. */
+.menu-inert {
+  color: var(--muted);
+  font-style: italic;
+  cursor: default;
+}
+
+.menu-inert:hover {
+  background: transparent;
+}
+
+/*
+ * What tells two rows apart when their names do not — the folder a session ran in, when a
+ * document was last touched. Pushed to the right, and never at the label's expense.
+ */
+.menu-hint {
+  flex: none;
+  padding-left: 14px;
+  color: var(--muted);
+  font-size: 11px;
 }
 
 .menu-item {
@@ -1189,6 +1233,8 @@ button.twisty:hover {
 
 .menu-label {
   flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .menu-arrow {
@@ -1790,6 +1836,11 @@ button.issue-id:hover {
   position: absolute;
   width: 150px;
   transform: translate(-50%, -50%);
+}
+
+/* Off the node's right shoulder, where its name is drawn — not over the node itself. */
+.inline-edit.beside {
+  transform: translate(0, -50%);
   padding: 3px 6px;
   border: 1px solid var(--accent);
   border-radius: 4px;
