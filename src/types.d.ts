@@ -25,17 +25,23 @@ interface Window {
     /** Opens a path the OS way — default app for a file, Finder/Explorer for a folder.
         Resolves "opened", "missing", or whatever the OS said went wrong. */
     openPath(target: string): Promise<string>;
-    /** Opens a chat in a watched window; resolves with the conversation's URL once
-        Google mints one, or null if the window closes first. */
-    geminiChat(url: string): Promise<string | null>;
-    /** Whether the chat window's own Google session is signed in — read off the cookie
-        jar, since Google offers nothing else to ask. */
-    geminiStatus(): Promise<{ signedIn: boolean }>;
-    /** Opens a window whose only job is Google's sign-in, and closes it the moment the
-        login takes. Resolves with where that left things. */
-    geminiSignIn(): Promise<{ signedIn: boolean }>;
-    /** Clears that session. Notes keep their conversation links. */
-    geminiForget(): Promise<boolean>;
+    /** Where the `agy` CLI is (null when it is not installed), and whether it has ever run
+        on this machine. There is no sign-in question: the CLI holds its own OAuth login in
+        the keychain and asks for one in the terminal, where it can be answered. */
+    agyStatus(): Promise<{ cli: string | null; ran: boolean; platform: string }>;
+    /** Mints an Antigravity conversation scoped to `folder` and resolves with its id. The
+        conversation is left EMPTY — `name` is only what the CLI needs to start, and the
+        process is killed the moment it announces the id, before any model call. */
+    agyCreate(folder: string, name: string): Promise<string>;
+    /** Hands a conversation to the person's own terminal — whichever app owns `.command`.
+        Resolves once the terminal has been asked to open; what happens in it is the CLI's. */
+    agyOpen(options: { id: string; folder?: string; title?: string }): Promise<boolean>;
+    /** The conversations on this machine, most recently touched first — what a note can be
+        plugged into. `title` and `steps` are empty for one the CLI has no summary row for,
+        which is every conversation minted here and not yet talked to. */
+    agyConversations(
+      limit?: number,
+    ): Promise<Array<{ id: string; title: string; preview: string; steps: number; folder: string; at: number }>>;
     /** What a webpage says about itself: its `<title>`, and the biggest icon it offers as a
         data URI (both empty strings when the site gives nothing). Answers are cached in the
         app's own folder, so the same address costs one scrape, not one per launch. */
@@ -80,6 +86,24 @@ interface Window {
     linearForget(): Promise<boolean>;
     /** One GraphQL call, with the stored key added by the shell. */
     linearCall(query: string, variables?: unknown): Promise<unknown>;
+
+    /** Proves a bot token against Slack and keeps it in the OS keychain. Rejects with
+        what Slack said if the token is no good; resolves with who the token is. */
+    slackConnect(token: string): Promise<{ team: string; teamId: string; url: string; user: string }>;
+    /** `bot` is a bot token: posts come from the app rather than from the person. */
+    slackStatus(): Promise<{ connected: boolean; team: string; user: string; bot: boolean }>;
+    slackForget(): Promise<boolean>;
+    /** The channels the token can see, public and private, the ones the app is in first. */
+    slackChannels(): Promise<Array<{ id: string; name: string; member: boolean; private: boolean }>>;
+    /** The threads going in a channel — its answered messages, newest first. */
+    slackThreads(channel: string, limit?: number): Promise<SlackThread[]>;
+    /** One thread, by the channel and timestamp that name it — what a pasted link comes to. */
+    slackThread(channel: string, ts: string): Promise<SlackThread>;
+    /** Starts a thread: posts `text` as its first message, and resolves with the thread. */
+    slackPost(channel: string, text: string): Promise<SlackThread>;
+    /** Opens THE thread — the Slack app when it is here, the browser otherwise. False for
+        an address that is not a Slack message link. */
+    slackOpen(url: string): Promise<boolean>;
 
     /** Whether Freeform is on this Mac, and whether Bedrock's shortcut — Apple's only
         door into making a board — is in the Shortcuts library. */
@@ -138,32 +162,18 @@ interface Window {
     /** The menu bar speaking: Settings… or Open Vault… was picked. */
     onMenu(fn: (what: "settings" | "open-vault") => void): void;
 
-    /** Whether sessions can be run in a terminal here: where tmux is (null when it is not
-        installed), and how it could be got. The whole mode is gated on this. */
-    termStatus(): Promise<{ tmux: string | null; installer: "brew" | null; platform: string }>;
-    /** `brew install tmux`. Rejects with what brew said. */
-    termInstall(): Promise<{ tmux: string }>;
-    /** Starts a session under tmux, with an id minted up front. Resolves with that id —
-        no watching, no guessing: the note has its session's name immediately. Pass a
-        previous id to resume it instead, which keeps that id rather than branching. */
-    claudeCliStart(folder: string, resume?: string | null): Promise<string>;
-    /** Whether that tmux session is still running. */
-    claudeCliAlive(session: string): Promise<boolean>;
+    /** Where the `claude` CLI is (null when it is not installed). The whole prerequisite
+        for terminal mode: there is nothing else to install, and no window to own. */
+    claudeCliStatus(): Promise<{ cli: string | null; platform: string }>;
+    /** Starts a session in the person's own terminal, with an id minted up front. Resolves
+        with that id — no watching, no guessing: the note has its session's name
+        immediately. Pass a previous id to resume it instead, which keeps that id rather
+        than branching. `title` names the terminal window. */
+    claudeCliStart(folder: string, resume?: string | null, title?: string): Promise<string>;
     /** Which account the CLI runs as — identity only, never a token, and never a guess at
         what that account may spend. The CLI and the Claude app keep separate logins, so
         which one is which is worth saying out loud. */
     claudeAccount(): Promise<{ email: string; org: string; seat: string }>;
-    /** Ends it for good — what closing its window deliberately does not do. */
-    claudeCliKill(session: string): Promise<boolean>;
-    /** Opens (or raises) the window that draws it. */
-    claudeCliWindow(options: { id: string; title?: string }): Promise<boolean>;
-
-    /* Used only by the terminal window itself. */
-    termAttach(options: { id: string; cols: number; rows: number }): Promise<boolean>;
-    termInput(data: string): void;
-    termResize(cols: number, rows: number): void;
-    onTermData(fn: (data: string) => void): void;
-    onTermEnded(fn: () => void): void;
   };
 }
 
@@ -184,6 +194,22 @@ type WordDoc = {
   title: string;
   /** Last use, epoch milliseconds. */
   at: number;
+};
+
+/** A Slack thread as the pointer Bedrock keeps: never the conversation itself. */
+type SlackThread = {
+  /** The channel it is in, and the timestamp of the message that started it — together
+      the thread's whole identity as far as Slack is concerned. */
+  channel: string;
+  ts: string;
+  /** The first message, as plain words — what the note is named after. */
+  text: string;
+  replies: number;
+  /** When it started, and when it was last answered, both epoch milliseconds. */
+  at: number;
+  latest: number;
+  /** The thread's permalink — what the note keeps, and what a click opens. */
+  url: string;
 };
 
 /** A Notion page as the pointer Bedrock keeps: never the page itself. */

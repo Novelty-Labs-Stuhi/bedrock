@@ -117,6 +117,93 @@ export function askChoice(
   });
 }
 
+/** One row in a searchable pick: what it says, and a dimmer note to tell twins apart. */
+export type PickOption = { label: string; hint?: string };
+
+/**
+ * Pick one of MANY known answers — a workspace's channels, say — where a plain list would
+ * run off the screen. A search box at the top narrows the rows as you type; the list
+ * scrolls; ↑↓ move and Enter takes the highlighted row. Resolves to the chosen label, or
+ * null if dismissed.
+ */
+export function askPick(message: string, options: PickOption[], placeholder = "Search…"): Promise<string | null> {
+  return new Promise<string | null>((resolve) => {
+    const done: Resolve<string | null> = (value) => {
+      close();
+      resolve(value);
+    };
+    const box = overlay();
+    box.classList.add("open");
+    box.innerHTML =
+      `<div class="dialog-card dialog-pick">` +
+      `<div class="dialog-title"></div>` +
+      `<input class="dialog-input dialog-search" type="text" spellcheck="false" />` +
+      `<div class="dialog-choices"></div>` +
+      `<div class="dialog-row"><button class="dialog-cancel">Cancel</button></div>` +
+      `</div>`;
+    box.querySelector<HTMLElement>(".dialog-title")!.textContent = message;
+    const input = box.querySelector<HTMLInputElement>(".dialog-search")!;
+    input.placeholder = placeholder;
+    const list = box.querySelector<HTMLElement>(".dialog-choices")!;
+
+    let shown: PickOption[] = [];
+    let active = 0;
+    const paint = (): void => {
+      const query = input.value.trim().toLowerCase();
+      shown = query ? options.filter((o) => `${o.label} ${o.hint ?? ""}`.toLowerCase().includes(query)) : options;
+      active = Math.min(active, Math.max(0, shown.length - 1));
+      list.innerHTML = "";
+      if (!shown.length) {
+        const none = document.createElement("div");
+        none.className = "dialog-none";
+        none.textContent = "nothing matches";
+        list.appendChild(none);
+        return;
+      }
+      shown.forEach((option, index) => {
+        const button = document.createElement("button");
+        button.className = "dialog-choice" + (index === active ? " active" : "");
+        button.type = "button";
+        const label = document.createElement("span");
+        label.textContent = option.label;
+        button.appendChild(label);
+        if (option.hint) {
+          const hint = document.createElement("small");
+          hint.textContent = option.hint;
+          button.appendChild(hint);
+        }
+        button.onmousedown = (event) => event.preventDefault(); // the search box keeps focus
+        button.onclick = () => done(option.label);
+        list.appendChild(button);
+      });
+      list.children[active]?.scrollIntoView({ block: "nearest" });
+    };
+    input.oninput = () => {
+      active = 0;
+      paint();
+    };
+    box.querySelector<HTMLElement>(".dialog-cancel")!.onclick = () => done(null);
+    box.onmousedown = (event) => {
+      if (event.target === box) done(null);
+    };
+    box.onkeydown = (event) => {
+      event.stopPropagation();
+      if (event.key === "Escape") done(null);
+      else if (event.key === "ArrowDown" && shown.length) {
+        event.preventDefault();
+        active = (active + 1) % shown.length;
+        paint();
+      } else if (event.key === "ArrowUp" && shown.length) {
+        event.preventDefault();
+        active = (active - 1 + shown.length) % shown.length;
+        paint();
+      } else if (event.key === "Enter" && shown[active]) done(shown[active].label);
+    };
+    paint();
+    input.focus();
+  });
+}
+
 /** Yes/no confirmation, styled like askText so the app looks of a piece. */
 export function askConfirm(message: string, confirmLabel = "Delete"): Promise<boolean> {
   return new Promise<boolean>((resolve) => {

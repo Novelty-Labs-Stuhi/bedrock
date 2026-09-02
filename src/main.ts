@@ -5,6 +5,7 @@ import {
   labelledLink,
   parseField,
   parseStyle,
+  parseType,
   pinText,
   relinkText,
   setField,
@@ -13,7 +14,7 @@ import {
   type NodeStyle,
 } from "./links";
 import { showFolderStylePicker, showStylePicker } from "./node-style";
-import { askChoice, askConfirm, askText } from "./dialog";
+import { askChoice, askConfirm, askPick, askText } from "./dialog";
 import { EDGE_DIR, isEdgeNote, renamedEdgeNote } from "./edges";
 import { showMenu, type MenuItem } from "./menu";
 import {
@@ -204,11 +205,12 @@ const NOTE_DOT =
 
 const graphView = new GraphView(ui.cy, {
   // There are no pages any more — the graph is the whole app, and a note is a pointer
-  // at something with its own home. A plain note has nowhere to go, and says so.
-  onOpen: () => {
-    ui.status.textContent = "a plain note has nothing behind it — its links are already on the graph";
+  // at something with its own home. A holder has nowhere to go yet, and says what would
+  // give it somewhere.
+  onOpen: (path) => {
+    ui.status.textContent = `${noteName(path)} is a holder — right-click → Turn into makes it something`;
   },
-  onOpenGemini: (path, url) => openGeminiNode(path, url),
+  onOpenAntigravity: (path, conversation) => void openAntigravitySession(path, conversation),
   onOpenClaude: (path, session) => void openClaudeSession(path, session),
   onOpenPath: (path, target, kind) => void openFsNode(path, target, kind),
   onOpenWeb: (path, url) => void openWebNode(path, url),
@@ -219,58 +221,94 @@ const graphView = new GraphView(ui.cy, {
   onOpenEdge: (source, target) => relabelEdge(source, target),
   onOpenFreeform: (path, board) => void openFreeformNode(path, board),
   onOpenNotion: (path, url) => void openNotionNode(path, url),
+  onOpenSlack: (path, url) => void openSlackNode(path, url),
   onOpenAppleNote: (path, note) => void openAppleNoteNode(path, note),
   onOpenWord: (path, doc) => void openWordNode(path, doc),
   onLinkExisting: (source, target) => linkNotes(source, target),
   onLinkNew: (source, at, folder, kind) => {
-    if (kind === "gemini") void createGeminiAt(at, folder, source);
+    if (kind === "antigravity") void createAntigravityAt(at, folder, source);
     else if (kind === "claude") void createClaudeAt(at, folder, source);
     else if (kind === "file" || kind === "folder") void createFsAt(at, folder, kind, source);
     else if (kind === "web") void createWebAt(at, folder, source);
     else if (kind === "freeform") void createFreeformAt(at, folder, source);
     else if (kind === "notion") void createNotionAt(at, folder, source);
+    else if (kind === "slack") void createSlackAt(at, folder, source);
     else if (kind === "applenote") void createAppleNoteAt(at, folder, source);
     else if (kind === "word") void createWordAt(at, folder, source);
-    // A plain draft released on empty space used to grow a text note. Prose lives in
-    // Apple Notes now, so that gesture makes an Apple note — or says where notes went.
-    else if (settings.enabled("applenotes")) void createAppleNoteAt(at, folder, source);
-    else ui.status.textContent = "notes live in Apple Notes now — Settings → Integrations → Apple Notes";
+    // A plain draft released on empty space grows a holder: a named node with nothing
+    // behind it yet, to be turned into something once it is known what.
+    else void createHolderAt(at, folder, source);
   },
   onReparent: (path, folder) => void moveEntry(path, "file", folder, true),
   onRefolder: (path, folder) => void moveEntry(path, "dir", folder, true),
   onGroup: (picked, frame) => void groupIntoFolder(picked, frame),
   onNodeMenu: (path, client) => {
-    // One branch holds every kind of link, each wearing the tile its node would wear
-    // on the graph — an existing note first, then whichever integrations are on.
-    const link: MenuItem[] = [
-      { label: "Existing note…", icon: NOTE_DOT, run: () => graphView.startLink(path) },
+    /*
+     * Right-click on a note. Everything here starts by drawing a LINK from this note, so
+     * the two branches say so: "Link + Create" makes something new on the other end,
+     * "Link + Attach" puts something that already exists there. Both leave you dragging a
+     * draft, and where you drop it is where the new node lands — which is why picking a
+     * Notion page in the menu still does not place anything yet.
+     *
+     * The same two branches, in the same order, as the canvas menu. A right-click should
+     * not be a different vocabulary depending on what happened to be under it.
+     */
+    const create: MenuItem[] = [
+      { label: "Holder", icon: NOTE_DOT, run: () => graphView.startLink(path) },
     ];
     const draft = (kind: DraftKind, label: string): void => {
-      link.push({ label, icon: TYPE_ICONS[kind], run: () => graphView.startLink(path, kind) });
+      create.push({ label, icon: TYPE_ICONS[kind], run: () => graphView.startLink(path, kind) });
     };
-    if (settings.enabled("gemini")) draft("gemini", "Gemini chat…");
-    if (settings.enabled("claude")) draft("claude", "Claude session…");
+    if (settings.enabled("antigravity")) draft("antigravity", "Antigravity session");
+    if (settings.enabled("claude")) draft("claude", "Claude session");
     if (settings.enabled("files")) {
-      draft("file", "File…");
-      draft("folder", "Folder…");
+      draft("file", "File");
+      draft("folder", "Folder");
     }
-    if (settings.enabled("web")) draft("web", "Webpage…");
-    if (settings.enabled("freeform")) draft("freeform", "Freeform board…");
-    if (settings.enabled("notion")) draft("notion", "Notion page…");
-    if (settings.enabled("applenotes")) draft("applenote", "Apple note…");
-    if (settings.enabled("word")) draft("word", "Word document…");
-    const items: MenuItem[] = [{ label: "Link", children: link }];
-    // Only a session note can be plugged into one; on any other note it would mean nothing.
+    if (settings.enabled("web")) draft("web", "Webpage");
+    if (settings.enabled("freeform")) draft("freeform", "Freeform board");
+    if (settings.enabled("notion")) draft("notion", "Notion page");
+    if (settings.enabled("slack")) draft("slack", "Slack thread");
+    if (settings.enabled("applenotes")) draft("applenote", "Apple note");
+    if (settings.enabled("word")) draft("word", "Word document");
+
+    const items: MenuItem[] = [{ label: "Link + Create", children: create }];
+    // What already exists, starting with what is already on the canvas: a node. That draft
+    // lands only on a note. The rest are drafts that already know what they are attaching
+    // to — picking the thing arms the draft, and dropping it decides where. See
+    // `startLink`'s `release`.
+    const attach: MenuItem[] = [
+      { label: "Existing node", icon: NOTE_DOT, run: () => graphView.startLink(path, "link") },
+      ...attachMenu(
+        (option, kind) => () =>
+          graphView.startLink(path, kind, (at, folder, source) => void option.place(at, folder, source)),
+      ),
+    ];
+    items.push({ label: "Link + Attach", children: attach });
+
+    // A holder is a node waiting to be something: this is where it becomes one, keeping
+    // its name, its place and its look. Only a note with no type yet is offered it — a
+    // Notion page is not turned into a Word document, it is deleted and another made.
+    if (graphView.nodeType(path) === "") {
+      const into = turnIntoMenu(path);
+      if (into.length) items.push({ label: "Turn into", children: into });
+    }
+
+    // Retargeting a note that is ALREADY a session note — a different thing from either
+    // branch above, which both make a new note.
     if (settings.enabled("claude") && graphView.sessionNote(path)) {
       items.push({ label: "Plug in a session…", run: () => void plugInSession(path) });
+    }
+    if (settings.enabled("antigravity") && graphView.antigravityNote(path)) {
+      items.push({ label: "Plug in a conversation…", run: () => void plugInAntigravitySession(path) });
     }
     if (settings.enabled("active")) {
       items.push({ label: "Style…", run: () => void styleNode(path, client) });
     }
     items.push(
       { label: "Copy path", run: () => void copyNotePath(path) },
-      { label: `Rename "${noteName(path)}"`, run: () => renameOnGraph(path) },
-      { label: `Delete "${noteName(path)}"`, run: () => void deleteEntry(path, "file") },
+      { label: "Rename", run: () => renameOnGraph(path) },
+      { label: "Delete", run: () => void deleteEntry(path, "file") },
     );
     showMenu(client, items);
   },
@@ -290,37 +328,34 @@ const graphView = new GraphView(ui.cy, {
     showMenu(client, items);
   },
   onCanvasMenu: (at, client, folder) => {
-    // One branch holds everything empty space can grow: new things, pointers at
-    // existing things ("Existing …" rows), and both kinds of folder — Bedrock's own
-    // box (the blue frame) and a folder on the disk (the yellow one). Each row wears
-    // its graph tile; switched-off integrations appear nowhere.
-    const create: MenuItem[] = [];
+    /*
+     * Right-click on empty space. The same two branches as a note's menu, minus the
+     * linking: "Create" makes a new thing here, "Attach" puts something that already
+     * exists here. Each row wears its graph tile; switched-off integrations appear nowhere.
+     */
+    // The holder leads: it needs no integration and is what everything else can grow from.
+    const create: MenuItem[] = [{ label: "Holder", icon: NOTE_DOT, run: () => void createHolderAt(at, folder) }];
     if (settings.enabled("applenotes")) {
-      create.push(
-        { label: "Apple note", icon: TYPE_ICONS.applenote, run: () => void createAppleNoteAt(at, folder) },
-        { label: "Existing Apple note…", icon: TYPE_ICONS.applenote, run: () => void linkAppleNoteAt(at, folder) },
-      );
+      create.push({ label: "Apple note", icon: TYPE_ICONS.applenote, run: () => void createAppleNoteAt(at, folder) });
     }
     if (settings.enabled("notion")) {
-      create.push(
-        { label: "Notion page", icon: TYPE_ICONS.notion, run: () => void createNotionAt(at, folder) },
-        { label: "Existing Notion page…", icon: TYPE_ICONS.notion, run: () => void linkNotionAt(at, folder) },
-      );
+      create.push({ label: "Notion page", icon: TYPE_ICONS.notion, run: () => void createNotionAt(at, folder) });
+    }
+    if (settings.enabled("slack")) {
+      create.push({ label: "Slack thread", icon: TYPE_ICONS.slack, run: () => void createSlackAt(at, folder) });
     }
     if (settings.enabled("word")) {
-      create.push(
-        { label: "Word document", icon: TYPE_ICONS.word, run: () => void createWordAt(at, folder) },
-        { label: "Existing Word document…", icon: TYPE_ICONS.word, run: () => void linkWordAt(at, folder) },
-      );
+      create.push({ label: "Word document", icon: TYPE_ICONS.word, run: () => void createWordAt(at, folder) });
     }
     if (settings.enabled("freeform")) {
-      create.push(
-        { label: "Freeform board", icon: TYPE_ICONS.freeform, run: () => void createFreeformAt(at, folder) },
-        { label: "Existing Freeform board…", icon: TYPE_ICONS.freeform, run: () => void linkFreeformAt(at, folder) },
-      );
+      create.push({ label: "Freeform board", icon: TYPE_ICONS.freeform, run: () => void createFreeformAt(at, folder) });
     }
-    if (settings.enabled("gemini")) {
-      create.push({ label: "Gemini conversation", icon: TYPE_ICONS.gemini, run: () => void createGeminiAt(at, folder) });
+    if (settings.enabled("antigravity")) {
+      create.push({
+        label: "Antigravity session",
+        icon: TYPE_ICONS.antigravity,
+        run: () => void createAntigravityAt(at, folder),
+      });
     }
     if (settings.enabled("claude")) {
       create.push({ label: "Claude session", icon: TYPE_ICONS.claude, run: () => void createClaudeAt(at, folder) });
@@ -343,6 +378,10 @@ const graphView = new GraphView(ui.cy, {
     create.push({ label: "Folder", icon: BOX_ICON, run: () => graphView.startGroup() });
 
     const items: MenuItem[] = [{ label: "Create", children: create }];
+    // Nothing to drag here: the click already said where, so a picked option lands at once.
+    const attach = attachMenu((option) => () => void option.place(at, folder, null));
+    if (attach.length) items.push({ label: "Attach", children: attach });
+
     // Right-clicked inside a box: that box can be coloured, and told apart from the
     // others at a glance — which is most of what a folder is for on a canvas.
     if (folder) {
@@ -402,7 +441,7 @@ function waitedFor(docs: Doc[]): Set<string> {
 }
 
 /**
- * A path for a note the app is naming ITSELF — "Untitled", "Gemini chat", a page's host or its
+ * A path for a note the app is naming ITSELF — "Untitled", "Antigravity session", a page's host or its
  * title. Free like `uniquePath`, and free as well of the names something is already waiting for.
  *
  * A generated name is handed out again and again, and that is where connections from nowhere
@@ -1144,7 +1183,7 @@ async function copyPath(path: string, absolute: boolean): Promise<void> {
 /**
  * The repository as git last described it, or null when nothing has asked yet (no desktop
  * shell, or the vault's folder on disk is still unknown). Read from the shell rather than
- * remembered, for the same reason tmux is: it changes underneath the app constantly — every
+ * remembered, for the same reason the CLIs are: it changes underneath the app constantly — every
  * note saved is a file changed — and a page quoting a stale count is worse than a blank one.
  */
 let gitState: GitStatus | null = null;
@@ -1474,6 +1513,169 @@ function renameOnGraph(path: string): void {
   });
 }
 
+/* --------------------------------------------------------------- holders --- */
+
+/**
+ * A holder is a node and nothing more: a name on the canvas, a place in a folder, a look if
+ * it is given one — and no type, so a click opens nothing. It is what goes down when
+ * something is known to belong HERE before it is known what it is. Right-click → "Turn into"
+ * makes it any switched-on integration later, and it keeps its name, its links and its look
+ * through that. On disk it is an empty note, which is what every plain note already was.
+ */
+const HOLDER_NAME = "Holder";
+
+/**
+ * "Holder" — from the canvas menu, or from a plain link draft released on empty space
+ * (`source` is then the note the arrow came from). Made at once and named on the node, the
+ * way every other new node is; nothing else to ask, because it stands for nothing yet.
+ */
+async function createHolderAt(
+  at: { x: number; y: number },
+  folder: string | null,
+  source: string | null = null,
+): Promise<void> {
+  const dir = folder ?? "";
+  const path = freshPath(dir, HOLDER_NAME);
+  await vault.createFile(path, "");
+  entries = [...entries, { path, kind: "file" }]; // so the rename's collision check sees it
+  if (source) graphView.commitLink(source, path, { label: noteName(path), parent: dir || undefined, at });
+  else graphView.commitNode(path, noteName(path), dir || undefined, at);
+  graphStale = true;
+  ui.status.textContent = `created ${path} — name it; right-click → Turn into makes it something`;
+  graphView.renameNode(path, (name) => {
+    void (async () => {
+      const finalPath = name ? ((await applyRename(path, "file", name)) ?? path) : path;
+      if (source) await finishLink(source, finalPath, null);
+    })();
+  });
+  await refreshSidebar();
+}
+
+/** What a holder can become: any typed note the graph knows how to draw and open. */
+type HolderKind = Exclude<DraftKind, "note"> | "linear";
+
+/**
+ * The integrations a holder can be turned into — the switched-on ones, in the order the
+ * canvas menu offers them, each wearing its graph tile so the row looks like the node will.
+ */
+function turnIntoMenu(path: string): MenuItem[] {
+  const rows: Array<[Feature, HolderKind, string]> = [
+    ["applenotes", "applenote", "Apple note"],
+    ["notion", "notion", "Notion page"],
+    ["slack", "slack", "Slack thread"],
+    ["word", "word", "Word document"],
+    ["freeform", "freeform", "Freeform board"],
+    ["antigravity", "antigravity", "Antigravity session"],
+    ["claude", "claude", "Claude session"],
+    ["linear", "linear", "Linear issue"],
+    ["web", "web", "Webpage…"],
+    ["files", "file", "File on disk…"],
+    ["files", "folder", "Folder on disk…"],
+  ];
+  return rows
+    .filter(([feature]) => settings.enabled(feature))
+    .map(([, kind, label]) => ({
+      label,
+      icon: TYPE_ICONS[kind],
+      run: () => void turnHolderInto(path, kind, label.replace(/…$/, "")),
+    }));
+}
+
+/**
+ * Right-click → "Turn into → X": the holder becomes an X note, and then what "Create → X"
+ * does once a new note has its name happens to it — the page, board, note or document is
+ * made under the holder's name; the session opens; the checklist unfolds. Two things are
+ * settled BEFORE anything is written, so a change of mind leaves the holder exactly as it
+ * was: whatever the integration needs to exist (the app, the shortcut, the sign-in), and
+ * the one question a pointer type asks (an address, a pick in the OS dialog).
+ */
+async function turnHolderInto(path: string, kind: HolderKind, label: string): Promise<void> {
+  const ready =
+    kind === "applenote"
+      ? await appleNotesReady()
+      : kind === "notion"
+        ? await notionReady()
+        : kind === "slack"
+          ? await slackReady()
+          : kind === "word"
+            ? await wordReady()
+            : kind === "freeform"
+              ? await freeformReady()
+              : kind === "antigravity"
+                ? await antigravityReady()
+                : true;
+  if (!ready) return;
+
+  let pointer: string | null = null;
+  if (kind === "web") {
+    const typed = await askText("Paste the webpage's address", "", "Turn into");
+    if (typed === null) return; // dismissed — still a holder
+    pointer = readUrl(typed);
+    if (!pointer) {
+      ui.status.textContent = `${typed} is not a web address`;
+      return;
+    }
+  } else if (kind === "file" || kind === "folder") {
+    const bridge = window.bedrock;
+    if (!bridge) {
+      ui.status.textContent = "File and folder links need the desktop app — npm start";
+      return;
+    }
+    pointer = await bridge.pickPath(kind);
+    if (!pointer) return; // the picker was dismissed — still a holder
+  }
+
+  await flushAll(); // the note may be open and mid-edit — don't write behind its own buffer
+  const text = await vault.read(path);
+  const already = parseType(text);
+  if (already) {
+    ui.status.textContent = `${noteName(path)} is already a ${already} note`;
+    return;
+  }
+  let next = setField(text, "type", kind);
+  if (kind === "web" && pointer) next = setField(next, "url", pointer);
+  if ((kind === "file" || kind === "folder") && pointer) next = setField(next, "path", pointer);
+  // A session runs where the vault says its sessions run, when it has said; the note asks
+  // otherwise, on its first opening, exactly as a session made from "Create" would.
+  const runIn =
+    kind === "claude" ? settings.claudeFolder() : kind === "antigravity" ? settings.antigravityFolder() : null;
+  if (runIn) next = setField(next, "folder", runIn);
+  // An issue is a checklist, so a holder with no rows gets the one an issue is born with.
+  if (kind === "linear" && !/^\s*- \[[ xX]\]/m.test(next)) next = `- [ ] \n\n${next}`;
+  if (!(await tryVault(`could not turn ${noteName(path)} into a ${label}`, () => vault.write(path, next)))) return;
+  syncOpenPanes(path, next);
+  graphView.setNodeType(path, kind, pointer ?? undefined);
+  if (kind === "linear") graphView.setIssueRaw(path, next);
+  graphStale = true;
+
+  switch (kind) {
+    case "applenote":
+      return makeAppleNote(path);
+    case "notion":
+      return makeNotionPage(path);
+    case "slack":
+      return makeSlackThread(path);
+    case "word":
+      return makeWordDoc(path);
+    case "freeform":
+      return makeFreeformBoard(path);
+    case "claude":
+      return openClaudeSession(path, null);
+    case "antigravity":
+      return openAntigravitySession(path, null);
+    case "linear":
+      graphView.toggleIssue(path, true); // its first line opens offering an arrow
+      ui.status.textContent = `${noteName(path)} → a Linear issue; its checklist is open`;
+      return;
+    case "web":
+      if (pointer) void fetchWebPage(pointer); // the site's face goes on when it answers
+      ui.status.textContent = `${noteName(path)} → ${pointer}`;
+      return;
+    default:
+      ui.status.textContent = `${noteName(path)} → ${pointer}`;
+  }
+}
+
 /* ---------------------------------------------------------------- linear --- */
 
 /**
@@ -1554,12 +1756,10 @@ async function setUpLinear(): Promise<void> {
  * What each integration's folded page says about itself.
  *
  * Worth being blunt about, because the four are not the same kind of thing at all. Only
- * Linear holds a credential of its own. Claude and git hold NONE — they run through
- * software already on this machine and already signed in, so their pages have nothing to
- * connect and say so. Gemini is the odd one: Google will not let an app borrow the
- * browser's login (Chrome's cookies are encrypted per user through the OS keychain), so
- * the choice is a sign-in inside this app's own window, or your real browser and a paste.
- * That choice is the page.
+ * Linear holds a credential of its own. Claude, Antigravity and git hold NONE — they run
+ * through software already on this machine and already signed in, so their pages have
+ * nothing to connect and say so. What those pages are for instead is saying WHERE the
+ * work runs, and being honest about which of it Bedrock is not part of.
  */
 function integrationPage(feature: Feature): SetupPage | null {
   const bridge = window.bedrock;
@@ -1620,6 +1820,58 @@ function integrationPage(feature: Feature): SetupPage | null {
       };
     }
 
+    case "slack": {
+      if (!bridge) {
+        return {
+          status: "desktop app only",
+          lines: [
+            {
+              label: "Why",
+              value: "the API needs a token, and a browser tab has neither a keychain to hold one nor a way past Slack's CORS.",
+            },
+          ],
+        };
+      }
+      if (!slackState?.connected) {
+        return {
+          status: "not connected",
+          lines: [
+            {
+              label: "Token",
+              value: "not connected — no thread can be started or attached",
+              action: { id: "connect", label: "Connect…" },
+            },
+            {
+              label: "Where to get one",
+              value:
+                "api.slack.com/apps → Create New App → OAuth & Permissions. Under USER Token Scopes add chat:write, channels:history and channels:read (plus groups:history and groups:read for private channels), Install to Workspace, and copy the User OAuth Token (xoxp-…). Posts made with it are yours — your name, your face, no app in the channel. A bot token (xoxb-…) works too, and posts as the app.",
+            },
+          ],
+        };
+      }
+      return {
+        status: setup.slackChannelName || "connected",
+        ready: !!setup.slackChannel,
+        lines: [
+          {
+            label: "Workspace",
+            value: `${slackState.team || "connected"}${slackState.user ? ` — posting as ${slackState.user}` : ""}${slackState.bot ? " (the app, not you — a user token would post as you)" : ""}`,
+            action: { id: "connect", label: "Disconnect" },
+          },
+          {
+            label: "Channel",
+            value: setup.slackChannelName || "not chosen — threads have nowhere to start, and nothing to attach from",
+            action: { id: "channel", label: setup.slackChannel ? "Change…" : "Choose…" },
+          },
+          {
+            label: "What is posted",
+            value:
+              "a new thread note's name, as the first message of a thread in that channel — and nothing else, ever. Attaching a thread that is already going posts nothing: the note takes the head of its first message for a name.",
+          },
+        ],
+      };
+    }
+
     case "claude": {
       if (!bridge) return { status: "desktop app only", lines: [{ label: "Why", value: "sessions open through the Claude app, which a browser tab cannot reach — npm start" }] };
       const folder = settings.claudeFolder();
@@ -1649,15 +1901,14 @@ function integrationPage(feature: Feature): SetupPage | null {
       if (inTerminal) {
         lines.push(
           {
-            label: "tmux",
-            value: tmuxPath
-              ? `${tmuxPath} — sessions run under it, so they outlive this app`
-              : "not installed. Sessions run under tmux so they keep working when Bedrock is shut; without it there is nothing to hand a session to.",
-            ...(tmuxPath ? {} : { action: { id: "install-tmux", label: "Install tmux" } }),
+            label: "The CLI",
+            value: claudeCli
+              ? `${claudeCli} — sessions run in your own terminal, not in a window here`
+              : "not installed. Sessions are run by Claude Code's own CLI, so it has to be here: see claude.com/product/claude-code.",
           },
           {
             label: "How it behaves",
-            value: "closing a session window detaches from it — the agent carries on, and reopening the node picks the terminal back up mid-turn. Quitting Bedrock changes nothing.",
+            value: "the node opens the session in whichever terminal owns .command files — Terminal, iTerm or Ghostty. The session is not Bedrock's process, so quitting Bedrock does nothing to it.",
           },
           {
             label: "In the Claude app",
@@ -1683,77 +1934,78 @@ function integrationPage(feature: Feature): SetupPage | null {
         });
       }
       const status = inTerminal
-        ? tmuxPath
-          ? "terminal"
-          : "tmux needed"
+        ? claudeCli
+          ? "your terminal"
+          : "claude CLI needed"
         : folder
           ? basename(folder) || folder
           : "asks each time";
-      return { status, ready: !inTerminal || !!tmuxPath, lines };
+      return { status, ready: !inTerminal || !!claudeCli, lines };
     }
 
-    case "gemini": {
+    case "antigravity": {
       if (!bridge) {
         return {
-          status: "browser only",
+          status: "desktop app only",
           lines: [
             {
-              label: "Where",
-              value: "a new tab, signed in as whoever you are there. Copy the conversation's URL in Gemini and it lands in the note when you come back.",
+              label: "Why",
+              value: "sessions run the `agy` CLI in your own terminal, and a browser tab can start neither — npm start",
             },
           ],
         };
       }
-      const own = setup.geminiWindow === "app";
+      const folder = settings.antigravityFolder();
+      if (!agyCli) {
+        return {
+          status: "agy not installed",
+          lines: [
+            {
+              label: "The CLI",
+              value: agyRan
+                ? "not on the path Bedrock can see. It has run on this machine before, so it is probably installed somewhere a login shell finds and this app does not — check `which agy`."
+                : "not installed. Sessions are run by Antigravity's own CLI, so it has to be here: see antigravity.google/docs/cli.",
+            },
+            {
+              label: "Why a CLI",
+              value: "so the agent is genuinely outside Bedrock — it keeps working when this app is shut, and its login is its own",
+            },
+          ],
+        };
+      }
       const lines: SetupLine[] = [
         {
-          label: "Open chats in",
-          value: "",
-          choices: [
-            { id: "window-app", label: "Bedrock's window", on: own },
-            { id: "window-browser", label: "Your browser", on: !own },
-          ],
+          label: "The CLI",
+          value: `${agyCli} — sessions run in your own terminal, not in a window here`,
+        },
+        {
+          label: "Sign-in",
+          value:
+            "the CLI's own, held in this machine's keychain. Bedrock never reads it and has no sign-in of its own to offer: a session that needs a login asks for one in the terminal, where it can be answered.",
+        },
+        {
+          label: "How it behaves",
+          value:
+            "the node mints a conversation, writes its id into the note, and opens it in whichever terminal owns .command files — Terminal, iTerm or Ghostty. Closing that window is between you and the CLI; Bedrock is not involved either way.",
+        },
+        {
+          label: "Reopening a node",
+          value: "resumes THAT conversation by id, with its history — never a new one, and never a guess at which",
+        },
+        {
+          label: "Default folder",
+          value: folder || "not set — every new session note asks where to run",
+          action: { id: "folder", label: folder ? "Change…" : "Choose…" },
         },
       ];
-      if (own) {
-        lines.push(
-          {
-            label: "Google account",
-            value: geminiSignedIn
-              ? "signed in — the cookies live in Bedrock's own session and survive restarts"
-              : "not signed in. Chrome's login cannot be borrowed — its cookies are encrypted per user by the OS — so this session needs its own, once.",
-            action: geminiSignedIn
-              ? { id: "signout", label: "Sign out" }
-              : { id: "signin", label: "Sign in…" },
-          },
-          {
-            label: "Conversation links",
-            value: "saved into the note by themselves — the window watches for the URL Google mints on your first message",
-          },
-        );
-        if (!geminiSignedIn) {
-          lines.push({
-            label: "Until then",
-            value: "Gemini nodes are refused rather than opened — a chat window showing a login is not a conversation",
-          });
-        }
-      } else {
-        lines.push(
-          {
-            label: "Google account",
-            value: "whoever you are signed in as in your browser — nothing to set up here",
-          },
-          {
-            label: "Conversation links",
-            value: "copy the URL in Gemini; it lands in the note the moment you come back to Bedrock",
-          },
-        );
+      if (folder) {
+        lines.push({
+          label: "",
+          value: "go back to asking for each new session",
+          action: { id: "forget", label: "Forget it" },
+        });
       }
-      return {
-        status: own ? (geminiSignedIn ? "signed in" : "sign-in needed") : "your browser",
-        ready: !own || geminiSignedIn,
-        lines,
-      };
+      return { status: folder ? basename(folder) || folder : "asks each time", ready: true, lines };
     }
 
     /*
@@ -2100,12 +2352,12 @@ function runIntegrationAction(feature: Feature, action: string): void {
   else if (feature === "claude" && action === "folder") void setUpClaudeFolder();
   else if (feature === "claude" && action === "forget") forgetClaudeFolder();
   else if (feature === "claude" && action.startsWith("run-")) setClaudeWindow(action.slice(4));
-  else if (feature === "claude" && action === "install-tmux") void installTmux();
-  else if (feature === "gemini" && action.startsWith("window-")) setGeminiWindow(action.slice(7));
-  else if (feature === "gemini" && action === "signin") void signIntoGemini();
-  else if (feature === "gemini" && action === "signout") void signOutOfGemini();
+  else if (feature === "antigravity" && action === "folder") void setUpAntigravityFolder();
+  else if (feature === "antigravity" && action === "forget") forgetAntigravityFolder();
   else if (feature === "freeform" && action === "install") void installFreeformShortcut();
   else if (feature === "freeform" && action === "test") void testFreeform();
+  else if (feature === "slack" && action === "connect") void setUpSlack();
+  else if (feature === "slack" && action === "channel") void pickSlackChannel();
   else if (feature === "notion" && action === "connect") void connectNotion();
   else if (feature === "notion" && action === "unlink") void unlinkNotion();
   else if (feature === "applenotes" && action === "test") void testAppleNotes();
@@ -2119,6 +2371,58 @@ function runIntegrationAction(feature: Feature, action: string): void {
   else if (feature === "git" && action === "remote") void setGitRemote();
   else if (feature === "git" && action === "push") void pushVault();
   else if (feature === "git" && action === "pull") void pullVault();
+}
+
+/* ------------------------------------------------- antigravity's own page --- */
+
+/**
+ * Where `agy` is, and whether it has ever run here. Read from the shell rather than
+ * remembered: it can be installed while the app is running, and "installed" is the only
+ * prerequisite this integration has — there is no sign-in for Bedrock to track, because
+ * the CLI's login is the CLI's and is asked for in the terminal.
+ */
+let agyCli: string | null = null;
+let agyRan = false;
+
+async function refreshAntigravity(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  const status = await bridge.agyStatus().catch(() => null);
+  agyCli = status?.cli ?? null;
+  agyRan = status?.ran ?? false;
+  redrawSettings();
+}
+
+/**
+ * Where a new Antigravity session runs — asked, and then remembered per vault, exactly as
+ * the Claude folder is. The two are asked separately because they are usually different
+ * answers: the folder a vault's coding sessions run in is rarely the folder its agent
+ * sessions are wanted in.
+ */
+async function askAntigravityFolder(first?: string | null): Promise<string | null> {
+  const root = knownVaultRoot();
+  const choices = [...new Set([...(first ? [first] : []), ...(root ? [root] : [])])];
+  const question = "Which folder should this session run in?";
+  if (!choices.length) return askText(question, first ?? "~/", "Use this");
+  return askChoice(question, choices, "Another folder…", question, first ?? undefined);
+}
+
+async function setUpAntigravityFolder(): Promise<void> {
+  if (!window.bedrock) {
+    ui.status.textContent = "Antigravity sessions need the desktop app — npm start";
+    return;
+  }
+  const chosen = await askAntigravityFolder(settings.antigravityFolder());
+  if (!chosen) return;
+  settings.setSetup({ antigravityFolder: chosen });
+  ui.status.textContent = `Antigravity: new sessions run in ${chosen}`;
+  redrawSettings();
+}
+
+function forgetAntigravityFolder(): void {
+  settings.setSetup({ antigravityFolder: "" });
+  ui.status.textContent = "Antigravity: new sessions will ask where to run";
+  redrawSettings();
 }
 
 /* ------------------------------------------------------ claude's own page --- */
@@ -2147,26 +2451,26 @@ function forgetClaudeFolder(): void {
 }
 
 /**
- * Where tmux is, or null — the whole terminal mode hangs off this, the way Gemini's hangs
- * off a cookie. Read from the shell rather than remembered, because it can be installed
- * (from this very page) while the app is running.
+ * Where the `claude` CLI is, or null — the whole terminal mode hangs off this, the way
+ * Antigravity's hangs off `agy`. Read from the shell rather than remembered, because it
+ * can be installed while the app is running.
  */
-let tmuxPath: string | null = null;
+let claudeCli: string | null = null;
 
 /**
- * And who the CLI would run as. Read alongside tmux because it is the same kind of fact —
+ * And who the CLI would run as. Read alongside it because it is the same kind of fact —
  * something true of this machine that the mode depends on and nothing else would tell you.
  */
 let claudeAccount: { email: string; org: string; seat: string } | null = null;
 
-async function refreshTmux(): Promise<void> {
+async function refreshClaudeCli(): Promise<void> {
   const bridge = window.bedrock;
   if (!bridge) return;
   const [status, account] = await Promise.all([
-    bridge.termStatus().catch(() => null),
+    bridge.claudeCliStatus().catch(() => null),
     bridge.claudeAccount().catch(() => null),
   ]);
-  tmuxPath = status?.tmux ?? null;
+  claudeCli = status?.cli ?? null;
   claudeAccount = account;
   redrawSettings();
 }
@@ -2175,40 +2479,25 @@ function setClaudeWindow(where: string): void {
   const terminal = where === "terminal";
   settings.setSetup({ claudeWindow: terminal ? "terminal" : "app" });
   redrawSettings();
-  if (terminal) void refreshTmux(); // choosing it is when its prerequisite starts mattering
-}
-
-/** The button that gets tmux, so nobody has to be told to open a terminal to get one. */
-async function installTmux(): Promise<void> {
-  const bridge = window.bedrock;
-  if (!bridge) return;
-  ui.status.textContent = "tmux: installing with Homebrew — this takes a moment…";
-  try {
-    const { tmux } = await bridge.termInstall();
-    tmuxPath = tmux;
-    ui.status.textContent = `tmux: installed at ${tmux} — terminal sessions are ready`;
-  } catch (err) {
-    ui.status.textContent = `tmux: ${(err as Error).message}`;
-  }
-  redrawSettings();
+  if (terminal) void refreshClaudeCli(); // choosing it is when its prerequisite starts mattering
 }
 
 /**
- * Whether a terminal session may be opened. Asked of the shell each time, so installing
- * tmux takes effect without a restart — and refused rather than half-done, because a
- * session note whose terminal cannot open is worse than no note at all.
+ * Whether a terminal session may be opened. Asked of the shell each time, so installing the
+ * CLI takes effect without a restart — and refused rather than half-done, because a session
+ * note whose terminal cannot open is worse than no note at all.
  */
 async function terminalReady(): Promise<boolean> {
   const bridge = window.bedrock;
   if (!bridge) return false;
-  const status = await bridge.termStatus().catch(() => null);
-  tmuxPath = status?.tmux ?? null;
-  if (!tmuxPath) {
+  const status = await bridge.claudeCliStatus().catch(() => null);
+  claudeCli = status?.cli ?? null;
+  if (!claudeCli) {
     ui.status.textContent =
-      "Claude: terminal sessions need tmux — Settings → Integrations → Claude Code → Install tmux";
+      "Claude: terminal sessions need the claude CLI — claude.com/product/claude-code";
     redrawSettings();
   }
-  return !!tmuxPath;
+  return !!claudeCli;
 }
 
 /* ---------------------------------------------------- freeform's own page --- */
@@ -2518,68 +2807,6 @@ async function wordReady(): Promise<boolean> {
   return true;
 }
 
-/* ------------------------------------------------------ gemini's own page --- */
-
-/** Whether the chat window's Google session is signed in; null until the shell says. */
-let geminiSignedIn = false;
-
-/** Asks the shell, then redraws whatever is reporting it. */
-async function refreshGeminiStatus(): Promise<void> {
-  const status = await window.bedrock?.geminiStatus().catch(() => ({ signedIn: false }));
-  geminiSignedIn = status?.signedIn ?? false;
-  redrawSettings();
-}
-
-function setGeminiWindow(where: string): void {
-  settings.setSetup({ geminiWindow: where === "browser" ? "browser" : "app" });
-  redrawSettings();
-  // Switching to Bedrock's window is the moment its sign-in starts mattering.
-  if (where !== "browser") void refreshGeminiStatus();
-}
-
-/** The one door into Google: a window that signs in and then gets out of the way. */
-async function signIntoGemini(): Promise<void> {
-  const bridge = window.bedrock;
-  if (!bridge) return;
-  ui.status.textContent = "Gemini: signing in — finish in the window that opened";
-  const { signedIn } = await bridge.geminiSignIn().catch(() => ({ signedIn: false }));
-  geminiSignedIn = signedIn;
-  ui.status.textContent = signedIn
-    ? "Gemini: signed in — conversation nodes work from here on"
-    : "Gemini: not signed in — the window closed before the login took";
-  redrawSettings();
-}
-
-/**
- * Whether a Gemini action may go ahead, asked of the shell rather than of the flag, so the
- * answer is never one sign-in out of date.
- *
- * Only Bedrock's own window has anything to be signed into. In browser mode the login is
- * your browser's business and there is nothing here to check; in a plain tab there is no
- * session at all. So the gate is exactly as narrow as the thing it guards.
- */
-async function geminiReady(): Promise<boolean> {
-  const bridge = window.bedrock;
-  if (!bridge || settings.setup().geminiWindow !== "app") return true;
-  const { signedIn } = await bridge.geminiStatus().catch(() => ({ signedIn: false }));
-  geminiSignedIn = signedIn;
-  if (!signedIn) {
-    ui.status.textContent =
-      "Gemini: sign in first — Settings → Integrations → Gemini → Sign in, or switch it to your browser";
-    redrawSettings();
-  }
-  return signedIn;
-}
-
-async function signOutOfGemini(): Promise<void> {
-  if (!(await askConfirm("Sign out of Google in Bedrock's chat window? Notes keep their conversation links.", "Sign out"))) {
-    return;
-  }
-  await window.bedrock?.geminiForget().catch(() => false);
-  ui.status.textContent = "Gemini: signed out — the next chat opens Google's sign-in";
-  await refreshGeminiStatus();
-}
-
 /* ------------------------------------------------------ linear's own page --- */
 
 /**
@@ -2821,198 +3048,6 @@ function writeStyle(path: string, style: NodeStyle): void {
   });
 }
 
-/* ---------------------------------------------------------------- gemini --- */
-
-const GEMINI_URL = "https://gemini.google.com/app";
-
-/**
- * What a conversation note holds: the link its node opens, and its type on the last
- * line — `type:: gemini` is the whole notion of a typed note, written in markdown.
- * Google mints the conversation's own URL once you start chatting; paste it over
- * the generic one and the node points at that exact chat from then on.
- */
-const geminiTemplate = (name: string): string => `# ${name}\n\n${GEMINI_URL}\n\ntype:: gemini\n`;
-
-/**
- * Opens a chat and, when the note has no conversation of its own yet, arranges for
- * the minted URL to come back on its own. The desktop shell opens the chat in a
- * window it WATCHES: the moment Google assigns gemini.google.com/app/<id>, the link
- * is handed back and saved — no gesture at all. A plain browser cannot watch another
- * tab, so there the clipboard catch below stays the way home. Returns the status line.
- */
-function openGeminiChat(path: string, target: string): string {
-  const generic = target === GEMINI_URL; // no conversation of its own yet
-  if (generic) armGeminiCapture(path); // follows renames; doubles as the fallback
-  // Settings → Integrations → Gemini: the app's own window watches for the link and
-  // needs its own Google sign-in; the browser needs none and hands the link back by
-  // clipboard. Both are complete ways to work, which is why it is a choice.
-  if (window.bedrock?.geminiChat && settings.setup().geminiWindow === "app") {
-    void window.bedrock.geminiChat(target).then((convo) => {
-      if (convo && generic) void adoptGeminiLink(convo);
-    });
-    return generic
-      ? `${noteName(path)} — chat opened; the link saves itself once the conversation starts`
-      : `${noteName(path)} → ${target}`;
-  }
-  const opened = window.open(target, "_blank", "noopener");
-  if (!opened) return `the browser blocked the popup — ${target}`;
-  return generic
-    ? `${noteName(path)} — copy the conversation's URL in Gemini; it lands in the note when you come back`
-    : `${noteName(path)} → ${target}`;
-}
-
-/**
- * Click on a Gemini node: it is a link, not a page. Editing stays in the tree.
- *
- * The sign-in is checked first, and a node whose session has none is refused rather than
- * opened onto a login form — which is the same call `createGeminiAt` makes, for the same
- * reason. In browser mode there is nothing to check and the click goes straight through.
- */
-function openGeminiNode(path: string, url: string | null): void {
-  const say = (message: string): void => {
-    // One tick later: a click is also a grab+free to cytoscape, and the free handler
-    // clears the hint right after this — the message has to land after that reset.
-    window.setTimeout(() => {
-      ui.status.textContent = message;
-    }, 0);
-  };
-  // Straight through where nothing has to be asked, so the popup blocker still sees the
-  // click that opened the chat as the gesture it was.
-  if (!window.bedrock || settings.setup().geminiWindow !== "app") {
-    say(openGeminiChat(path, url || GEMINI_URL));
-    return;
-  }
-  void geminiReady().then((ready) => {
-    if (ready) say(openGeminiChat(path, url || GEMINI_URL));
-  });
-}
-
-/* ------------------------------------------------------- catching the link --- */
-/*
- * Google mints a conversation's URL (gemini.google.com/app/<id>) only after the
- * first message, and no API hands it out — so the app catches it instead. Opening
- * a chat ARMS a capture for that note; the first gemini conversation URL copied
- * AFTER that moment is written into the note the instant this window is focused
- * again. One ⌘L ⌘C in the browser is the whole ceremony.
- */
-
-const GEMINI_CONVO_RE = /^https:\/\/gemini\.google\.com\/(?:app|share)\/[\w-]+/;
-
-/** The gemini note waiting for its conversation link, if any. */
-let geminiCapture: string | null = null;
-/** What the clipboard held when the capture was armed — only NEW copies count. */
-let clipboardBefore = "";
-
-function armGeminiCapture(path: string): void {
-  geminiCapture = path;
-  navigator.clipboard.readText().then(
-    (text) => (clipboardBefore = text.trim()),
-    () => {}, // no clipboard permission — an old link may be matched, nothing worse
-  );
-}
-
-/**
- * Writes a caught conversation URL into the note that is waiting for one — reading
- * `geminiCapture` at write time rather than closing over a path, so a note renamed
- * mid-chat still receives its link.
- */
-async function adoptGeminiLink(url: string): Promise<void> {
-  const path = geminiCapture;
-  if (!path) return;
-  if (!(await vault.exists(path))) {
-    geminiCapture = null; // the note went away while they were chatting
-    return;
-  }
-  const text = await vault.read(path);
-  if (!text.includes(url)) {
-    // Swap the note's current link (the generic /app one) for the real conversation;
-    // a note somebody stripped the link from gets it appended instead.
-    const held = /https?:\/\/[^\s)\]>]+/.exec(text)?.[0];
-    const next = held ? text.replace(held, url) : `${text.replace(/\n*$/, "")}\n\n${url}\n`;
-    await vault.write(path, next);
-    graphView.setGeminiUrl(path, url);
-    graphStale = true;
-    for (let i = 0; i < panes.length; i++) if (pathOf(panes[i]) === path) await renderPage(i);
-    ui.status.textContent = `${noteName(path)} now opens its own conversation`;
-  }
-  geminiCapture = null;
-}
-
-async function catchGeminiLink(): Promise<void> {
-  if (!geminiCapture) return;
-  let copied = "";
-  try {
-    copied = (await navigator.clipboard.readText()).trim();
-  } catch {
-    return; // no clipboard permission — the feature just stays quiet
-  }
-  if (copied === clipboardBefore) return; // still whatever was there before the chat
-  const url = GEMINI_CONVO_RE.exec(copied)?.[0];
-  if (url) await adoptGeminiLink(url);
-}
-
-window.addEventListener("focus", () => void catchGeminiLink());
-
-/**
- * "New Gemini conversation" — from the canvas menu, or from a link draft released on
- * empty space (`source` is then the note the arrow came from). The chat is NOT opened
- * yet: first the conversation gets its name, and committing the name is what sends
- * you to Gemini.
- */
-async function createGeminiAt(
-  at: { x: number; y: number },
-  folder: string | null,
-  source: string | null = null,
-): Promise<void> {
-  // Refused before anything is written: a conversation note whose chat cannot open is a
-  // file to clean up later, and the sign-in is one button away in Settings.
-  if (!(await geminiReady())) return;
-  const dir = folder ?? "";
-  const path = freshPath(dir, "Gemini chat");
-  await vault.createFile(path, geminiTemplate(noteName(path)));
-  entries = [...entries, { path, kind: "file" }]; // so the rename's collision check sees it
-  if (source) {
-    graphView.commitLink(source, path, {
-      label: noteName(path),
-      parent: dir || undefined,
-      at,
-      type: "gemini",
-      url: GEMINI_URL,
-    });
-  } else {
-    graphView.commitNode(path, noteName(path), dir || undefined, at, "gemini", GEMINI_URL);
-  }
-  graphStale = true;
-  ui.status.textContent = `created ${path} — name the conversation, and the chat opens`;
-  graphView.renameNode(path, (name) => {
-    // Standalone conversation: committing the name is the user gesture the popup
-    // blocker honours, so the chat opens HERE, synchronously; the rename's own
-    // async work follows behind and the capture follows the rename.
-    if (!source) {
-      const message = openGeminiChat(path, GEMINI_URL);
-      window.setTimeout(() => {
-        ui.status.textContent = message;
-      }, 0);
-    }
-    void (async () => {
-      const finalPath = name ? ((await applyRename(path, "file", name)) ?? path) : path;
-      if (geminiCapture === path) geminiCapture = finalPath;
-      if (!source) return;
-      // Linked conversation: the connection gets its name too, exactly like drawing
-      // any link — and only THEN does Gemini open. All the naming happens at home;
-      // committing the label is itself a gesture, so the popup ban stays satisfied.
-      graphView.promptConnection(source, finalPath, (label) => {
-        const message = openGeminiChat(finalPath, GEMINI_URL);
-        window.setTimeout(() => {
-          ui.status.textContent = message;
-        }, 0);
-        void finishLink(source, finalPath, label);
-      });
-    })();
-  });
-  await refreshSidebar();
-}
-
 /* ----------------------------------------------------------------- files --- */
 
 /**
@@ -3059,9 +3094,9 @@ async function createFsAt(
       type: kind,
       fspath: target,
     });
-    // The connection can be named like any drawn link. The note itself is not renamed
-    // here: its name came off the disk, which is the whole point of it.
-    graphView.promptConnection(source, path, (label) => void finishLink(source, path, label));
+    // The note itself is not renamed here: its name came off the disk, which is the whole
+    // point of it. The connection is unnamed, as every drawn link is — a click names it.
+    void finishLink(source, path, null);
   } else {
     graphView.commitNode(path, noteName(path), dir || undefined, at, kind, undefined, target);
   }
@@ -3208,13 +3243,11 @@ async function createWebAt(
   graphStale = true;
   ui.status.textContent = `${noteName(path)} → ${url}`;
   await refreshSidebar();
-  // The site is asked BEFORE the connection is named, because its answer can rename the
+  // The site is asked BEFORE the link is written, because its answer can rename the
   // note — and a link written against the name it had a moment ago points at nothing.
   // Same order as naming a new note by hand: the note settles, then the line does.
   const settled = await adoptWebPage(path, url, noteName(path));
-  if (source) {
-    graphView.promptConnection(source, settled, (label) => void finishLink(source, settled, label));
-  }
+  if (source) await finishLink(source, settled, null);
 }
 
 /**
@@ -3444,69 +3477,14 @@ async function createFreeformAt(
         await makeFreeformBoard(finalPath);
         return;
       }
-      // Linked board: the connection gets its name FIRST. Making the board opens
-      // Freeform over everything, and a window grabbing focus mid-word is how a label
-      // gets lost — all the naming happens at home, then the board is made.
-      graphView.promptConnection(source, finalPath, (label) => {
-        void (async () => {
-          await finishLink(source, finalPath, label);
-          await makeFreeformBoard(finalPath);
-        })();
-      });
+      // Linked board: the link is written home first, unnamed — a click on the line
+      // names it — and then the board is made.
+      await finishLink(source, finalPath, null);
+      await makeFreeformBoard(finalPath);
     })();
   });
 }
 
-/**
- * "Link a Freeform board…" — the boards already in Freeform, latest edit first, and the
- * one picked becomes a node named after it. Boards can share a title over there, so the
- * list numbers the doubles rather than guessing which one was meant.
- */
-async function linkFreeformAt(
-  at: { x: number; y: number },
-  folder: string | null,
-  source: string | null = null,
-): Promise<void> {
-  if (!(await freeformReady())) return;
-  const bridge = window.bedrock;
-  if (!bridge) return;
-  ui.status.textContent = "Freeform: reading your boards…";
-  const boards = await bridge.freeformBoards(30).catch(() => []);
-  if (!boards.length) {
-    ui.status.textContent = "Freeform: no boards to link — make one first";
-    return;
-  }
-  const byLabel = new Map<string, FreeformBoard>();
-  for (const board of boards) {
-    const title = board.title || "Untitled";
-    let label = title;
-    for (let n = 2; byLabel.has(label); n++) label = `${title} (${n})`;
-    byLabel.set(label, board);
-  }
-  const picked = await askChoice("Which board should the note point at?", [...byLabel.keys()], "Cancel");
-  if (picked === null) return;
-  const board = byLabel.get(picked);
-  if (!board) return;
-  const dir = folder ?? "";
-  const path = uniquePath(filePaths(), dir, asFileName(board.title || "Untitled"), ".md");
-  await vault.createFile(path, freeformTemplate(board.id));
-  entries = [...entries, { path, kind: "file" }];
-  if (source) {
-    graphView.commitLink(source, path, {
-      label: noteName(path),
-      parent: dir || undefined,
-      at,
-      type: "freeform",
-      url: board.id,
-    });
-    graphView.promptConnection(source, path, (label) => void finishLink(source, path, label));
-  } else {
-    graphView.commitNode(path, noteName(path), dir || undefined, at, "freeform", board.id);
-  }
-  graphStale = true;
-  ui.status.textContent = `${noteName(path)} → its board in Freeform`;
-  await refreshSidebar();
-}
 
 /* ---------------------------------------------------------------- notion --- */
 
@@ -3604,24 +3582,20 @@ async function createNotionAt(
         await makeNotionPage(finalPath);
         return;
       }
-      // Linked page: the connection gets its name FIRST — making the page opens Notion
-      // over everything, and a window grabbing focus mid-word is how a label gets lost.
-      graphView.promptConnection(source, finalPath, (label) => {
-        void (async () => {
-          await finishLink(source, finalPath, label);
-          await makeNotionPage(finalPath);
-        })();
-      });
+      // Linked page: the link is written home first, unnamed — a click on the line
+      // names it — and then the page is made.
+      await finishLink(source, finalPath, null);
+      await makeNotionPage(finalPath);
     })();
   });
 }
 
+
 /**
- * "Link a Notion page…" — asks what to look for (nothing lists what is recent), offers
- * what the workspace answered, and the one picked becomes a node named after it. Pages
- * can share a title over there, so the list numbers the doubles rather than guessing.
+ * "Search Notion…" — the row under the recent pages. A workspace is bigger than any menu,
+ * so the one attachable whose list can never be complete keeps a way to ask for the rest.
  */
-async function linkNotionAt(
+async function searchNotionAt(
   at: { x: number; y: number },
   folder: string | null,
   source: string | null = null,
@@ -3643,6 +3617,8 @@ async function linkNotionAt(
     ui.status.textContent = "Notion: nothing found to link";
     return;
   }
+  // Titles repeat over there, so the doubles are numbered rather than guessed between —
+  // a modal picks by label, unlike the menu, where each row carries its own answer.
   const byLabel = new Map<string, NotionPage>();
   for (const page of pages) {
     const title = page.title || "Untitled";
@@ -3654,25 +3630,18 @@ async function linkNotionAt(
   if (picked === null) return;
   const page = byLabel.get(picked);
   if (!page) return;
-  const dir = folder ?? "";
-  const path = uniquePath(filePaths(), dir, asFileName(page.title || "Untitled"), ".md");
-  await vault.createFile(path, notionTemplate(page.url));
-  entries = [...entries, { path, kind: "file" }];
-  if (source) {
-    graphView.commitLink(source, path, {
-      label: noteName(path),
-      parent: dir || undefined,
-      at,
-      type: "notion",
-      url: page.url,
-    });
-    graphView.promptConnection(source, path, (label) => void finishLink(source, path, label));
-  } else {
-    graphView.commitNode(path, noteName(path), dir || undefined, at, "notion", page.url);
-  }
-  graphStale = true;
-  ui.status.textContent = `${noteName(path)} → its page in Notion`;
-  await refreshSidebar();
+  await attachNodeAt(
+    {
+      kind: "notion",
+      title: page.title,
+      text: notionTemplate(page.url),
+      handle: page.url,
+      done: `${page.title || "Untitled"} → its page in Notion`,
+    },
+    at,
+    folder,
+    source,
+  );
 }
 
 /* ----------------------------------------------------------- apple notes --- */
@@ -3766,74 +3735,14 @@ async function createAppleNoteAt(
         await makeAppleNote(finalPath);
         return;
       }
-      // Linked note: the connection gets its name FIRST — Notes opening over everything
-      // mid-word is how a label gets lost. All the naming at home, then the note is made.
-      graphView.promptConnection(source, finalPath, (label) => {
-        void (async () => {
-          await finishLink(source, finalPath, label);
-          await makeAppleNote(finalPath);
-        })();
-      });
+      // Linked note: the link is written home first, unnamed — a click on the line
+      // names it — and then the note is made.
+      await finishLink(source, finalPath, null);
+      await makeAppleNote(finalPath);
     })();
   });
 }
 
-/**
- * "Link an Apple note…" — the notes already over there, latest edit first, and the one
- * picked becomes a node named after it. Titles repeat over there too, so the doubles
- * are numbered rather than guessed between.
- */
-async function linkAppleNoteAt(
-  at: { x: number; y: number },
-  folder: string | null,
-  source: string | null = null,
-): Promise<void> {
-  if (!(await appleNotesReady())) return;
-  const bridge = window.bedrock;
-  if (!bridge) return;
-  ui.status.textContent = "Apple Notes: reading your notes…";
-  let notes: AppleNote[];
-  try {
-    notes = await bridge.notesList(30);
-  } catch (err) {
-    ui.status.textContent = `Apple Notes: ${(err as Error).message}`;
-    return;
-  }
-  if (!notes.length) {
-    ui.status.textContent = "Apple Notes: no notes to link — make one first";
-    return;
-  }
-  const byLabel = new Map<string, AppleNote>();
-  for (const note of notes) {
-    const title = note.title || "Untitled";
-    let label = title;
-    for (let n = 2; byLabel.has(label); n++) label = `${title} (${n})`;
-    byLabel.set(label, note);
-  }
-  const picked = await askChoice("Which note should this one point at?", [...byLabel.keys()], "Cancel");
-  if (picked === null) return;
-  const note = byLabel.get(picked);
-  if (!note) return;
-  const dir = folder ?? "";
-  const path = uniquePath(filePaths(), dir, asFileName(note.title || "Untitled"), ".md");
-  await vault.createFile(path, appleNoteTemplate(note.id));
-  entries = [...entries, { path, kind: "file" }];
-  if (source) {
-    graphView.commitLink(source, path, {
-      label: noteName(path),
-      parent: dir || undefined,
-      at,
-      type: "applenote",
-      url: note.id,
-    });
-    graphView.promptConnection(source, path, (label) => void finishLink(source, path, label));
-  } else {
-    graphView.commitNode(path, noteName(path), dir || undefined, at, "applenote", note.id);
-  }
-  graphStale = true;
-  ui.status.textContent = `${noteName(path)} → its note in Apple Notes`;
-  await refreshSidebar();
-}
 
 /* ------------------------------------------------------------------ word --- */
 
@@ -3929,67 +3838,519 @@ async function createWordAt(
         await makeWordDoc(finalPath);
         return;
       }
-      // Linked document: the connection gets its name FIRST — Word opening over
-      // everything mid-word is how a label gets lost.
-      graphView.promptConnection(source, finalPath, (label) => {
-        void (async () => {
-          await finishLink(source, finalPath, label);
-          await makeWordDoc(finalPath);
-        })();
-      });
+      // Linked document: the link is written home first, unnamed — a click on the line
+      // names it — and then the document is made.
+      await finishLink(source, finalPath, null);
+      await makeWordDoc(finalPath);
     })();
   });
 }
 
+
+/* --------------------------------------------------------- slack threads --- */
+
 /**
- * "Link a Word document…" — Word's own recent list, latest first, no launch and no
- * prompt to read it. The one picked becomes a node named after the file; names repeat
- * across folders, so the doubles are numbered rather than guessed between.
+ * A thread note is a pointer in the same mould: the thread's permalink, and nothing said
+ * on its behalf. The channel and the timestamp that name the thread are both inside the
+ * link, so the one line is the whole handle — and it is a link that works pasted anywhere.
+ * Empty means "not started yet", which a click starts.
  */
-async function linkWordAt(
+const slackTemplate = (url: string): string =>
+  url ? `type:: slack\n\nthread:: ${url}\n` : `type:: slack\n`;
+
+/** Whether a workspace is connected and what it is called; null until the shell says. */
+let slackState: { connected: boolean; team: string; user: string; bot: boolean } | null = null;
+
+async function refreshSlack(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  slackState = await bridge.slackStatus().catch(() => null);
+  redrawSettings();
+}
+
+/**
+ * The whole setup: paste a bot token once. It is proved against Slack before it is kept,
+ * so a bad one is told about now; connecting is also what switches the integration on.
+ * Connected, the same button disconnects — the token is forgotten, the notes keep their
+ * links.
+ */
+async function setUpSlack(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) {
+    ui.status.textContent = "Slack needs the desktop app — npm start";
+    return;
+  }
+  if (slackState?.connected) {
+    const who = slackState.team ? ` (${slackState.team})` : "";
+    if (!(await askConfirm(`Disconnect Slack${who}? Notes keep their thread links.`, "Disconnect"))) return;
+    await bridge.slackForget().catch(() => false);
+    ui.status.textContent = "Slack: disconnected — the token is forgotten";
+    await refreshSlack();
+    return;
+  }
+  const token = await askText(
+    "Paste a Slack user token (xoxp-…) — posts then go out as you. It is kept in this machine's keychain, never in the vault.",
+    "",
+    "Connect",
+  );
+  if (!token) return;
+  try {
+    const { team } = await bridge.slackConnect(token.trim());
+    settings.set("slack", true);
+    ui.status.textContent = `Slack: connected to ${team || "the workspace"} — now choose a channel`;
+  } catch (err) {
+    ui.status.textContent = `Slack: ${shellError(err)}`;
+  }
+  await refreshSlack();
+}
+
+/** Which channel threads start in — the one question the vault answers about Slack. */
+async function pickSlackChannel(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge || !slackState?.connected) return;
+  ui.status.textContent = "Slack: reading the channels…";
+  let channels: Awaited<ReturnType<NonNullable<Window["bedrock"]>["slackChannels"]>>;
+  try {
+    channels = await bridge.slackChannels();
+  } catch (err) {
+    ui.status.textContent = `Slack: ${shellError(err)}`;
+    return;
+  }
+  if (!channels.length) {
+    ui.status.textContent = "Slack: that token can see no channels";
+    return;
+  }
+  // A workspace has hundreds of these, so the pick is searched rather than scrolled.
+  // Two channels cannot share a name, so the label is the whole answer.
+  const rows = channels.map((channel) => ({
+    label: `#${channel.name}`,
+    hint: channel.member ? (channel.private ? "private" : "") : "not a member",
+  }));
+  const picked = await askPick("Which channel should threads start in?", rows, "Search channels…");
+  const channel = channels.find((c) => `#${c.name}` === picked);
+  if (!channel) return;
+  settings.setSetup({ slackChannel: channel.id, slackChannelName: `#${channel.name}` });
+  ui.status.textContent = channel.member
+    ? `Slack: threads start in #${channel.name}`
+    : `Slack: threads start in #${channel.name} — join it first, or Slack refuses the post`;
+  redrawSettings();
+}
+
+/** A shell to ask, and a token in it. Enough to attach a thread by its link. */
+async function slackConnected(): Promise<boolean> {
+  const bridge = window.bedrock;
+  if (!bridge) {
+    ui.status.textContent = "Slack threads need the desktop app — npm start";
+    return false;
+  }
+  slackState = await bridge.slackStatus().catch(() => null);
+  if (!slackState?.connected) {
+    ui.status.textContent = "Slack: connect the workspace first — Settings → Integrations → Slack";
+    redrawSettings();
+    return false;
+  }
+  return true;
+}
+
+/** Whether a thread may be STARTED: connected, and with a channel to start it in. */
+async function slackReady(): Promise<boolean> {
+  if (!(await slackConnected())) return false;
+  if (!settings.setup().slackChannel) {
+    ui.status.textContent = "Slack: choose a channel first — Settings → Integrations → Slack";
+    return false;
+  }
+  return true;
+}
+
+/** How much of a first message becomes the note's name. */
+const SLACK_LABEL_LENGTH = 36;
+
+/**
+ * What a thread is called here: the head of its first message, cut at a word. A thread
+ * started from a note opens with the note's own name, so for those the two are the same
+ * thing; for one attached from Slack this is the name the note is born with, and a name
+ * given by hand afterwards is never touched.
+ */
+function slackLabel(text: string): string {
+  const line = text.replace(/\s+/g, " ").trim();
+  if (!line) return "Slack thread";
+  if (line.length <= SLACK_LABEL_LENGTH) return line;
+  const cut = line.slice(0, SLACK_LABEL_LENGTH);
+  const space = cut.lastIndexOf(" ");
+  return `${(space > 12 ? cut.slice(0, space) : cut).replace(/[\s,;:.!?\-–—]+$/, "")}…`;
+}
+
+/**
+ * What a pasted Slack link names: `…/archives/C0123ABCD/p1693000000123456`, with a
+ * `thread_ts` alongside when it was copied from a reply. The thread's own timestamp wins,
+ * so a link to any reply attaches the whole thread. Null for anything that is not one.
+ */
+function readSlackLink(typed: string): { channel: string; ts: string } | null {
+  let url: URL;
+  try {
+    url = new URL(typed.trim());
+  } catch {
+    return null;
+  }
+  if (!/(^|\.)slack\.com$/.test(url.hostname)) return null;
+  const m = /\/archives\/([CGD][A-Z0-9]+)\/p(\d{10})(\d{6})/.exec(url.pathname);
+  if (!m) return null;
+  const thread = url.searchParams.get("thread_ts");
+  return { channel: m[1], ts: thread && /^\d+\.\d+$/.test(thread) ? thread : `${m[2]}.${m[3]}` };
+}
+
+/**
+ * Starts the thread a note stands for. There is no other way to make one — a thread IS a
+ * message with answers — so the note's name is posted as the first message, in the
+ * vault's channel, and the link Slack mints for it is written home and opened.
+ */
+async function makeSlackThread(path: string): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  const { slackChannel, slackChannelName } = settings.setup();
+  ui.status.textContent = `Slack: starting “${noteName(path)}” in ${slackChannelName}…`;
+  let thread: SlackThread;
+  try {
+    thread = await bridge.slackPost(slackChannel, noteName(path));
+  } catch (err) {
+    ui.status.textContent = `Slack: ${shellError(err)}`;
+    return;
+  }
+  await flushAll(); // the note may be open and mid-edit; the write must not clobber
+  await vault.write(path, setField(await vault.read(path), "thread", thread.url));
+  graphView.setSlackThread(path, thread.url);
+  graphStale = true;
+  for (let i = 0; i < panes.length; i++) if (pathOf(panes[i]) === path) await renderPage(i);
+  void bridge.slackOpen(thread.url);
+  ui.status.textContent = `${noteName(path)} → its own thread in ${slackChannelName}, open in Slack`;
+}
+
+/**
+ * Click on a thread node: open the thread. A note whose thread was never started (the
+ * post failed, or the line was stripped by hand) is offered a start — asked first, because
+ * unlike making a page, starting a thread says something in front of other people.
+ */
+async function openSlackNode(path: string, url: string | null): Promise<void> {
+  // One tick later, for the same reason `openFsNode` waits: the click's own free
+  // handler clears the hint right after this, and the message has to outlive that.
+  const say = (message: string): void => {
+    window.setTimeout(() => {
+      ui.status.textContent = message;
+    }, 0);
+  };
+  const bridge = window.bedrock;
+  if (!bridge) {
+    say("Slack threads need the desktop app — npm start");
+    return;
+  }
+  if (url) {
+    const opened = await bridge.slackOpen(url);
+    say(opened ? `${noteName(path)} → Slack` : `the note's thread:: line is not a Slack message link`);
+    return;
+  }
+  if (!(await slackReady())) return;
+  const where = settings.setup().slackChannelName;
+  if (!(await askConfirm(`Start a thread in ${where}, with “${noteName(path)}” as its first message?`, "Post"))) return;
+  await makeSlackThread(path);
+}
+
+/**
+ * "New Slack thread" — from the canvas menu, or from a link draft released on empty
+ * space. The note comes first and gets its name, and committing the name is what starts
+ * the thread: the name is the first message, and the link comes home.
+ */
+async function createSlackAt(
   at: { x: number; y: number },
   folder: string | null,
   source: string | null = null,
 ): Promise<void> {
-  if (!(await wordReady())) return;
-  const bridge = window.bedrock;
-  if (!bridge) return;
-  ui.status.textContent = "Word: reading its recent documents…";
-  const docs = await bridge.wordRecent(30).catch(() => []);
-  if (!docs.length) {
-    ui.status.textContent = "Word: no recent documents to link — “New Word document” instead";
-    return;
-  }
-  const byLabel = new Map<string, WordDoc>();
-  for (const doc of docs) {
-    const title = doc.title || "Untitled";
-    let label = title;
-    for (let n = 2; byLabel.has(label); n++) label = `${title} (${n})`;
-    byLabel.set(label, doc);
-  }
-  const picked = await askChoice("Which document should the note point at?", [...byLabel.keys()], "Cancel");
-  if (picked === null) return;
-  const doc = byLabel.get(picked);
-  if (!doc) return;
+  if (!(await slackReady())) return;
   const dir = folder ?? "";
-  const path = uniquePath(filePaths(), dir, asFileName(doc.title || "Untitled"), ".md");
-  await vault.createFile(path, wordTemplate(doc.path));
-  entries = [...entries, { path, kind: "file" }];
+  const path = uniquePath(filePaths(), dir, "Slack thread", ".md");
+  await vault.createFile(path, slackTemplate(""));
+  entries = [...entries, { path, kind: "file" }]; // so the rename's collision check sees it
   if (source) {
     graphView.commitLink(source, path, {
       label: noteName(path),
       parent: dir || undefined,
       at,
-      type: "word",
-      url: doc.path,
+      type: "slack",
     });
-    graphView.promptConnection(source, path, (label) => void finishLink(source, path, label));
   } else {
-    graphView.commitNode(path, noteName(path), dir || undefined, at, "word", doc.path);
+    graphView.commitNode(path, noteName(path), dir || undefined, at, "slack");
   }
   graphStale = true;
-  ui.status.textContent = `${noteName(path)} → its document in Word`;
   await refreshSidebar();
+  ui.status.textContent = `created ${path} — name it, and that name opens a thread in ${settings.setup().slackChannelName}`;
+  graphView.renameNode(path, (name) => {
+    void (async () => {
+      const finalPath = name ? ((await applyRename(path, "file", name)) ?? path) : path;
+      if (!source) {
+        await makeSlackThread(finalPath);
+        return;
+      }
+      // Linked thread: the link is written home first, unnamed — a click on the line
+      // names it — and then the thread starts.
+      await finishLink(source, finalPath, null);
+      await makeSlackThread(finalPath);
+    })();
+  });
+}
+
+/** A thread that already exists, made into a note named after its first message. */
+const attachSlackThread = (
+  thread: SlackThread,
+  at: { x: number; y: number },
+  folder: string | null,
+  source: string | null,
+): Promise<void> => {
+  const title = slackLabel(thread.text);
+  return attachNodeAt(
+    {
+      kind: "slack",
+      title,
+      text: slackTemplate(thread.url),
+      handle: thread.url,
+      done: `${title} → its thread in Slack`,
+    },
+    at,
+    folder,
+    source,
+  );
+};
+
+/**
+ * "Paste a link…" — the row under the channel's threads. Any message link will do, from
+ * any channel the token can read: the thread it starts (or belongs to) is asked for, and
+ * the note takes the head of its first message for a name.
+ */
+async function pasteSlackThreadAt(
+  at: { x: number; y: number },
+  folder: string | null,
+  source: string | null = null,
+): Promise<void> {
+  if (!(await slackConnected())) return;
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  const typed = await askText("Paste a link to a Slack message — the one that started the thread, or any reply in it", "", "Attach");
+  if (typed === null) return;
+  const link = readSlackLink(typed);
+  if (!link) {
+    ui.status.textContent = `${typed.trim() || "that"} is not a Slack message link`;
+    return;
+  }
+  ui.status.textContent = "Slack: reading the thread…";
+  let thread: SlackThread;
+  try {
+    thread = await bridge.slackThread(link.channel, link.ts);
+  } catch (err) {
+    ui.status.textContent = `Slack: ${shellError(err)}`;
+    return;
+  }
+  await attachSlackThread(thread, at, folder, source);
+}
+
+/* ----------------------------------------------------------- antigravity --- */
+
+/**
+ * A session note in the same mould as a Claude one: no prose, just the handle. The folder
+ * the session runs in, and the conversation `agy` minted for it — nothing else, not even a
+ * heading. Its name on the graph is its filename, which is the one place a name belongs
+ * when the file has nothing else in it.
+ */
+const antigravityTemplate = (folder: string | null): string =>
+  `type:: antigravity\n${folder ? `\nfolder:: ${folder}\n` : ""}`;
+
+/** The name a session note is born with, until it is given one. */
+const ANTIGRAVITY_NAME = "Antigravity session";
+
+/** Notes with a mint in flight — a second click must not mint a second conversation. */
+const antigravityStarting = new Set<string>();
+
+/**
+ * Click on an Antigravity session node.
+ *
+ * Two states, and the note's own `conversation::` line tells them apart. A note that has
+ * one is resumed: `agy --conversation <id>` in a terminal, history and all. A note that
+ * has none mints one first — and the id goes into the note BEFORE the terminal opens, so a
+ * conversation can never end up running with nothing on disk pointing at it.
+ *
+ * The minting is the only part that waits, and it waits on the CLI announcing an id rather
+ * than on any model call, so it is a couple of seconds. Nothing is watched for afterwards:
+ * unlike the integration this replaced, the id is known before the session is opened.
+ */
+async function openAntigravitySession(path: string, conversation: string | null): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) {
+    ui.status.textContent = "Antigravity sessions need the desktop app — npm start";
+    return;
+  }
+  if (!(await antigravityReady())) return;
+
+  await flushAll(); // the note may be open and mid-edit; its fields have to be current
+  const text = await vault.read(path);
+  const held = conversation || parseField(text, "conversation");
+  const folder =
+    parseField(text, "folder") || settings.antigravityFolder() || (await askAntigravityFolder());
+  if (!folder) return; // nowhere to run it, and the ask was declined
+
+  if (held) {
+    // A note that had to be asked where to run keeps the answer, so it is asked once and
+    // not once per opening. Its conversation is already true, so only the folder is written.
+    if (!parseField(text, "folder")) await saveAntigravityConversation(path, held, folder);
+    await handAntigravityToTerminal(path, held, folder);
+    return;
+  }
+  if (antigravityStarting.has(path)) {
+    ui.status.textContent = `${noteName(path)} — a conversation is already being started for this note`;
+    return;
+  }
+
+  antigravityStarting.add(path);
+  ui.status.textContent = `${noteName(path)} — starting a conversation in ${folder}…`;
+  try {
+    const id = await bridge.agyCreate(folder, noteName(path));
+    await saveAntigravityConversation(path, id, parseField(text, "folder") ? null : folder);
+    await handAntigravityToTerminal(path, id, folder);
+  } catch (err) {
+    ui.status.textContent = `Antigravity: ${(err as Error).message}`;
+  } finally {
+    antigravityStarting.delete(path);
+  }
+}
+
+/**
+ * Hands a conversation to the terminal and says so. Deliberately says WHICH terminal it is
+ * not: Bedrock does not own the window, cannot tell whether the session is still running
+ * once it is in there, and should not imply otherwise.
+ */
+async function handAntigravityToTerminal(
+  path: string,
+  conversation: string,
+  folder: string,
+): Promise<void> {
+  try {
+    await window.bedrock?.agyOpen({ id: conversation, folder, title: noteName(path) });
+    ui.status.textContent = `${noteName(path)} → its session, in your terminal (${folder})`;
+  } catch (err) {
+    ui.status.textContent = `Antigravity: ${(err as Error).message}`;
+  }
+}
+
+/**
+ * Whether an Antigravity action may go ahead, asked of the shell rather than of the flag,
+ * so the answer is never one install out of date. The CLI is the whole prerequisite —
+ * there is nothing to be signed into HERE, and a session that needs a login says so in the
+ * terminal, which is a better place to answer it than a settings page.
+ */
+async function antigravityReady(): Promise<boolean> {
+  const bridge = window.bedrock;
+  if (!bridge) return false;
+  const status = await bridge.agyStatus().catch(() => null);
+  agyCli = status?.cli ?? null;
+  agyRan = status?.ran ?? false;
+  if (!agyCli) {
+    ui.status.textContent =
+      "Antigravity: the agy CLI is not installed — see antigravity.google/docs/cli, then click again";
+    redrawSettings();
+  }
+  return !!agyCli;
+}
+
+/**
+ * Writes a conversation's id into its note. Safe to run twice: a note that already carries
+ * this id is left exactly as it is. `folder` is written only when the note was not already
+ * carrying one, so a session's own folder is recorded once and then believed.
+ */
+async function saveAntigravityConversation(
+  path: string,
+  conversation: string,
+  folder: string | null,
+): Promise<void> {
+  if (!(await vault.exists(path))) return; // the note went away mid-start
+  await flushAll();
+  const text = await vault.read(path);
+  let next = setField(text, "conversation", conversation);
+  if (folder) next = setField(next, "folder", folder);
+  if (next === text) return;
+  if (!(await tryVault(`could not write to ${noteName(path)}`, () => vault.write(path, next)))) return;
+  graphView.setAntigravityConversation(path, conversation);
+  graphStale = true;
+  syncOpenPanes(path, next);
+}
+
+/**
+ * "New Antigravity session" — from the canvas menu, or from a link draft released on empty
+ * space (`source` is then the note the arrow came from).
+ *
+ * Nothing is started here. The note is created and named, and that is all: a conversation
+ * is minted by the first click on the node, which is the click that also opens it. A node
+ * whose session was never opened has cost nothing and left nothing behind — which is the
+ * whole reason not to mint one at creation time.
+ */
+async function createAntigravityAt(
+  at: { x: number; y: number },
+  folder: string | null,
+  source: string | null = null,
+): Promise<void> {
+  if (!(await antigravityReady())) return;
+  const dir = folder ?? "";
+  const path = freshPath(dir, ANTIGRAVITY_NAME);
+  const runIn = settings.antigravityFolder();
+  await vault.createFile(path, antigravityTemplate(runIn));
+  entries = [...entries, { path, kind: "file" }]; // so the rename's collision check sees it
+  if (source) {
+    graphView.commitLink(source, path, {
+      label: noteName(path),
+      parent: dir || undefined,
+      at,
+      type: "antigravity",
+    });
+  } else {
+    graphView.commitNode(path, noteName(path), dir || undefined, at, "antigravity");
+  }
+  graphStale = true;
+  ui.status.textContent = `created ${path} — name it, and clicking it starts the session`;
+  graphView.renameNode(path, (name) => {
+    void (async () => {
+      const finalPath = name ? ((await applyRename(path, "file", name)) ?? path) : path;
+      if (source) await finishLink(source, finalPath, null);
+    })();
+  });
+  await refreshSidebar();
+}
+
+/**
+ * "Plug in a session…" — points a note at a conversation that already exists, whether it
+ * was started here, in the Antigravity IDE, or by hand in a terminal.
+ *
+ * The list is the CLI's own inventory, which is two lists stitched together: the summaries
+ * it keeps titles in, and every conversation database on disk. The second is what makes a
+ * conversation minted here and never talked to appear at all — it has no summary row until
+ * something is said in it.
+ */
+async function plugInAntigravitySession(path: string): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge || !(await antigravityReady())) return;
+  const found = await bridge.agyConversations(20).catch(() => []);
+  if (!found.length) {
+    ui.status.textContent = "Antigravity: no conversations on this machine yet";
+    return;
+  }
+  const label = (one: (typeof found)[number]): string => {
+    const when = one.at ? new Date(one.at).toLocaleString() : "never opened";
+    const what = one.title || one.preview.slice(0, 40) || `untitled — ${one.id.slice(0, 8)}`;
+    return `${what} — ${when}`;
+  };
+  const picked = await askChoice(
+    "Which conversation should this note open?",
+    found.map(label),
+    "Cancel",
+  );
+  const chosen = picked ? found[found.map(label).indexOf(picked)] : null;
+  if (!chosen) return;
+  await saveAntigravityConversation(path, chosen.id, chosen.folder || null);
+  ui.status.textContent = `${noteName(path)} now opens ${chosen.title || chosen.id.slice(0, 8)}`;
 }
 
 /* ---------------------------------------------------------------- claude --- */
@@ -4093,10 +4454,9 @@ async function openClaudeSession(path: string, session: string | null): Promise<
 /**
  * The same click, in terminal mode.
  *
- * Three states, and the note's own `session::` line tells them apart: a session still
- * running under tmux is simply drawn again (the window is a viewport, so reopening it is
- * free and lands you mid-turn); a session that has finished is resumed as a new tmux
- * session on the same id, so its history comes back with it; a note that has never run
+ * Three states, and the note's own `session::` line tells them apart: a session that is
+ * mid-turn somewhere is left alone and said so (see below); a session that has finished is
+ * resumed on the same id, so its history comes back with it; a note that has never run
  * starts one. In every case the id is minted by the shell BEFORE the CLI starts, so the
  * note knows its session's name immediately — none of the app path's watching-for-a-
  * transcript is needed here.
@@ -4105,11 +4465,19 @@ async function openClaudeTerminal(path: string, session: string | null): Promise
   const bridge = window.bedrock;
   if (!bridge || !(await terminalReady())) return;
 
-  if (session && (await bridge.claudeCliAlive(session).catch(() => false))) {
-    await bridge.claudeCliWindow({ id: session, title: noteName(path) });
-    await markSessionSeen(path);
-    ui.status.textContent = `${noteName(path)} → its terminal, still running`;
-    return;
+  // A session that is mid-turn somewhere is NOT reopened. Bedrock cannot raise a terminal
+  // window it does not own, so the only thing a second click could do is start a second
+  // `claude --resume` on the same transcript — two processes appending to one file, which
+  // is worse than being told to go and find the window.
+  if (session) {
+    const live = await bridge.claudeStatus([session]).catch(() => null);
+    const state = live?.[session]?.state;
+    if (state === "running" || state === "waiting") {
+      ui.status.textContent =
+        `${noteName(path)} — already ${state === "running" ? "running" : "waiting on you"} in a terminal; ` +
+        `find that window rather than opening a second one on the same session`;
+      return;
+    }
   }
 
   await flushAll(); // the note may be open and mid-edit; its fields have to be current
@@ -4119,7 +4487,7 @@ async function openClaudeTerminal(path: string, session: string | null): Promise
 
   try {
     // A note that has run before resumes ITS session rather than starting a stranger.
-    const id = await bridge.claudeCliStart(folder, session ?? null);
+    const id = await bridge.claudeCliStart(folder, session ?? null, noteName(path));
     await saveClaudeSession(path, id);
     if (!parseField(text, "folder")) {
       const next = setField(await vault.read(path), "folder", folder);
@@ -4127,10 +4495,10 @@ async function openClaudeTerminal(path: string, session: string | null): Promise
       syncOpenPanes(path, next);
     }
     graphStale = true;
-    await bridge.claudeCliWindow({ id, title: noteName(path) });
+    await markSessionSeen(path);
     ui.status.textContent = session
-      ? `${noteName(path)} — resumed in a terminal, in ${folder}`
-      : `${noteName(path)} — a terminal session started in ${folder}; it keeps running if you close the window`;
+      ? `${noteName(path)} → its session, resumed in your terminal (${folder})`
+      : `${noteName(path)} → a session started in your terminal (${folder})`;
   } catch (err) {
     ui.status.textContent = `Claude: ${(err as Error).message}`;
   }
@@ -4202,6 +4570,312 @@ async function saveClaudeSession(path: string, id: string, folder?: string): Pro
   graphStale = true;
   syncOpenPanes(path, next);
   ui.status.textContent = `${noteName(path)} now opens its own session`;
+}
+
+/* ------------------------------------------- attaching to what is already there --- */
+/*
+ * Pointing a NEW note at something that already exists over there — an Apple note you
+ * wrote last week, a Notion page, a Claude session that has been running all morning.
+ *
+ * Every integration used to grow its own copy of this: read a list, number the duplicate
+ * titles, put them in a modal, make a note out of the answer. Four copies of one idea, and
+ * the two agent integrations never got one at all. It is one table now. What genuinely
+ * differs between them is only three things — what the list is, what the note says, and
+ * what rides on the node — so that is all an entry says.
+ *
+ * The list is fetched when its row is OPENED, never when the menu is built: a right-click
+ * must not wait on Notion, and a list nobody looked at costs nothing.
+ */
+
+/** One thing that could be attached to: its row in the menu, and what picking it does. */
+type AttachOption = {
+  label: string;
+  /** Drawn dimmer, to the right — what tells two rows with the same name apart. */
+  hint?: string;
+  place: (at: { x: number; y: number }, folder: string | null, source: string | null) => Promise<void>;
+};
+
+type Attachable = {
+  kind: DraftKind;
+  feature: Feature;
+  /** The row in the Attach branch — singular, because you pick one. */
+  label: string;
+  /** What could be attached to. Throws something worth reading when it cannot say. */
+  options: () => Promise<AttachOption[]>;
+};
+
+/** A last-touched stamp, short enough to sit in a menu row. */
+const when = (at: number): string =>
+  at ? new Date(at).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "";
+
+/**
+ * Makes the note, puts it on the graph, and — when it came off a link draft — draws the
+ * link and asks that link's name. The one place any of the six does any of that.
+ */
+async function attachNodeAt(
+  spec: {
+    kind: DraftKind;
+    title: string;
+    text: string;
+    /** What rides on the node, so a click opens the thing without reading the file first. */
+    handle?: string;
+    /** Anything the live node needs that does not ride as `handle`. */
+    paint?: (path: string) => void;
+    done: string;
+  },
+  at: { x: number; y: number },
+  folder: string | null,
+  source: string | null,
+): Promise<void> {
+  const dir = folder ?? "";
+  const path = uniquePath(filePaths(), dir, asFileName(spec.title || "Untitled"), ".md");
+  await vault.createFile(path, spec.text);
+  entries = [...entries, { path, kind: "file" }];
+  if (source) {
+    graphView.commitLink(source, path, {
+      label: noteName(path),
+      parent: dir || undefined,
+      at,
+      type: spec.kind,
+      url: spec.handle,
+    });
+    void finishLink(source, path, null);
+  } else {
+    graphView.commitNode(path, noteName(path), dir || undefined, at, spec.kind, spec.handle);
+  }
+  spec.paint?.(path);
+  graphStale = true;
+  ui.status.textContent = spec.done;
+  await refreshSidebar();
+}
+
+/** The shell, or a thrown line saying why there is none — the menu draws that line. */
+function shellOrThrow(): NonNullable<Window["bedrock"]> {
+  const bridge = window.bedrock;
+  if (!bridge) throw new Error("needs the desktop app");
+  return bridge;
+}
+
+const ATTACHABLES: Attachable[] = [
+  {
+    kind: "applenote",
+    feature: "applenotes",
+    label: "Apple note",
+    options: async () => {
+      const notes = await shellOrThrow().notesList(30);
+      return notes.map((note) => ({
+        label: note.title || "Untitled",
+        hint: when(note.at),
+        place: (at, folder, source) =>
+          attachNodeAt(
+            {
+              kind: "applenote",
+              title: note.title,
+              text: appleNoteTemplate(note.id),
+              handle: note.id,
+              done: `${note.title || "Untitled"} → its note in Apple Notes`,
+            },
+            at,
+            folder,
+            source,
+          ),
+      }));
+    },
+  },
+  {
+    kind: "notion",
+    feature: "notion",
+    label: "Notion page",
+    options: async () => {
+      // An empty query lists what is recent, which is the right default for a menu. A
+      // workspace is bigger than any list, so the search stays reachable underneath it.
+      const pages = await shellOrThrow().notionSearch("");
+      const rows: AttachOption[] = pages.map((page) => ({
+        label: page.title || "Untitled",
+        place: (at, folder, source) =>
+          attachNodeAt(
+            {
+              kind: "notion",
+              title: page.title,
+              text: notionTemplate(page.url),
+              handle: page.url,
+              done: `${page.title || "Untitled"} → its page in Notion`,
+            },
+            at,
+            folder,
+            source,
+          ),
+      }));
+      rows.push({ label: "Search Notion…", place: searchNotionAt });
+      return rows;
+    },
+  },
+  {
+    kind: "slack",
+    feature: "slack",
+    label: "Slack thread",
+    options: async () => {
+      // The threads going in the vault's channel, newest first; a thread anywhere else —
+      // or one in this channel nobody has answered yet — comes in through a pasted link.
+      const bridge = shellOrThrow();
+      const channel = settings.setup().slackChannel;
+      const rows: AttachOption[] = [];
+      if (channel) {
+        const threads = await bridge.slackThreads(channel, 30).catch((err: unknown) => {
+          throw new Error(shellError(err));
+        });
+        for (const thread of threads) {
+          rows.push({
+            label: slackLabel(thread.text),
+            hint: `${thread.replies} ${thread.replies === 1 ? "reply" : "replies"} · ${when(thread.latest)}`,
+            place: (at, folder, source) => attachSlackThread(thread, at, folder, source),
+          });
+        }
+      }
+      rows.push({ label: "Paste a link…", place: pasteSlackThreadAt });
+      return rows;
+    },
+  },
+  {
+    kind: "word",
+    feature: "word",
+    label: "Word document",
+    options: async () => {
+      const docs = await shellOrThrow().wordRecent(30);
+      return docs.map((doc) => ({
+        label: doc.title || "Untitled",
+        hint: when(doc.at),
+        place: (at, folder, source) =>
+          attachNodeAt(
+            {
+              kind: "word",
+              title: doc.title,
+              text: wordTemplate(doc.path),
+              handle: doc.path,
+              done: `${doc.title || "Untitled"} → its document in Word`,
+            },
+            at,
+            folder,
+            source,
+          ),
+      }));
+    },
+  },
+  {
+    kind: "freeform",
+    feature: "freeform",
+    label: "Freeform board",
+    options: async () => {
+      const boards = await shellOrThrow().freeformBoards(30);
+      return boards.map((board) => ({
+        label: board.title || "Untitled",
+        hint: when(board.at),
+        place: (at, folder, source) =>
+          attachNodeAt(
+            {
+              kind: "freeform",
+              title: board.title,
+              text: freeformTemplate(board.id),
+              handle: board.id,
+              done: `${board.title || "Untitled"} → its board in Freeform`,
+            },
+            at,
+            folder,
+            source,
+          ),
+      }));
+    },
+  },
+  {
+    kind: "antigravity",
+    feature: "antigravity",
+    label: "Antigravity session",
+    options: async () => {
+      const found = await shellOrThrow().agyConversations(40);
+      return found.map((one) => {
+        // A conversation minted here and not yet talked to has no summary row, so no
+        // title: it is named by its id, which is at least true.
+        const title = one.title || one.preview.slice(0, 40) || `Session ${one.id.slice(0, 8)}`;
+        const runIn = one.folder || settings.antigravityFolder();
+        return {
+          label: title,
+          hint: one.folder ? basename(one.folder) : when(one.at),
+          place: (at, folder, source) =>
+            attachNodeAt(
+              {
+                kind: "antigravity",
+                title,
+                text: setField(antigravityTemplate(runIn), "conversation", one.id),
+                handle: one.id,
+                done: `${title} → its Antigravity session`,
+              },
+              at,
+              folder,
+              source,
+            ),
+        };
+      });
+    },
+  },
+  {
+    kind: "claude",
+    feature: "claude",
+    label: "Claude session",
+    options: async () => {
+      const sessions = await shellOrThrow().claudeSessions(60);
+      return sessions.map((session) => {
+        const title = session.title || `Session ${session.id.slice(0, 8)}`;
+        return {
+          label: title,
+          hint: session.folder ? basename(session.folder) : when(session.at),
+          place: (at, folder, source) =>
+            attachNodeAt(
+              {
+                kind: "claude",
+                title,
+                // A session id does NOT ride as the node's handle: a Claude node keeps it
+                // on its own key, because the corner that reports what the session is
+                // doing is keyed off that same field.
+                text: setField(claudeTemplate(session.folder), "session", session.id),
+                paint: (path) => {
+                  graphView.setClaudeSession(path, session.id, session.folder);
+                  void pollSessions(); // its dot should say something true immediately
+                },
+                done: `${title} → its Claude session`,
+              },
+              at,
+              folder,
+              source,
+            ),
+        };
+      });
+    },
+  },
+];
+
+/** The attachables whose integration is switched on, in the order the table lists them. */
+const attachables = (): Attachable[] => ATTACHABLES.filter((one) => settings.enabled(one.feature));
+
+/**
+ * The Attach branch: one row per integration, each opening the things it can see. Those
+ * inner rows are lazy — see the note on `Attachable.options`.
+ *
+ * `release` says what a picked option does about its position. From empty space that is
+ * known already; from a node it is wherever the link draft lands.
+ */
+function attachMenu(release: (option: AttachOption, kind: DraftKind) => () => void): MenuItem[] {
+  return attachables().map((one) => ({
+    label: one.label,
+    icon: TYPE_ICONS[one.kind],
+    children: async () => {
+      const options = await one.options();
+      return options.map((option) => ({
+        label: option.label,
+        hint: option.hint,
+        run: release(option, one.kind),
+      }));
+    },
+  }));
 }
 
 /* --------------------------------------------------- plugging in a session --- */
@@ -4301,12 +4975,10 @@ async function createClaudeAt(
         await openClaudeSession(finalPath, null);
         return;
       }
-      // Linked session: the connection gets its name too, exactly like drawing any link,
-      // and only then does the session open.
-      graphView.promptConnection(source, finalPath, (label) => {
-        void finishLink(source, finalPath, label);
-        void openClaudeSession(finalPath, null);
-      });
+      // Linked session: the link is written home, unnamed like every drawn link, and
+      // then the session opens.
+      await finishLink(source, finalPath, null);
+      await openClaudeSession(finalPath, null);
     })();
   });
   await refreshSidebar();
@@ -4392,13 +5064,13 @@ async function markSessionSeen(path: string): Promise<void> {
 }
 
 /**
- * Right-drag landed on an existing note: draw the edge, then name the connection. The edge is on
- * screen while it is being named, and the file is written once — with the relation if one was typed.
+ * Right-drag landed on an existing note: draw the edge and write the link home, unnamed. Most
+ * connections never need a word on them; the one that does gets it from a click on the line.
  */
 function linkNotes(source: string, target: string): void {
   graphView.commitLink(source, target);
   graphStale = true;
-  graphView.promptConnection(source, target, (label) => void finishLink(source, target, label));
+  void finishLink(source, target, null);
 }
 
 /** Writes the (possibly named) link through to the file and labels the live edge. */
@@ -4440,14 +5112,15 @@ const redrawSettings = mountSettings(ui.settings, ui.settingsPanel, settings, {
   page: integrationPage,
   onAction: runIntegrationAction,
 });
-// All of these are the shell's to know, and all can change while the app runs — a Google
-// sign-in, a tmux install, a `/login` inside a session, a commit made in a terminal.
+// All of these are the shell's to know, and all can change while the app runs — an agy
+// install, a claude install, a `/login` inside a session, a commit made in a terminal.
 ui.settings.addEventListener("click", () => {
-  void refreshGeminiStatus();
-  void refreshTmux();
+  void refreshAntigravity();
+  void refreshClaudeCli();
   void refreshGit();
   void refreshFreeform();
   void refreshNotion();
+  void refreshSlack();
   void refreshAppleNotes();
   void refreshWord();
 });
@@ -4615,6 +5288,7 @@ const escapeAttr = (s: string): string => escapeHtml(s).replace(/"/g, "&quot;");
 // No vault opens by itself — not the demo, not even the last one. The app starts at
 // the front door, and everything attaches when a real folder is picked (`pickFolder`).
 void adoptLinearKey(); // a key stored on a previous run connects itself
+void refreshSlack(); // and so does a Slack token
 
 /** Whether any real vault has been opened this run — what lets Esc close the door. */
 let vaultOpen = false;

@@ -1,8 +1,8 @@
 // What the renderer may ask the shell to do: run a git snapshot in the vault's
-// folder, open a Gemini chat in a window the shell watches for the minted
-// conversation URL, open a Claude Code session in the Claude app and wait for the
-// id it mints, read a webpage's title and icon off the site itself, and talk to
-// Linear. Everything else goes through web APIs on purpose.
+// folder, mint an Antigravity conversation and hand it to the person's terminal,
+// open a Claude Code session in the Claude app and wait for the id it mints, read a
+// webpage's title and icon off the site itself, and talk to Linear and Slack. Everything else
+// goes through web APIs on purpose.
 //
 // Note what is NOT here: any way to read the Linear key back. The renderer can
 // connect, ask whether it is connected, forget, and make calls — the key itself
@@ -17,10 +17,10 @@ contextBridge.exposeInMainWorld("bedrock", {
   gitStatus: (root) => ipcRenderer.invoke("git-status", root),
   pickPath: (kind) => ipcRenderer.invoke("fs-pick", kind),
   openPath: (target) => ipcRenderer.invoke("fs-open", target),
-  geminiChat: (url) => ipcRenderer.invoke("gemini-chat", url),
-  geminiStatus: () => ipcRenderer.invoke("gemini-status"),
-  geminiSignIn: () => ipcRenderer.invoke("gemini-signin"),
-  geminiForget: () => ipcRenderer.invoke("gemini-forget"),
+  agyStatus: () => ipcRenderer.invoke("agy-status"),
+  agyCreate: (folder, name) => ipcRenderer.invoke("agy-create", folder, name),
+  agyOpen: (options) => ipcRenderer.invoke("agy-open", options),
+  agyConversations: (limit) => ipcRenderer.invoke("agy-conversations", limit),
   webPage: (url) => ipcRenderer.invoke("web-page", url),
   claudeFolder: () => ipcRenderer.invoke("claude-folder"),
   claudeFolders: (limit) => ipcRenderer.invoke("claude-folders", limit),
@@ -33,6 +33,14 @@ contextBridge.exposeInMainWorld("bedrock", {
   linearStatus: () => ipcRenderer.invoke("linear-status"),
   linearForget: () => ipcRenderer.invoke("linear-forget"),
   linearCall: (query, variables) => ipcRenderer.invoke("linear-call", query, variables),
+  slackConnect: (token) => ipcRenderer.invoke("slack-connect", token),
+  slackStatus: () => ipcRenderer.invoke("slack-status"),
+  slackForget: () => ipcRenderer.invoke("slack-forget"),
+  slackChannels: () => ipcRenderer.invoke("slack-channels"),
+  slackThreads: (channel, limit) => ipcRenderer.invoke("slack-threads", channel, limit),
+  slackThread: (channel, ts) => ipcRenderer.invoke("slack-thread", channel, ts),
+  slackPost: (channel, text) => ipcRenderer.invoke("slack-post", channel, text),
+  slackOpen: (url) => ipcRenderer.invoke("slack-open", url),
   freeformStatus: () => ipcRenderer.invoke("freeform-status"),
   freeformBoards: (limit) => ipcRenderer.invoke("freeform-boards", limit),
   freeformCreate: (title) => ipcRenderer.invoke("freeform-create", title),
@@ -56,20 +64,9 @@ contextBridge.exposeInMainWorld("bedrock", {
   // The menu bar's two renderer-side doors: Settings…, Open Vault….
   onMenu: (fn) => ipcRenderer.on("menu", (_e, what) => fn(what)),
 
-  // Sessions run by the CLI, under tmux. `termStatus` is what the settings window gates
-  // the whole mode on; the rest is the window that draws one.
-  termStatus: () => ipcRenderer.invoke("term-status"),
-  termInstall: () => ipcRenderer.invoke("term-install"),
-  claudeCliStart: (folder, resume) => ipcRenderer.invoke("claude-cli-start", folder, resume),
-  claudeCliAlive: (id) => ipcRenderer.invoke("claude-cli-alive", id),
+  // Sessions run by the CLI, in the person's own terminal. `claudeCliStatus` is what the
+  // settings window gates the mode on; starting one hands it over and returns its id.
+  claudeCliStatus: () => ipcRenderer.invoke("claude-cli-status"),
+  claudeCliStart: (folder, resume, title) => ipcRenderer.invoke("claude-cli-start", folder, resume, title),
   claudeAccount: () => ipcRenderer.invoke("claude-account"),
-  claudeCliKill: (id) => ipcRenderer.invoke("claude-cli-kill", id),
-  claudeCliWindow: (options) => ipcRenderer.invoke("claude-cli-window", options),
-
-  // Used only by terminal.html: the pty's two directions, plus its size.
-  termAttach: (options) => ipcRenderer.invoke("term-attach", options),
-  termInput: (data) => ipcRenderer.send("term-input", data),
-  termResize: (cols, rows) => ipcRenderer.send("term-resize", cols, rows),
-  onTermData: (fn) => ipcRenderer.on("term-data", (_e, data) => fn(data)),
-  onTermEnded: (fn) => ipcRenderer.on("term-ended", () => fn()),
 });

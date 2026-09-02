@@ -2,8 +2,8 @@
 // rather than file:// — a real origin is what makes localStorage and the File
 // System Access API ("Open folder…") work.
 
-const { app, BrowserWindow, Menu, dialog, ipcMain, protocol, net, safeStorage, session, shell } = require("electron");
-const { execFile } = require("node:child_process");
+const { app, BrowserWindow, Menu, dialog, ipcMain, protocol, net, safeStorage, shell } = require("electron");
+const { execFile, spawn } = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const http = require("node:http");
@@ -777,181 +777,291 @@ ipcMain.handle("linear-call", async (_event, query, variables) => {
 });
 
 /*
- * A Gemini chat in a window the app OWNS, so nobody has to copy anything: Google
- * assigns the conversation its URL (gemini.google.com/app/<id>) after the first
- * message, this window sees that navigation happen, and the promise resolves with
- * the link — the renderer writes it straight into the note. The window stays open;
- * closing it before a conversation starts resolves null.
- *
- * Signing in happens ONCE: the chats live in their own persistent session
- * (`persist:gemini`), so the cookies Google sets during that first login survive
- * every restart. Chrome's own cookie jar cannot be borrowed — it is encrypted per
- * user via the OS keychain — so making this session trustworthy is the whole game:
- * the user agent must not confess to Electron anywhere (Google refuses "insecure
- * browsers"), including on the sign-in POPUPS, which must also stay in this session
- * or the cookies they set land in the wrong jar and the login never takes.
+ * Slack. A thread here is a note pointing at a thread there — and a Slack thread is not
+ * a thing of its own: it is a message that other messages answer, named by the channel
+ * it is in and the timestamp of that first message. So "start a thread" is "post the
+ * first message", and the note's name is what gets posted. The bot token is kept the
+ * way Linear's key is — sealed with the OS keychain into the app's own folder, never
+ * the vault — and the renderer never sees it: it asks for a channel's threads, a
+ * thread's first message, or a post, and the shell adds the header.
  */
-const GEMINI_CONVO = /^https:\/\/gemini\.google\.com\/(?:app|share)\/[\w-]+/;
-const GEMINI_PARTITION = "persist:gemini";
-const GOOGLE_RE = /^https:\/\/([\w-]+\.)*google\.com\//;
+const SLACK_API = "https://slack.com/api/";
+const slackFile = () => path.join(app.getPath("userData"), "slack.json");
 
-/** The cookies Google sets when a sign-in takes. Only ever tested for existence. */
-const SIGNED_IN_COOKIE = /^(__Secure-1PSID|SID)$/;
-
-const geminiJar = () => session.fromPartition(GEMINI_PARTITION).cookies;
-
-async function geminiSignedIn() {
+function readSlack() {
   try {
-    const jar = await geminiJar().get({ domain: ".google.com" });
-    return jar.some((c) => SIGNED_IN_COOKIE.test(c.name) && !!c.value);
+    const stored = JSON.parse(fs.readFileSync(slackFile(), "utf8"));
+    if (typeof stored.token !== "string") return null;
+    return {
+      token: unseal(stored.token),
+      team: typeof stored.team === "string" ? stored.team : "",
+      teamId: typeof stored.teamId === "string" ? stored.teamId : "",
+      url: typeof stored.url === "string" ? stored.url : "",
+      user: typeof stored.user === "string" ? stored.user : "",
+      bot: !!stored.bot,
+    };
   } catch {
-    return false;
+    return null; // never connected, or the keychain refused — both mean "not connected"
+  }
+}
+
+/** One Web API call with whatever token is stored. Throws what Slack said, in words. */
+async function slackFetch(token, method, args) {
+  const response = await net.fetch(SLACK_API + method, {
+    method: "POST",
+    headers: { "content-type": "application/json; charset=utf-8", authorization: `Bearer ${token}` },
+    body: JSON.stringify(args ?? {}),
+  });
+  if (!response.ok) throw new Error(`Slack said ${response.status}`);
+  const body = await response.json();
+  if (!body.ok) throw new Error(slackError(body.error, args));
+  return body;
+}
+
+/** Slack's error codes are terse; these are the ones a person will actually meet. */
+function slackError(code, args) {
+  switch (code) {
+    case "invalid_auth":
+    case "not_authed":
+    case "token_revoked":
+    case "account_inactive":
+      return "Slack refused the token";
+    case "missing_scope":
+      return "the token lacks a scope it needs — chat:write, channels:history, channels:read (and groups:* for private channels)";
+    case "not_in_channel":
+      return "not in that channel — join it in Slack first (or /invite the app, on a bot token)";
+    case "channel_not_found":
+      return `Slack knows no channel ${args && args.channel ? args.channel : ""}`.trim();
+    case "thread_not_found":
+    case "message_not_found":
+      return "that message is not in Slack any more";
+    case "ratelimited":
+      return "Slack is rate-limiting — try again in a moment";
+    default:
+      return `Slack said ${code || "no"}`;
   }
 }
 
 /**
- * A window in the chat session. Google's sign-in flow opens popups; they must be real
- * windows IN THIS SESSION for the login cookies to land where the chat lives. Anything
- * else goes to the system browser, exactly like links in notes do.
+ * The first line of a message, as a person would read it: Slack's own markup — user and
+ * channel mentions, `<url|text>` links, escaped &, < and > — taken down to plain words.
+ * What a thread is called on the graph is cut from this.
  */
-function geminiWindow(title) {
-  const win = new BrowserWindow({
-    width: 1100,
-    height: 780,
-    title,
-    autoHideMenuBar: true,
-    backgroundColor: "#1e1e1e",
-    webPreferences: { partition: GEMINI_PARTITION, contextIsolation: true, nodeIntegration: false },
-  });
-  win.webContents.setWindowOpenHandler(({ url: target }) => {
-    if (GOOGLE_RE.test(target)) {
-      return {
-        action: "allow",
-        overrideBrowserWindowOptions: {
-          autoHideMenuBar: true,
-          webPreferences: { partition: GEMINI_PARTITION, contextIsolation: true, nodeIntegration: false },
-        },
-      };
-    }
-    if (/^https?:/.test(target)) void shell.openExternal(target);
-    return { action: "deny" };
-  });
-  return win;
+function slackPlain(text) {
+  return String(text || "")
+    .replace(/<@[A-Z0-9]+\|([^>]+)>/g, "@$1")
+    .replace(/<@[A-Z0-9]+>/g, "")
+    .replace(/<#[A-Z0-9]+\|([^>]*)>/g, "#$1")
+    .replace(/<!([a-z]+)(?:\^[^|>]*)?(?:\|([^>]*))?>/g, (_m, kind, label) => label || `@${kind}`)
+    .replace(/<([^|>]+)\|([^>]*)>/g, "$2")
+    .replace(/<((?:https?|mailto):[^>]+)>/g, (_m, url) => {
+      try {
+        return new URL(url).hostname.replace(/^www\./, "") || url;
+      } catch {
+        return url;
+      }
+    })
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
-ipcMain.handle("gemini-chat", (_event, url) => {
-  const win = geminiWindow("Gemini");
-  void win.loadURL(String(url));
-  return new Promise((resolve) => {
-    let settled = false;
-    const check = (target) => {
-      if (settled) return;
-      const match = GEMINI_CONVO.exec(target || "");
-      if (match) {
-        settled = true;
-        resolve(match[0]);
-      }
-    };
-    win.webContents.on("did-navigate", (_e, target) => check(target));
-    win.webContents.on("did-navigate-in-page", (_e, target) => check(target));
-    win.on("closed", () => {
-      if (!settled) {
-        settled = true;
-        resolve(null);
-      }
-    });
-  });
+/** A message's permalink, spelt the way Slack itself spells one, from the team's own URL. */
+const slackPermalink = (account, channel, ts) =>
+  account.url
+    ? `${account.url.replace(/\/$/, "")}/archives/${channel}/p${ts.replace(".", "")}`
+    : `https://slack.com/archives/${channel}/p${ts.replace(".", "")}`;
+
+/**
+ * A thread as the pointer a note keeps: where it is, what it opened with, and how much
+ * has been said under it since.
+ */
+function slackThreadRow(account, channel, message) {
+  const ts = String(message.ts || "");
+  return {
+    channel,
+    ts,
+    text: slackPlain(message.text),
+    replies: Number(message.reply_count) || 0,
+    at: Math.round(parseFloat(ts) * 1000) || 0,
+    latest: Math.round(parseFloat(message.latest_reply || ts) * 1000) || 0,
+    url: slackPermalink(account, channel, ts),
+  };
+}
+
+/**
+ * Pasting a bot token is the whole setup: it is proved against Slack before being kept,
+ * so a typo is told about now rather than at the first post that fails. What comes back
+ * is who the token is — the workspace, and the bot's own name.
+ */
+ipcMain.handle("slack-connect", async (_event, rawToken) => {
+  const token = String(rawToken || "").trim();
+  if (!token) throw new Error("no token given");
+  if (!/^xox[bp]-/.test(token)) throw new Error("that is not a Slack token — one starts with xoxp- (you) or xoxb- (the app)");
+  const who = await slackFetch(token, "auth.test", {});
+  const account = {
+    team: String(who.team || ""),
+    teamId: String(who.team_id || ""),
+    url: String(who.url || ""),
+    user: String(who.user || ""),
+    // A user token acts as the person; a bot token as the app. Slack tells them apart by
+    // prefix, and the settings page says which it is, because the difference is whose
+    // name the first message goes out under.
+    bot: token.startsWith("xoxb-"),
+  };
+  fs.mkdirSync(path.dirname(slackFile()), { recursive: true });
+  fs.writeFileSync(slackFile(), JSON.stringify({ version: 1, token: seal(token), ...account }), { mode: 0o600 });
+  return account;
 });
 
-/**
- * Whether the chat window's own session is signed into Google. There is no API to ask —
- * the answer is in the cookie jar, and `__Secure-1PSID` is the one Google sets when a
- * sign-in takes. It is only ever read for its EXISTENCE; the value is never handled.
- */
-ipcMain.handle("gemini-status", async () => ({ signedIn: await geminiSignedIn() }));
-
-/**
- * Signing in, and NOTHING ELSE. A window that opens on Google's own sign-in page, watches
- * the jar for the cookie that says it took, and closes itself the moment it lands.
- *
- * Its own door rather than a side effect of opening a chat: a chat window that happens to
- * show a login is the thing that made this integration feel broken — you could not tell
- * whether you were about to talk to Gemini or to a form, and nothing told you when it had
- * worked. Here the window has one job and reports whether it did it.
- *
- * The jar is watched rather than the navigation: which page Google lands on at the end of
- * a login depends on the account (a consent screen, a chooser, a security interstitial),
- * but the cookie is the same either way — it IS what being signed in means.
- */
-ipcMain.handle("gemini-signin", async () => {
-  if (await geminiSignedIn()) return { signedIn: true };
-  const win = geminiWindow("Sign in to Google");
-  const jar = geminiJar();
-
-  return new Promise((resolve) => {
-    let settled = false;
-    const done = (signedIn) => {
-      if (settled) return;
-      settled = true;
-      jar.removeListener("changed", onChanged);
-      resolve({ signedIn });
-      // Closing is the confirmation: the window had one job and it is finished.
-      if (signedIn && !win.isDestroyed()) win.close();
-    };
-    const onChanged = (_e, cookie, _cause, removed) => {
-      if (removed || !SIGNED_IN_COOKIE.test(cookie.name) || !cookie.value) return;
-      if (!/(^|\.)google\.com$/.test(String(cookie.domain).replace(/^\./, "."))) return;
-      done(true);
-    };
-    jar.on("changed", onChanged);
-    // Dismissed without finishing — but check the jar rather than assuming, in case the
-    // login took on a page that closed itself.
-    win.on("closed", () => void geminiSignedIn().then(done));
-    void win.loadURL(
-      "https://accounts.google.com/ServiceLogin?continue=" +
-        encodeURIComponent("https://gemini.google.com/app"),
-    );
-  });
+ipcMain.handle("slack-status", () => {
+  const account = readSlack();
+  return account
+    ? { connected: true, team: account.team, user: account.user, bot: account.bot }
+    : { connected: false, team: "", user: "", bot: false };
 });
 
-/**
- * Forgets the chat window's session — cookies and all. The next chat opens at the sign-in
- * page again. Nothing in any note changes: a conversation's URL is the note's, not the
- * session's, and it will still open once somebody signs back in.
- */
-ipcMain.handle("gemini-forget", async () => {
-  await session.fromPartition(GEMINI_PARTITION).clearStorageData();
+ipcMain.handle("slack-forget", () => {
+  try {
+    fs.rmSync(slackFile());
+  } catch {
+    /* nothing stored */
+  }
   return true;
 });
 
-/* ------------------------------------------------ claude, in a terminal of its own --- */
-/*
- * The other way to run a session: the `claude` CLI, in a window this app draws, with the
- * agent living OUTSIDE this app entirely.
- *
- * The trick is that Bedrock never owns the session — tmux does. A session is started
- * detached (`tmux new-session -d`), which hands it to the tmux server, a daemon that
- * belongs to the login session rather than to whoever asked for it. Bedrock then draws it
- * by running `tmux attach` inside a pseudo-terminal and piping that into an xterm.js in a
- * window. Closing the window kills the ATTACH, not the session.
- *
- * So the agent keeps working while the window is shut, keeps working while Bedrock is
- * shut, and is still mid-turn when you come back — the app really is only a viewport onto
- * something running on the machine. It is also why this needs tmux installed and will not
- * pretend otherwise: without it there is nothing to hand the session to.
+/** The channels the token can see — public and private — the ones the app is in first. */
+ipcMain.handle("slack-channels", async () => {
+  const account = readSlack();
+  if (!account) throw new Error("Slack is not connected");
+  const found = [];
+  let cursor = "";
+  do {
+    const page = await slackFetch(account.token, "conversations.list", {
+      types: "public_channel,private_channel",
+      exclude_archived: true,
+      limit: 200,
+      ...(cursor ? { cursor } : {}),
+    });
+    for (const channel of page.channels || []) {
+      found.push({
+        id: String(channel.id),
+        name: String(channel.name || channel.id),
+        member: !!channel.is_member,
+        private: !!channel.is_private,
+      });
+    }
+    cursor = String((page.response_metadata && page.response_metadata.next_cursor) || "");
+  } while (cursor && found.length < 1000);
+  found.sort((a, b) => Number(b.member) - Number(a.member) || a.name.localeCompare(b.name));
+  return found;
+});
+
+/**
+ * The threads going in a channel: its recent messages that have been answered, newest
+ * first. A message nobody has replied to is not a thread yet — it is offered under the
+ * paste-a-link door instead, where any message can be the start of one.
  */
+ipcMain.handle("slack-threads", async (_event, rawChannel, rawLimit) => {
+  const account = readSlack();
+  if (!account) throw new Error("Slack is not connected");
+  const channel = String(rawChannel || "");
+  if (!/^[CG][A-Z0-9]+$/.test(channel)) throw new Error("no channel chosen — Settings → Integrations → Slack");
+  const limit = Math.max(1, Math.min(Number(rawLimit) || 30, 100));
+  const page = await slackFetch(account.token, "conversations.history", { channel, limit: 200 });
+  return (page.messages || [])
+    .filter((message) => Number(message.reply_count) > 0 && !message.subtype)
+    .slice(0, limit)
+    .map((message) => slackThreadRow(account, channel, message));
+});
 
-// Upstream node-pty, not the prebuilt-multiarch fork: that one publishes
-// prebuilds for linux only and omits its C++ sources, so it cannot be built
-// for macOS at all.
-const pty = require("node-pty");
+/** One thread, by the pair that names it — what a pasted link comes down to. */
+ipcMain.handle("slack-thread", async (_event, rawChannel, rawTs) => {
+  const account = readSlack();
+  if (!account) throw new Error("Slack is not connected");
+  const channel = String(rawChannel || "");
+  const ts = String(rawTs || "");
+  if (!/^[CGD][A-Z0-9]+$/.test(channel) || !/^\d+\.\d+$/.test(ts)) throw new Error("that is not a Slack message link");
+  const page = await slackFetch(account.token, "conversations.replies", { channel, ts, limit: 1 });
+  const parent = (page.messages || [])[0];
+  if (!parent) throw new Error("that message is not in Slack any more");
+  return slackThreadRow(account, channel, parent);
+});
 
-/** A session's tmux name. The id is Claude's own, so the two never drift apart. */
-const tmuxName = (id) => `bedrock-${String(id)}`;
+/**
+ * Starts a thread: posts its first message. There is no other way to make one — a thread
+ * IS a message with answers — so what the note is called is what goes to the channel, and
+ * the timestamp Slack mints for it is the thread's name from then on.
+ */
+ipcMain.handle("slack-post", async (_event, rawChannel, rawText) => {
+  const account = readSlack();
+  if (!account) throw new Error("Slack is not connected");
+  const channel = String(rawChannel || "");
+  const text = String(rawText || "").trim();
+  if (!/^[CG][A-Z0-9]+$/.test(channel)) throw new Error("no channel chosen — Settings → Integrations → Slack");
+  if (!text) throw new Error("nothing to post");
+  const posted = await slackFetch(account.token, "chat.postMessage", { channel, text, unfurl_links: false });
+  return slackThreadRow(account, channel, { ...(posted.message || {}), ts: posted.ts, text, reply_count: 0 });
+});
+
+/**
+ * Opens THE thread. The Slack app answers `slack://` directly, thread view and all; the
+ * https permalink is the fallback for a Mac without it, and lands in the browser, which
+ * hands it to Slack's web client (or the app, if it turns out to be there after all).
+ */
+ipcMain.handle("slack-open", async (_event, rawUrl) => {
+  const url = String(rawUrl || "");
+  const link = parseSlackLink(url);
+  if (!link) return false;
+  const account = readSlack();
+  const team = account && account.teamId;
+  if (team && fs.existsSync("/Applications/Slack.app")) {
+    try {
+      await shell.openExternal(
+        `slack://channel?team=${team}&id=${link.channel}&message=${link.ts}&thread_ts=${link.ts}`,
+      );
+      return true;
+    } catch {
+      /* no handler for slack:// after all — the browser then */
+    }
+  }
+  void shell.openExternal(url);
+  return true;
+});
+
+/**
+ * What a Slack permalink names — `…/archives/C0123ABCD/p1693000000123456`, with a
+ * `thread_ts` alongside when the link was copied from a reply rather than the message
+ * that started the thread. The thread's own timestamp wins, so a link to any reply
+ * attaches the whole thread.
+ */
+function parseSlackLink(text) {
+  let url;
+  try {
+    url = new URL(String(text || "").trim());
+  } catch {
+    return null;
+  }
+  if (!/(^|\.)slack\.com$/.test(url.hostname)) return null;
+  const m = /\/archives\/([CGD][A-Z0-9]+)\/p(\d{10})(\d{6})/.exec(url.pathname);
+  if (!m) return null;
+  const thread = url.searchParams.get("thread_ts");
+  return { channel: m[1], ts: thread && /^\d+\.\d+$/.test(thread) ? thread : `${m[2]}.${m[3]}` };
+}
+
+/* --------------------------------------- running things in the person's terminal --- */
+/*
+ * Both agent integrations work the same way: Bedrock finds a CLI, gets a session an id, and
+ * hands that id to the terminal the person already uses. It owns none of what happens next,
+ * which is the point — the agent is not this app's child process, so it outlives the app
+ * without anything clever, and the person keeps the terminal they have already set up.
+ */
 
 /**
  * The PATH a terminal would have. A GUI app on macOS inherits a bare launchd environment,
- * so neither `tmux` (Homebrew) nor `claude` (~/.local/bin) is on it — asking the login
+ * so neither `agy` nor `claude` (both ~/.local/bin) is on it — asking the login
  * shell is the only way to find what the user would find. Read once and kept: it changes
  * when a shell profile does, which is not during a run.
  */
@@ -974,53 +1084,10 @@ function loginPath() {
   return loginPathCache;
 }
 
-/*
- * Variables that decide WHO a Claude session is, and must never be inherited.
- *
- * A GUI app inherits whatever launched it. Launch Bedrock from a terminal that exports
- * `ANTHROPIC_API_KEY` — or from another Claude Code session, which exports
- * `ANTHROPIC_BASE_URL` and a dozen `CLAUDE_CODE_*` of its own — and every session started
- * from here would quietly authenticate as that instead of as the CLI's own account. The
- * symptom is a billing error from an account you did not think you were using, which is a
- * miserable thing to debug and a worse thing to be charged for.
- *
- * So a session gets none of it. It runs as if you had opened a terminal yourself: the
- * login shell is still sourced below, so anything YOU export in your own profile still
- * applies — the scrub only drops what this app happened to be handed.
- */
-const INHERITED_IDENTITY = /^(ANTHROPIC_|CLAUDE_|CLAUDECODE$)/;
-
-/** The environment a session (or an attach) runs in, with that inheritance removed. */
-function termEnv() {
-  const clean = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (!INHERITED_IDENTITY.test(key)) clean[key] = value;
-  }
-  return {
-    ...clean,
-    PATH: loginPath(),
-    TERM: "xterm-256color",
-    // Or the CLI draws for whatever terminal happened to launch the app.
-    COLORTERM: "truecolor",
-  };
-}
-
-/**
- * `env -u FOO -u BAR` for whatever we were actually handed, to put in front of the command
- * tmux runs. Belt to the braces above: the tmux SERVER may already be running with an
- * environment from an earlier, dirtier launch, and a session it spawns would inherit that
- * rather than what we pass here. Unsetting at exec time is the only place that cannot be
- * got round.
- */
-const scrubArgs = () =>
-  Object.keys(process.env)
-    .filter((key) => INHERITED_IDENTITY.test(key))
-    .flatMap((key) => ["-u", key]);
-
-/** Where tmux is, or null when it is not installed. Not cached — it can be installed. */
-function tmuxPath() {
+/** Where a CLI is, or null when it is not installed. Not cached — it can be installed. */
+function binOnPath(name) {
   for (const dir of loginPath().split(":")) {
-    const candidate = path.join(dir, "tmux");
+    const candidate = path.join(dir, name);
     try {
       fs.accessSync(candidate, fs.constants.X_OK);
       return candidate;
@@ -1031,96 +1098,356 @@ function tmuxPath() {
   return null;
 }
 
-const tmux = (...args) =>
-  new Promise((resolve, reject) => {
-    const bin = tmuxPath();
-    if (!bin) return reject(new Error("tmux is not installed"));
-    execFile(bin, args, { env: termEnv() }, (err, stdout, stderr) => {
-      if (err) reject(new Error((stderr || stdout || err.message).trim()));
-      else resolve(stdout.trim());
-    });
-  });
-
-/** Whether a session is still running. `has-session` exits non-zero when it is not. */
-async function tmuxAlive(id) {
-  try {
-    await tmux("has-session", "-t", tmuxName(id));
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 /**
- * What the terminal integration can and cannot do here. `installer` is how tmux could be
- * got if it is missing — the settings window offers the button, and refuses the mode
- * until this reports a path.
+ * Hands a command to the person's terminal.
+ *
+ * Through a `.command` file rather than AppleScript on purpose. Driving Terminal with
+ * `osascript` is an Apple Events request, which means a "Bedrock wants to control Terminal"
+ * consent dialog and an `NSAppleEventsUsageDescription` in a signed build's Info.plist — a
+ * lot of ceremony to run one command. `open` on an executable `.command` asks nobody, and it
+ * goes to whichever terminal the person actually uses: Terminal, iTerm and Ghostty all
+ * register for the type, so this follows their choice rather than overriding it.
+ *
+ * Nothing is inherited from Bedrock either, which is worth saying out loud: `open` asks
+ * LaunchServices to start the terminal, so the session gets the environment the person's own
+ * shell profile gives it rather than the one this app happened to be launched with. The
+ * scrubbing the minting path has to do by hand is free here.
+ *
+ * The script is named for the session, so reopening a note rewrites its own file instead of
+ * littering, and the title goes in the window so a screen full of terminals can be told apart.
  */
-ipcMain.handle("term-status", () => {
-  const bin = tmuxPath();
-  const brew = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"].find((p) => fs.existsSync(p));
-  return {
-    tmux: bin,
-    installer: bin ? null : brew ? "brew" : null,
-    platform: process.platform,
-  };
-});
-
-/** `brew install tmux`, for the button that offers it. Slow, so it is awaited properly. */
-ipcMain.handle("term-install", async () => {
-  const brew = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"].find((p) => fs.existsSync(p));
-  if (!brew) throw new Error("Homebrew not found — install tmux yourself, then try again");
+async function handToTerminal({ id, folder, title, bin, args }) {
+  const scripts = path.join(app.getPath("userData"), "sessions");
+  fs.mkdirSync(scripts, { recursive: true });
+  const script = path.join(scripts, `${id}.command`);
+  // Single-quoted for the shell, with any quote in a path or title closed and reopened
+  // around an escaped one — a vault called "Arsenii's notes" is an ordinary thing to have.
+  const quote = (value) => `'${String(value).replace(/'/g, `'\\''`)}'`;
+  fs.writeFileSync(
+    script,
+    `#!/bin/sh\n` +
+      `# Written by Bedrock. Rewritten every time this note's node is opened.\n` +
+      `printf '\\033]0;%s\\007' ${quote(title)}\n` +
+      `cd ${quote(folder)} || exit 1\n` +
+      `exec ${quote(bin)} ${args.map(quote).join(" ")}\n`,
+    { mode: 0o755 },
+  );
   await new Promise((resolve, reject) => {
-    execFile(brew, ["install", "tmux"], { env: termEnv(), timeout: 600000 }, (err, stdout, stderr) => {
-      if (err) reject(new Error((stderr || stdout || err.message).trim().slice(-400)));
+    execFile("/usr/bin/open", [script], (err, stdout, stderr) => {
+      if (err) reject(new Error((stderr || stdout || err.message).trim()));
       else resolve(stdout);
     });
   });
-  const bin = tmuxPath();
-  if (!bin) throw new Error("tmux installed but still not on the path — restart Bedrock");
-  return { tmux: bin };
-});
+  return true;
+}
+
+/* -------------------------------------------------- antigravity, in your terminal --- */
+/*
+ * An Antigravity session, run by the `agy` CLI in the terminal the person already uses.
+ *
+ * Bedrock owns none of this, and that is the point. It does exactly two things: it gets a
+ * conversation its ID, and it hands that ID to a terminal. Everything else — the login,
+ * the agent, the transcript, whether the thing is still running — belongs to `agy` and to
+ * the store it keeps in `~/.gemini/antigravity-cli`. So there is no window to draw, no pty
+ * to babysit, and no session that dies when this app is quit.
+ *
+ * The ID is the load-bearing part, and `agy` will not take one of ours: `--conversation
+ * <unknown-uuid>` warns "not found" and quietly starts a conversation under an ID of its
+ * own, which is exactly the silent-wrong-session bug worth avoiding. It does, however,
+ * ANNOUNCE the ID: `--output-format stream-json` writes an `init` event as its first line,
+ * before any model call, carrying `conversation_id`. So a conversation is minted by
+ * starting one, reading that one line, and killing the process — which leaves a real,
+ * empty, resumable conversation on disk, costs no tokens, and needs nothing watched for.
+ *
+ * The note keeps the ID (`conversation::`) and that is the whole binding. Compare the
+ * integration this replaced, which had to watch a browser window for a URL Google minted
+ * only after the first message: nothing here is scraped, and nothing is guessed.
+ */
+
+/** Where `agy` is, or null when it is not installed. */
+const agyPath = () => binOnPath("agy");
+
+/** The CLI's own state directory — its conversations, and the proof it has ever run. */
+const agyHome = () => path.join(os.homedir(), ".gemini", "antigravity-cli");
+const agyConversations = () => path.join(agyHome(), "conversations");
+
+/*
+ * Variables that decide WHO an Antigravity session is, and must never be inherited.
+ *
+ * Minting is the one place Bedrock still runs an agent CLI as its own child, so it is the
+ * one place this matters. `agy` run by hand uses the OAuth login the person made with it —
+ * their own subscription. But the CLI will prefer an API key when it finds one in the
+ * environment, and a GUI app inherits whatever launched it: start Bedrock from a shell that
+ * exports `GEMINI_API_KEY` and every conversation minted here would authenticate — and
+ * BILL — against that key instead of the login the person thinks they are using.
+ *
+ * Minting therefore runs with these dropped. The terminal handoff needs no such care: it
+ * runs in the person's own shell and so gets the person's own environment by construction.
+ */
+const AGY_INHERITED_IDENTITY = /^(GEMINI_API_KEY|GOOGLE_API_KEY|GOOGLE_APPLICATION_CREDENTIALS|GOOGLE_CLOUD_PROJECT|GOOGLE_GENAI_)/;
+
+function agyEnv() {
+  const clean = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!AGY_INHERITED_IDENTITY.test(key)) clean[key] = value;
+  }
+  return { ...clean, PATH: loginPath() };
+}
 
 /**
- * Starts a session and hands it straight to tmux. The id is minted HERE and passed to the
- * CLI with `--session-id`, which is the whole reason this path is tidier than the app's:
- * the note knows its session's name before a word has been said in it, so nothing has to
- * be watched for or guessed at later. The transcript it writes is the ordinary one, which
- * is what lets the same session be opened in the Claude app afterwards.
+ * What this integration can do here. There is deliberately no sign-in question: `agy`
+ * holds its own OAuth login in the OS keychain, and a session that needs one says so in
+ * the terminal it opens in, where it can actually be answered. Bedrock never reads that
+ * token, and asking after it would mean touching a secret to display a pill.
  */
-ipcMain.handle("claude-cli-start", async (_event, folder, resume) => {
+ipcMain.handle("agy-status", () => {
+  const bin = agyPath();
+  return { cli: bin, ran: fs.existsSync(agyHome()), platform: process.platform };
+});
+
+/** How long to wait for the CLI to announce a conversation's id before giving up. */
+const AGY_MINT_MS = 60000;
+
+/**
+ * Mints a conversation and resolves with its id.
+ *
+ * `--print` needs a prompt, so it gets the note's name — but nothing is ever sent: the
+ * process is killed the instant the `init` line arrives, which is before the first model
+ * call. The conversation that is left behind is genuinely empty, so the first thing said
+ * in it is whatever the person types in their own terminal.
+ *
+ * `cwd` is how the workspace gets scoped: the CLI reports it back in `init`, and it is the
+ * folder the note's own place in the vault says this session is about.
+ */
+ipcMain.handle("agy-create", (_event, folder, name) => {
+  const bin = agyPath();
+  if (!bin) throw new Error("the agy CLI is not installed — antigravity.google/docs/cli");
   const dir = realFolder(folder);
   if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
     throw new Error(`${dir} is not a folder on this machine`);
   }
-  // Resuming keeps the id: `--resume` continues the same conversation rather than
-  // branching it, so the note's `session::` line stays true across any number of runs.
-  const resuming = /^[0-9a-f-]{36}$/i.test(String(resume ?? ""));
-  const id = resuming ? String(resume) : require("node:crypto").randomUUID();
-  const shell = process.env.SHELL || "/bin/zsh";
-  // Through a login shell so the CLI is found the way a terminal would find it, and
-  // `exec` so the shell does not sit around as a parent doing nothing.
-  const scrub = scrubArgs();
-  const prefix = scrub.length ? `env ${scrub.join(" ")} ` : "";
-  const command = resuming
-    ? `exec ${prefix}claude --resume ${id}`
-    : `exec ${prefix}claude --session-id ${id}`;
-  await tmux(
-    "new-session",
-    "-d",
-    "-s", tmuxName(id),
-    "-x", "120",
-    "-y", "34",
-    "-c", dir,
-    `${shell} -lc ${JSON.stringify(command)}`,
-  );
-  // No green bar across the bottom: this is a terminal that happens to be run by tmux,
-  // not a tmux the user is being asked to operate.
-  await tmux("set-option", "-t", tmuxName(id), "status", "off").catch(() => {});
-  return id;
+  return new Promise((resolve, reject) => {
+    const child = spawn(bin, ["--print", String(name || "Antigravity session"), "--output-format", "stream-json"], {
+      cwd: dir,
+      env: agyEnv(),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    let errors = "";
+    let settled = false;
+    const finish = (err, id) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      // SIGTERM first so the CLI can close its database cleanly; SIGKILL only if it hangs.
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        /* already gone */
+      }
+      const hard = setTimeout(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          /* already gone */
+        }
+      }, 2000);
+      hard.unref?.();
+      if (err) reject(err);
+      else resolve(id);
+    };
+    const timer = setTimeout(
+      () => finish(new Error("agy did not report a conversation id — run `agy` once in a terminal first")),
+      AGY_MINT_MS,
+    );
+    child.stdout.on("data", (chunk) => {
+      out += chunk;
+      const newline = out.indexOf("\n");
+      if (newline < 0) return; // the init line has not landed whole yet
+      const line = out.slice(0, newline);
+      let event = null;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        return finish(new Error(`agy said something unexpected: ${line.slice(0, 200)}`));
+      }
+      const id = event?.conversation_id;
+      if (typeof id === "string" && id) return finish(null, id);
+      finish(new Error("agy started but announced no conversation id"));
+    });
+    child.stderr.on("data", (chunk) => (errors += chunk));
+    child.on("error", (err) => finish(err));
+    child.on("exit", (code) =>
+      finish(new Error((errors.trim() || `agy exited with code ${code}`).slice(-400))),
+    );
+  });
 });
 
-ipcMain.handle("claude-cli-alive", (_event, id) => tmuxAlive(id));
+/**
+ * Hands a conversation to the person's terminal, and gets out of the way. How that is done
+ * — and why it is a `.command` file rather than AppleScript — is `handToTerminal` above.
+ */
+ipcMain.handle("agy-open", (_event, options) => {
+  const id = String(options?.id ?? "");
+  if (!/^[0-9a-f-]{36}$/i.test(id)) throw new Error("not a conversation id");
+  const bin = agyPath();
+  if (!bin) throw new Error("the agy CLI is not installed — antigravity.google/docs/cli");
+  return handToTerminal({
+    id,
+    folder: realFolder(options?.folder || os.homedir()),
+    title: String(options?.title ?? "Antigravity"),
+    bin,
+    args: ["--conversation", id],
+  });
+});
+
+/**
+ * The conversations on this machine, most recently touched first — what a note can be
+ * plugged into.
+ *
+ * Two sources, because the CLI keeps two. `conversation_summaries.db` has the titles and
+ * is what `agy`'s own resume picker reads, but it does not carry every conversation: one
+ * minted in print mode gets a database of its own and no summary row. So the summaries are
+ * read first for their names, and then the conversation directory is swept for anything
+ * they do not mention, which is listed by its id and its age. A conversation Bedrock
+ * minted but never opened is in that second group, and has to be offerable.
+ *
+ * SELECT only, over an ordinary connection. Not `-readonly`, which cannot be used here: the
+ * store is in WAL mode, and a read-only connection is not allowed to create the `-shm` file
+ * WAL needs, so it fails outright with "unable to open database file". WAL is built for
+ * exactly this instead — one writer and any number of concurrent readers — so a listing
+ * taken while a session is mid-turn is safe, and never blocks the session.
+ */
+ipcMain.handle("agy-conversations", async (_event, limit = 20) => {
+  const cap = Math.max(1, Math.min(200, Number(limit) || 20));
+  const summaries = new Map();
+  const db = path.join(agyHome(), "conversation_summaries.db");
+  if (fs.existsSync(db)) {
+    const rows = await new Promise((resolve) => {
+      execFile(
+        "/usr/bin/sqlite3",
+        [
+          "-json",
+          db,
+          "select conversation_id, title, preview, step_count, workspace_uris," +
+            " strftime('%s', last_modified_time) as at from conversation_summaries" +
+            " where killed = 0 order by last_modified_time desc limit 200",
+        ],
+        { timeout: 5000 },
+        (err, stdout) => {
+          if (err) return resolve([]); // no sqlite3, or a schema that has moved on
+          try {
+            resolve(JSON.parse(stdout || "[]"));
+          } catch {
+            resolve([]);
+          }
+        },
+      );
+    });
+    for (const row of rows) {
+      if (!row?.conversation_id) continue;
+      summaries.set(row.conversation_id, {
+        id: row.conversation_id,
+        title: String(row.title || "").trim(),
+        preview: String(row.preview || "").trim(),
+        steps: Number(row.step_count) || 0,
+        folder: firstWorkspace(row.workspace_uris),
+        at: (Number(row.at) || 0) * 1000,
+      });
+    }
+  }
+  // Everything with a database of its own, which is the real inventory.
+  let files = [];
+  try {
+    files = fs.readdirSync(agyConversations());
+  } catch {
+    files = []; // the CLI has never run here
+  }
+  const out = [];
+  for (const name of files) {
+    if (!name.endsWith(".db")) continue; // -wal and -shm are the same conversation
+    const id = name.slice(0, -".db".length);
+    const known = summaries.get(id);
+    let at = known?.at ?? 0;
+    try {
+      at = Math.max(at, fs.statSync(path.join(agyConversations(), name)).mtimeMs);
+    } catch {
+      /* vanished mid-walk */
+    }
+    out.push({ id, title: "", preview: "", steps: 0, folder: "", ...known, at });
+  }
+  return out.sort((a, b) => b.at - a.at).slice(0, cap);
+});
+
+/** The first workspace a conversation was opened on, out of the JSON list the CLI keeps. */
+function firstWorkspace(raw) {
+  try {
+    const list = JSON.parse(String(raw || "[]"));
+    const first = Array.isArray(list) ? String(list[0] ?? "") : "";
+    return first.startsWith("file://") ? decodeURIComponent(first.slice("file://".length)) : first;
+  } catch {
+    return "";
+  }
+}
+
+/* ----------------------------------------------------- claude, in your terminal --- */
+/*
+ * Claude Code, run by the `claude` CLI in the terminal the person already uses — the same
+ * shape as the Antigravity integration above, and for the same reasons.
+ *
+ * This replaced a version that ran the CLI under tmux and drew it into an xterm.js window
+ * Bedrock owned. That bought one thing — a session visible inside the app — at the price of
+ * a native pty dependency, a second renderer entry point, a tmux install to police, and an
+ * attach/detach lifecycle to explain. Handing the session to the terminal costs none of
+ * that: the process is not Bedrock's child, so it already outlives the app, and the person
+ * gets their own terminal, their own scrollback, their own key bindings.
+ *
+ * Better still, `claude` will take an id of somebody else's choosing — `--session-id` mints
+ * one and `--resume` continues it — so a note knows its session's name before a word is
+ * said in it. That is the same guarantee the Antigravity path gets out of reading an `init`
+ * event, but for free.
+ */
+
+/** Where `claude` is, or null when it is not installed. */
+const claudePath = () => binOnPath("claude");
+
+const SESSION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * What this mode needs, so the settings page can refuse it rather than fail at it. There is
+ * nothing to install beyond the CLI itself — which is the whole difference from the tmux
+ * version, whose prerequisite was something most people had never heard of.
+ */
+ipcMain.handle("claude-cli-status", () => ({ cli: claudePath(), platform: process.platform }));
+
+/**
+ * Starts a session in the person's terminal, and resolves with its id.
+ *
+ * The id is minted HERE and passed to the CLI, so the note has its session's name
+ * immediately and nothing is ever watched for or guessed at. Resuming keeps the id:
+ * `--resume` continues the same conversation rather than branching it, so a note's
+ * `session::` line stays true across any number of runs. The transcript written either way
+ * is the ordinary one, which is what lets the same session be opened in the Claude app
+ * afterwards — the two modes are two doors onto one thing.
+ */
+ipcMain.handle("claude-cli-start", async (_event, folder, resume, title) => {
+  const bin = claudePath();
+  if (!bin) throw new Error("the claude CLI is not installed — claude.com/product/claude-code");
+  const dir = realFolder(folder);
+  if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
+    throw new Error(`${dir} is not a folder on this machine`);
+  }
+  const resuming = SESSION_UUID.test(String(resume ?? ""));
+  const id = resuming ? String(resume) : crypto.randomUUID();
+  await handToTerminal({
+    id,
+    folder: dir,
+    title: String(title || "Claude"),
+    bin,
+    args: resuming ? ["--resume", id] : ["--session-id", id],
+  });
+  return id;
+});
 
 /**
  * Who the CLI will run as — read from its own `~/.claude.json`, identity only.
@@ -1147,103 +1474,6 @@ ipcMain.handle("claude-account", () => {
     };
   } catch {
     return { email: "", org: "", seat: "" };
-  }
-});
-
-/** Ends a session for good — the one thing closing a window deliberately does not do. */
-ipcMain.handle("claude-cli-kill", async (_event, id) => {
-  if (!(await tmuxAlive(id))) return false;
-  await tmux("kill-session", "-t", tmuxName(id));
-  return true;
-});
-
-/* ------------------------------------------------------------- the terminal window --- */
-
-/** Session id -> its window, so a second click raises the one already open. */
-const termWindows = new Map();
-/** webContents id -> the pty drawing into it, so closing one kills only that attach. */
-const termPtys = new Map();
-
-ipcMain.handle("claude-cli-window", async (_event, options) => {
-  const { id, title } = options ?? {};
-  if (!(await tmuxAlive(id))) throw new Error("that session is not running any more");
-
-  const existing = termWindows.get(id);
-  if (existing && !existing.isDestroyed()) {
-    existing.show();
-    existing.focus();
-    return true;
-  }
-
-  const win = new BrowserWindow({
-    width: 900,
-    height: 620,
-    title: String(title || "Claude"),
-    backgroundColor: "#1e1e1e",
-    autoHideMenuBar: true,
-    webPreferences: {
-      contextIsolation: true,
-      nodeIntegration: false,
-      preload: path.join(__dirname, "preload.cjs"),
-    },
-  });
-  termWindows.set(id, win);
-  win.on("closed", () => {
-    if (termWindows.get(id) === win) termWindows.delete(id);
-  });
-  win.webContents.setWindowOpenHandler(({ url }) => {
-    if (/^https?:/.test(url)) void shell.openExternal(url);
-    return { action: "deny" };
-  });
-  // The session id rides in the hash: the terminal page asks for it back on load.
-  await win.loadURL(`app://-/terminal.html#${encodeURIComponent(id)}`);
-  return true;
-});
-
-/**
- * Draws a running session into the window that asked. The pty runs `tmux attach` and
- * nothing else — it is a viewport, and killing it detaches rather than ends.
- */
-ipcMain.handle("term-attach", (event, options) => {
-  const { id, cols, rows } = options ?? {};
-  const bin = tmuxPath();
-  if (!bin) throw new Error("tmux is not installed");
-  const contentsId = event.sender.id;
-  termPtys.get(contentsId)?.kill();
-
-  const term = pty.spawn(bin, ["attach", "-t", tmuxName(id)], {
-    name: "xterm-256color",
-    cols: Math.max(20, Number(cols) || 120),
-    rows: Math.max(5, Number(rows) || 34),
-    cwd: os.homedir(),
-    env: termEnv(),
-  });
-  termPtys.set(contentsId, term);
-
-  term.onData((data) => {
-    if (!event.sender.isDestroyed()) event.sender.send("term-data", data);
-  });
-  term.onExit(() => {
-    termPtys.delete(contentsId);
-    if (!event.sender.isDestroyed()) event.sender.send("term-ended");
-  });
-  // The window going away detaches; the session carries on without a viewer.
-  event.sender.once("destroyed", () => {
-    termPtys.get(contentsId)?.kill();
-    termPtys.delete(contentsId);
-  });
-  return true;
-});
-
-ipcMain.on("term-input", (event, data) => {
-  termPtys.get(event.sender.id)?.write(String(data));
-});
-
-ipcMain.on("term-resize", (event, cols, rows) => {
-  try {
-    termPtys.get(event.sender.id)?.resize(Math.max(20, cols | 0), Math.max(5, rows | 0));
-  } catch {
-    /* the pty went away between the resize and the render */
   }
 });
 
@@ -1435,6 +1665,59 @@ function transcriptsFor(dir) {
 }
 
 /**
+ * A session's name, best answer first: the one somebody typed, then the one Claude Code
+ * derived, and only then the first thing said in it.
+ *
+ * That last fallback needs cleaning rather than trusting. A session resumed from a slash
+ * command opens with a `<local-command-caveat>` block, so a row taken straight off the
+ * first message reads "Caveat: The messages below were generated by…" — which names every
+ * such session identically and none of them usefully. Tags of that shape are dropped, and
+ * a session with nothing left to say is left unnamed for the caller to fall back on its id.
+ */
+function sessionTitle(custom, derived, first) {
+  if (custom.trim()) return custom.replace(/\s+/g, " ").trim().slice(0, 70);
+  if (derived.trim()) return derived.replace(/\s+/g, " ").trim().slice(0, 70);
+  const cleaned = first
+    .replace(/<local-command-[^>]*>[\s\S]*?<\/local-command-[^>]*>/g, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/^Caveat:[\s\S]*?(?=\n|$)/, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return cleaned.slice(0, 70);
+}
+
+/**
+ * When a session was last worked in, read out of its transcript rather than off the file.
+ *
+ * The file's mtime is NOT this. Anything that rewrites a file without a session running —
+ * a backup restored, a folder synced, an archive unpacked — sets every mtime it touches to
+ * the same instant, and on this machine that has already happened twice: of 138 transcripts,
+ * 58 share one mtime and 37 share another. Sorting by that puts a hundred sessions in an
+ * arbitrary order and buries whichever ones were genuinely recent, which is exactly the
+ * "it does not show me the latest sessions" symptom.
+ *
+ * The last turn's own timestamp cannot be touched by any of that, so it is what is used.
+ * Read from the tail, which is a fixed cost per session however many megabytes it runs to.
+ */
+function lastTurnAt(file) {
+  const lines = tailLines(file, 32 * 1024);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (!line.trim()) continue;
+    try {
+      const entry = JSON.parse(line);
+      if (entry.timestamp) {
+        const at = Date.parse(entry.timestamp);
+        if (at) return at;
+      }
+    } catch {
+      /* a half-written line at the very end of a live session */
+    }
+  }
+  return 0;
+}
+
+/**
  * Enough about a session to recognise it in a list: where it ran, what was first said in it,
  * and the title the app gave it. Titles are rewritten as a session goes on and land at the
  * END of the transcript, so they come from the tail while the folder and the opening line
@@ -1480,8 +1763,9 @@ function sessionSummary(session) {
   return {
     id: session.id,
     folder: cwd ?? "",
-    title: (custom || derived || first).replace(/\s+/g, " ").trim().slice(0, 70),
-    at: session.at,
+    title: sessionTitle(custom, derived, first),
+    // What "latest" means: the last turn in it, not the last time the file was written.
+    at: lastTurnAt(session.file) || session.at,
   };
 }
 
@@ -1492,14 +1776,18 @@ function sessionSummary(session) {
  * inferring whenever somebody is there to choose.
  */
 ipcMain.handle("claude-sessions", (_event, limit = 14) => {
-  const out = [];
+  // Every session is summarised before any is dropped, because the ordering key lives
+  // INSIDE the transcript (see `lastTurnAt`) — taking the first N by mtime and sorting
+  // those is what hid the recent ones. The cost is a tail read per session, which is
+  // flat in the size of a session and is what the status poll already pays.
+  const all = [];
   for (const session of transcripts()) {
-    if (out.length >= limit) break;
     const summary = sessionSummary(session);
     if (!summary.folder) continue; // not a transcript we can say anything useful about
-    out.push(summary);
+    all.push(summary);
   }
-  return out;
+  all.sort((a, b) => b.at - a.at);
+  return all.slice(0, Math.max(1, Number(limit) || 14));
 });
 
 /** How long after opening the link a new session in that folder could still be ours. */
@@ -2565,15 +2853,6 @@ app.whenReady().then(() => {
   if (process.platform === "darwin" && !app.isPackaged && fs.existsSync(DEV_ICON)) {
     app.dock.setIcon(DEV_ICON);
   }
-  // Session-wide user agent for the gemini partition: every request — first page,
-  // redirects, sign-in popups — reads as plain Chrome, or Google blocks the login.
-  const gemini = session.fromPartition(GEMINI_PARTITION);
-  gemini.setUserAgent(
-    gemini
-      .getUserAgent()
-      .replace(/\sElectron\/\S+/, "")
-      .replace(new RegExp(`\\s${app.getName()}/\\S+`), ""),
-  );
   buildMenu();
   createWindow();
   app.on("activate", () => {
