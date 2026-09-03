@@ -11,30 +11,9 @@
 import type { Vault } from "./vault";
 
 export type Point = { x: number; y: number };
-/**
- * A folder box: its size, the centre it sits at, and the two colours it may have been
- * given — the fill inside it and the fence around it. `user` marks a size the user set
- * by dragging a corner. The centre has to be cached too — a box's position is otherwise
- * derived from the notes inside it, so one note left off-centre would drag the whole
- * frame across the canvas on the next start.
- *
- * A folder has no file of its own to write any of this into, which is why it lives here:
- * `.notes/layout.json` is where the canvas keeps what it knows that the notes do not.
- */
-export type StoredFrame = {
-  w: number;
-  h: number;
-  user?: boolean;
-  x?: number;
-  y?: number;
-  bg?: string;
-  fence?: string;
-};
-
 type Snapshot = {
   version: 1;
   nodes: Record<string, Point>;
-  frames: Record<string, StoredFrame>;
 };
 
 export const NOTES_DIR = ".notes";
@@ -54,15 +33,9 @@ const isPoint = (value: unknown): value is Point => {
   return !!at && Number.isFinite(at.x) && Number.isFinite(at.y);
 };
 
-const isFrame = (value: unknown): value is StoredFrame => {
-  const frame = value as StoredFrame | null;
-  return !!frame && frame.w > 0 && frame.h > 0;
-};
-
 export class SpatialStore {
   private vault: Vault | null = null;
   private nodes = new Map<string, Point>();
-  private frames = new Map<string, StoredFrame>();
   private timer: number | undefined;
   private dirty = false;
   /** What was on disk when this vault was opened, and whether it has been backed up. */
@@ -81,7 +54,6 @@ export class SpatialStore {
     this.vault = vault;
     this.gen++;
     this.nodes.clear();
-    this.frames.clear();
     this.opened = "";
     this.backedUp = false;
 
@@ -98,18 +70,6 @@ export class SpatialStore {
       const snap = JSON.parse(raw) as Partial<Snapshot>;
       for (const [path, at] of Object.entries(snap.nodes ?? {})) {
         if (isPoint(at)) this.nodes.set(path, { x: at.x, y: at.y });
-      }
-      for (const [path, frame] of Object.entries(snap.frames ?? {})) {
-        if (!isFrame(frame)) continue;
-        const placed = Number.isFinite(frame.x) && Number.isFinite(frame.y);
-        this.frames.set(path, {
-          w: frame.w,
-          h: frame.h,
-          user: frame.user,
-          ...(placed ? { x: frame.x, y: frame.y } : {}),
-          ...(typeof frame.bg === "string" ? { bg: frame.bg } : {}),
-          ...(typeof frame.fence === "string" ? { fence: frame.fence } : {}),
-        });
       }
     } catch {
       // A corrupt cache is a cosmetic loss. Never let it stop the vault opening.
@@ -134,28 +94,6 @@ export class SpatialStore {
 
   node(path: string): Point | undefined {
     return this.nodes.get(path);
-  }
-
-  frame(folder: string): StoredFrame | undefined {
-    return this.frames.get(folder);
-  }
-
-  setFrame(folder: string, frame: StoredFrame): void {
-    const held = this.frames.get(folder);
-    const same =
-      held &&
-      held.w === frame.w &&
-      held.h === frame.h &&
-      held.user === frame.user &&
-      // Colours are only compared when this call carries them: the capture after a drag
-      // says nothing about them, and must not be read as saying they were cleared.
-      (frame.bg === undefined || held.bg === frame.bg) &&
-      (frame.fence === undefined || held.fence === frame.fence) &&
-      // A box that has never been placed keeps whatever centre it already had.
-      (frame.x === undefined || (Math.abs((held.x ?? NaN) - frame.x) <= 0.5 && Math.abs((held.y ?? NaN) - (frame.y ?? 0)) <= 0.5));
-    if (same) return;
-    this.frames.set(folder, { ...held, ...frame });
-    this.schedule();
   }
 
   /**
@@ -196,7 +134,6 @@ export class SpatialStore {
     const snap: Snapshot = {
       version: 1,
       nodes: Object.fromEntries(this.nodes),
-      frames: Object.fromEntries(this.frames),
     };
     try {
       // Keep the arrangement this vault was opened with, once, before touching it.

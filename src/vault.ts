@@ -251,9 +251,23 @@ export class FolderVault implements Vault {
     return this.root.name;
   }
 
+  /** The folder itself — what another window of the app needs to open this same vault. */
+  get directory(): FileSystemDirectoryHandle {
+    return this.root;
+  }
+
   static async pick(): Promise<FolderVault> {
     const handle = await window.showDirectoryPicker({ mode: "readwrite" });
     return new FolderVault(handle);
+  }
+
+  /**
+   * A folder inside this vault, as a vault of its own. Made if it is not there yet: a vault
+   * node that has never been opened is a vault that does not exist yet, and opening it is
+   * what brings it into being.
+   */
+  async child(dir: string): Promise<FolderVault> {
+    return new FolderVault(await this.dir(dir, true));
   }
 
   /** One walk, both listings: markdown entries for the app, image paths for embeds. */

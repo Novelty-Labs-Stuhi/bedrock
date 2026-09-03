@@ -291,3 +291,10 @@ type GitStatus = {
   ahead: number;
   behind: number;
 };
+
+/** cytoscape-cola ships no typings; it is a plain cytoscape extension. */
+declare module "cytoscape-cola" {
+  import type { Ext } from "cytoscape";
+  const cola: Ext;
+  export default cola;
+}

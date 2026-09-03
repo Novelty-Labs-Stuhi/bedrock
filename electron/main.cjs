@@ -35,28 +35,46 @@ function serve(request) {
   return net.fetch(pathToFileURL(target).toString());
 }
 
-function createWindow() {
-  const win = new BrowserWindow({
-    width: 1280,
-    height: 820,
-    minWidth: 720,
-    minHeight: 460,
-    title: "Bedrock",
-    backgroundColor: "#1e1e1e",
-    ...(process.platform !== "darwin" && !app.isPackaged ? { icon: DEV_ICON } : {}),
-    webPreferences: {
-      contextIsolation: true,
-      nodeIntegration: false,
-      preload: path.join(__dirname, "preload.cjs"),
-    },
-  });
+/** One Bedrock window's options — the first one's, and every one the app opens of itself. */
+const windowOptions = () => ({
+  width: 1280,
+  height: 820,
+  minWidth: 720,
+  minHeight: 460,
+  title: "Bedrock",
+  backgroundColor: "#1e1e1e",
+  ...(process.platform !== "darwin" && !app.isPackaged ? { icon: DEV_ICON } : {}),
+  webPreferences: {
+    contextIsolation: true,
+    nodeIntegration: false,
+    preload: path.join(__dirname, "preload.cjs"),
+  },
+});
 
-  // http(s) links in notes belong in the real browser, not in this window.
-  win.webContents.setWindowOpenHandler(({ url }) => {
-    if (/^https?:/.test(url)) void shell.openExternal(url);
+/**
+ * What a `window.open` from the renderer is allowed to do. http(s) links in notes belong
+ * in the real browser, not in this window. The app's own address is the one thing it may
+ * open a window of: a vault node opens its vault in a second Bedrock window, and hands it
+ * the folder over `postMessage` — which is why the renderer has to open it itself rather
+ * than ask the shell to (the handle can only travel between two windows that know each
+ * other).
+ */
+function openHandler({ url }) {
+  if (/^https?:/.test(url)) {
+    void shell.openExternal(url);
     return { action: "deny" };
-  });
+  }
+  if (url.startsWith("app://-/")) {
+    return { action: "allow", overrideBrowserWindowOptions: windowOptions() };
+  }
+  return { action: "deny" };
+}
 
+function createWindow() {
+  const win = new BrowserWindow(windowOptions());
+  win.webContents.setWindowOpenHandler(openHandler);
+  // A window the renderer opened is a Bedrock window too, and gets the same rules.
+  win.webContents.on("did-create-window", (child) => child.webContents.setWindowOpenHandler(openHandler));
   void win.loadURL("app://-/");
 }
 

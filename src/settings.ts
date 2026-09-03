@@ -74,21 +74,15 @@ export type Look = {
   node: string;
   /** A connection nobody has coloured. */
   edge: string;
-  /** A folder box's fill, its fence and its name. */
-  folder: string;
-  /** Whether a folder box is drawn with a line round it at all. */
-  fence: boolean;
   /**
    * Whether notes and connections wear their names all the time. Off, the graph is read
    * as shapes and a name is something you go and ask for: the pointer on a note names it,
    * its neighbours and the links between them, and the pointer on a link names that link.
-   * A folder box keeps its name either way — a box cannot be hovered (see the `events: no`
-   * in the stylesheet), so a nameless one would have no way of ever saying what it is.
    */
   captions: boolean;
 };
 
-const LOOK_DEFAULT: Look = { bg: "", node: "", edge: "", folder: "", fence: true, captions: true };
+const LOOK_DEFAULT: Look = { bg: "", node: "", edge: "", captions: true };
 
 /* ------------------------------------------------------------------ layout --- */
 
@@ -104,6 +98,14 @@ export type LayoutPrefs = {
   sizeMin: number;
   sizeMax: number;
   /**
+   * The layout run's two dials, in canvas pixels — see `colaOptions` in graph.ts. How long
+   * a link wants to be, centre to centre; and how much clear ground every note keeps round
+   * itself, label included. Between them: how tight a cluster knots, and how far apart
+   * everything sits.
+   */
+  edgeLength: number;
+  nodeSpacing: number;
+  /**
    * What a plain scroll does. "pan" is the trackpad's reading — two fingers move the
    * canvas, a pinch zooms it; "zoom" is the mouse's, where the wheel zooms and the canvas
    * is dragged with the right button held. Right-drag pans in both.
@@ -111,7 +113,17 @@ export type LayoutPrefs = {
   scroll: "pan" | "zoom";
 };
 
-export const LAYOUT_DEFAULT: LayoutPrefs = { sizing: "degree", sizeMin: 20, sizeMax: 68, scroll: "pan" };
+export const LAYOUT_DEFAULT: LayoutPrefs = {
+  sizing: "degree",
+  sizeMin: 20,
+  sizeMax: 68,
+  edgeLength: 140,
+  nodeSpacing: 14,
+  scroll: "pan",
+};
+/** What the two layout dials run between. */
+export const EDGE_LENGTH_RANGE = { min: 40, max: 400 };
+export const NODE_SPACING_RANGE = { min: 0, max: 80 };
 /** What a note can be sized between, whatever gets typed. */
 export const SIZE_RANGE = { min: 6, max: 200 };
 
@@ -297,6 +309,11 @@ const SETUP_DEFAULT: Setup = {
 const clampSize = (value: number): number =>
   Math.round(Math.min(SIZE_RANGE.max, Math.max(SIZE_RANGE.min, value)));
 
+const clampDial = (key: "edgeLength" | "nodeSpacing", value: number): number => {
+  const range = key === "edgeLength" ? EDGE_LENGTH_RANGE : NODE_SPACING_RANGE;
+  return Math.round(Math.min(range.max, Math.max(range.min, value)));
+};
+
 export class SettingsStore {
   private vault: Vault | null = null;
   private features: Record<Feature, boolean> = { ...DEFAULTS };
@@ -343,11 +360,10 @@ export class SettingsStore {
         const value = parsed.features?.[was];
         if (typeof value === "boolean" && parsed.features?.[now] === undefined) this.features[now] = value;
       }
-      for (const key of ["bg", "node", "edge", "folder"] as const) {
+      for (const key of ["bg", "node", "edge"] as const) {
         const value = parsed.look?.[key];
         if (typeof value === "string") this.looks[key] = value;
       }
-      if (typeof parsed.look?.fence === "boolean") this.looks.fence = parsed.look.fence;
       if (typeof parsed.look?.captions === "boolean") this.looks.captions = parsed.look.captions;
       for (const key of Object.keys(SETUP_DEFAULT) as Array<keyof Setup>) {
         const value = parsed.setup?.[key];
@@ -359,6 +375,10 @@ export class SettingsStore {
       for (const key of ["sizeMin", "sizeMax"] as const) {
         const value = parsed.layout?.[key];
         if (typeof value === "number" && Number.isFinite(value)) this.layouts[key] = clampSize(value);
+      }
+      for (const key of ["edgeLength", "nodeSpacing"] as const) {
+        const value = parsed.layout?.[key];
+        if (typeof value === "number" && Number.isFinite(value)) this.layouts[key] = clampDial(key, value);
       }
       if (parsed.layout?.scroll === "zoom") this.layouts.scroll = "zoom";
       // Version 2 kept the Claude folder on its own; it is a setup like any other now.
@@ -408,7 +428,12 @@ export class SettingsStore {
   setLayout(patch: Partial<LayoutPrefs>): void {
     let changed = false;
     for (const [key, value] of Object.entries(patch) as Array<[keyof LayoutPrefs, never]>) {
-      const next = key === "sizeMin" || key === "sizeMax" ? (clampSize(value) as never) : value;
+      const next =
+        key === "sizeMin" || key === "sizeMax"
+          ? (clampSize(value) as never)
+          : key === "edgeLength" || key === "nodeSpacing"
+            ? (clampDial(key, value) as never)
+            : value;
       if (this.layouts[key] === next) continue;
       this.layouts[key] = next;
       changed = true;
@@ -444,20 +469,27 @@ export class SettingsStore {
     this.timer = window.setTimeout(() => void this.flush(), WRITE_DELAY);
   }
 
+  /**
+   * The config file as it would be written now — defaults included, whether or not this
+   * vault has ever saved one. What a vault made inside this one starts from.
+   */
+  snapshot(): string {
+    return (
+      JSON.stringify(
+        { version: 3, features: this.features, look: this.looks, setup: this.setups, layout: this.layouts },
+        null,
+        1,
+      ) + "\n"
+    );
+  }
+
   async flush(): Promise<void> {
     clearTimeout(this.timer);
     this.timer = undefined;
     if (!this.dirty || !this.vault) return;
     this.dirty = false;
     try {
-      await this.vault.write(
-        CONFIG_FILE,
-        JSON.stringify(
-          { version: 3, features: this.features, look: this.looks, setup: this.setups, layout: this.layouts },
-          null,
-          1,
-        ) + "\n",
-      );
+      await this.vault.write(CONFIG_FILE, this.snapshot());
     } catch {
       /* read-only vault */
     }
@@ -664,18 +696,9 @@ export function mountSettings(
         "a link nobody has coloured",
         swatchRow("edge", look.edge, { title: "The usual red", fill: "#f92411" }),
       ) +
-      lookRow(
-        "Folders",
-        "the fill, the fence and the name of a folder box",
-        swatchRow("folder", look.folder, { title: "The usual blue", fill: "#4c8dff" }),
-      ) +
-      `<label class="setting"><input type="checkbox" data-look="fence"${look.fence ? " checked" : ""} />` +
-      `<span><b>Fence round folders</b><small>off leaves a patch of coloured ground with a name on it` +
-      ` — a folder that styled its own fence still gets one</small></span></label>` +
       `<label class="setting"><input type="checkbox" data-look="captions"${look.captions ? " checked" : ""} />` +
       `<span><b>Names on the canvas</b><small>off reads the graph as shapes: put the pointer on a note` +
-      ` to name it, its neighbours and the links between them, or on a link to name that link` +
-      ` — folder names stay, a box has no other way to say what it is</small></span></label>`
+      ` to name it, its neighbours and the links between them, or on a link to name that link</small></span></label>`
     );
   };
 
@@ -691,15 +714,24 @@ export function mountSettings(
 
   const layout = (): string => {
     const prefs = store.layout();
+    /** A slider with its value beside it; the next run reads it, nothing moves on its own. */
+    const dial = (field: "edgeLength" | "nodeSpacing", label: string, what: string, range: { min: number; max: number }): string =>
+      `<label class="settings-dial"><span class="settings-dial-head"><b>${label}</b>` +
+      `<output data-dial-out="${field}">${prefs[field]}</output> px</span>` +
+      `<input type="range" data-layout="${field}" value="${prefs[field]}" min="${range.min}" max="${range.max}" step="1" />` +
+      `<small>${what}</small></label>`;
     const number = (field: "sizeMin" | "sizeMax", label: string): string =>
       `<label class="settings-num"><span>${label}</span>` +
       `<input type="number" data-layout="${field}" value="${prefs[field]}" min="${SIZE_RANGE.min}" max="${SIZE_RANGE.max}" step="1" /> px</label>`;
     return (
       `<div class="settings-look"><h5>Run the layout</h5>` +
-      `<small>nothing on the canvas moves until you ask: this relaxes every note and folder from where it is now` +
-      ` — springs on the links, breathing room between neighbours — and a drag round some notes offers the same for` +
-      ` just those</small>` +
-      `<button type="button" class="settings-run" data-layout-run>Lay out the whole graph</button></div>` +
+      `<small>nothing on the canvas moves until you ask: this arranges every note from where it is now (cola —` +
+      ` linked notes at the Pull distance, every note keeping the Spread clear round its label), and a drag round` +
+      ` some notes offers the same for just those, with the rest held still</small>` +
+      `<button type="button" class="settings-run" data-layout-run>Lay out the whole graph</button>` +
+      dial("edgeLength", "Pull", "how long a link wants to be — shorter knots a cluster tighter", EDGE_LENGTH_RANGE) +
+      dial("nodeSpacing", "Spread", "clear ground round every note — more pushes everything apart", NODE_SPACING_RANGE) +
+      `</div>` +
       `<div class="settings-look"><h5>Note sizes</h5><small>what a note's circle is sized by</small>` +
       choices("sizing", prefs.sizing, SIZINGS) +
       `<div class="settings-nums">${number("sizeMin", "smallest")}${number("sizeMax", "biggest")}</div></div>` +
@@ -749,12 +781,16 @@ export function mountSettings(
     button.classList.toggle("on", open);
   };
 
+  host.addEventListener("input", (event) => {
+    const box = event.target as HTMLInputElement;
+    const field = box.dataset.layout;
+    if (box.type !== "range" || !field) return;
+    const out = host.querySelector<HTMLOutputElement>(`[data-dial-out="${field}"]`);
+    if (out) out.textContent = box.value;
+  });
+
   host.addEventListener("change", (event) => {
     const box = event.target as HTMLInputElement;
-    if (box.dataset.look === "fence") {
-      store.setLook({ fence: box.checked });
-      return;
-    }
     if (box.dataset.look === "captions") {
       store.setLook({ captions: box.checked });
       return;
@@ -768,7 +804,7 @@ export function mountSettings(
       store.setLayout({ scroll: box.value === "zoom" ? "zoom" : "pan" });
       return;
     }
-    if (field === "sizeMin" || field === "sizeMax") {
+    if (field === "sizeMin" || field === "sizeMax" || field === "edgeLength" || field === "nodeSpacing") {
       const value = Number(box.value);
       if (Number.isFinite(value)) store.setLayout({ [field]: value });
       box.value = String(store.layout()[field]); // say what was kept, if it had to be clamped
@@ -813,7 +849,7 @@ export function mountSettings(
       return;
     }
     // A swatch: which field it sets is which data- attribute it carries.
-    for (const field of ["bg", "node", "edge", "folder"] as const) {
+    for (const field of ["bg", "node", "edge"] as const) {
       const value = hit.dataset[field];
       if (value === undefined) continue;
       store.setLook({ [field]: value });

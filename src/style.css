@@ -1362,14 +1362,7 @@ button.twisty:hover {
   display: none;
 }
 
-/* Group tool: the sheet takes the drag off cytoscape, the rect is what you draw. */
-.lasso-sheet {
-  position: absolute;
-  inset: 0;
-  pointer-events: auto;
-  cursor: crosshair;
-}
-
+/* The selection rectangle a drag on empty canvas draws. */
 .lasso-rect {
   position: absolute;
   border: 1px dashed var(--accent);
@@ -1806,32 +1799,6 @@ button.issue-id:hover {
     animation: none;
   }
 }
-
-/* Corner grips: nothing is drawn, the cursor is the only sign they are there. Above the
-   fence strips, which they overlap at the four ends — the corner has to win there. */
-.frame-handle {
-  position: absolute;
-  z-index: 2;
-  width: 18px;
-  height: 18px;
-  margin: -9px 0 0 -9px;
-  background: transparent;
-  pointer-events: auto;
-}
-
-/* The fence itself: four strips lying along a box's border, and the only place a folder
-   can be picked up from. Drawn nothing, like the corners — the box's own border is
-   already there to be aimed at, and the cursor says what will happen. Straddling the
-   line, so it can be grabbed from just outside the box as readily as from just in. */
-.frame-fence {
-  position: absolute;
-  z-index: 1;
-  margin: -5.5px 0 0 -5.5px;
-  background: transparent;
-  cursor: move;
-  pointer-events: auto;
-}
-
 .inline-edit {
   position: absolute;
   width: 150px;
@@ -1911,4 +1878,34 @@ button.issue-id:hover {
   background: var(--bg);
   color: var(--text);
   font: inherit;
+}
+
+/* The layout run's two dials: a slider, its value, and a line on what it does. */
+.settings-dial {
+  display: block;
+  padding: 8px 2px 2px;
+}
+
+.settings-dial-head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+}
+
+.settings-dial-head output {
+  margin-left: auto;
+  margin-right: 4px;
+  color: var(--muted);
+}
+
+.settings-dial input[type="range"] {
+  display: block;
+  width: 100%;
+  margin: 4px 0 2px;
+  accent-color: var(--accent);
+}
+
+.settings-dial small {
+  display: block;
+  color: var(--muted);
 }

@@ -4,7 +4,6 @@
 // does the choosing. What a choice MEANS to the canvas lives in `graph.ts`; where it
 // is kept (`sign:: star` and friends, in the note's own markdown) lives in `links.ts`.
 
-import type { FolderStyle } from "./frames";
 import type { NodeStyle } from "./links";
 
 /* -------------------------------------------------------------------- signs --- */
@@ -330,17 +329,6 @@ export const paint = (token: string): string =>
 /** What a pulse is, when the note asked for one without saying in what colour. */
 export const PULSE_DEFAULT = "#3fb950";
 
-/** And what a folder box is, until somebody colours it — `BOX` over in `graph.ts`. */
-export const FOLDER_BLUE = "#4c8dff";
-
-/**
- * A fence can also be taken away altogether: `fence:: none` is not a colour but the
- * absence of one, and a folder wearing it is a patch of coloured ground with a name on
- * it and no line round the outside. Its own word rather than an empty string, because
- * empty already means "whatever a folder normally looks like".
- */
-export const NO_FENCE = "none";
-
 /* --------------------------------------------------------------- animations --- */
 
 /** For now the pulsar and nothing else — the ring `graph.ts` beats out of a node's rim. */
@@ -509,43 +497,6 @@ export function showStylePicker(
       else if (colour !== undefined) style.colour = colour;
       else if (anim !== undefined) style.anim = anim;
       else if (animColour !== undefined) style.animColour = animColour;
-      else return false;
-      onChange({ ...style });
-      return true;
-    },
-  );
-}
-
-/**
- * The same panel for a folder box, which has two colours and no notion of the other two:
- * a folder is a boundary drawn round notes, so what it can say for itself is what colour
- * the ground inside it is and what colour the fence is. It has no file to keep that in —
- * see `FrameStore.setStyle`, which puts it with the box's size.
- */
-export function showFolderStylePicker(
-  at: { x: number; y: number },
-  current: FolderStyle,
-  onChange: (style: FolderStyle) => void,
-): void {
-  const style: FolderStyle = { ...current };
-  popover(
-    at,
-    () =>
-      `<div class="style-row"><h5>Background</h5>` +
-      colours("bg", style.bg, { title: "The usual blue", fill: FOLDER_BLUE }) +
-      `</div>` +
-      `<div class="style-row"><h5>Fence</h5>` +
-      colours(
-        "fence",
-        style.fence,
-        { title: "The usual blue", fill: FOLDER_BLUE },
-        { value: NO_FENCE, title: "No fence at all" },
-      ) +
-      `</div>`,
-    (data) => {
-      const { bg, fence } = data;
-      if (bg !== undefined) style.bg = bg;
-      else if (fence !== undefined) style.fence = fence;
       else return false;
       onChange({ ...style });
       return true;

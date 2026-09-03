@@ -13,11 +13,12 @@ import {
   unlinkText,
   type NodeStyle,
 } from "./links";
-import { showFolderStylePicker, showStylePicker } from "./node-style";
+import { showStylePicker } from "./node-style";
 import { askChoice, askConfirm, askPick, askText } from "./dialog";
 import { EDGE_DIR, isEdgeNote, renamedEdgeNote } from "./edges";
 import { showMenu, type MenuItem } from "./menu";
 import {
+  CONFIG_FILE,
   SettingsStore,
   applyTheme,
   canvasHex,
@@ -30,7 +31,7 @@ import { imageFiles, resetAssets, saveImage } from "./images";
 import { createEditor, type Editor } from "./editor";
 import { linkTargets } from "./markdown";
 import { Sidebar } from "./sidebar";
-import { SpatialStore } from "./spatial";
+import { SpatialStore, LAYOUT_FILE } from "./spatial";
 import { STICKY_DIR, StickyStore, isCardPath, stamp } from "./sticky";
 import {
   IdStore,
@@ -57,7 +58,6 @@ import {
   isMarkdown,
   join,
   noteName,
-  parts,
   uniquePath,
   type Entry,
   type Vault,
@@ -188,19 +188,18 @@ const sidebar = new Sidebar(ui.tree, {
   onMove: (path, kind, dir) => void moveEntry(path, kind, dir),
 });
 
-/** Bedrock's own folder in a menu: the blue frame a folder box is on the canvas —
-    deliberately not the yellow disk folder, which is a different thing entirely. */
-const BOX_ICON =
-  "data:image/svg+xml;utf8," +
-  encodeURIComponent(
-    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="10" rx="2" fill="rgba(76,141,255,0.18)" stroke="#4c8dff" stroke-width="1.6"/></svg>',
-  );
-
 /** What "an existing note" looks like in a menu: the plain red circle a note is. */
 const NOTE_DOT =
   "data:image/svg+xml;utf8," +
   encodeURIComponent(
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="#f92411"/></svg>',
+  );
+
+/** A vault in a menu: the same red as a holder's dot, squared — as the node is on the canvas. */
+const NOTE_SQUARE =
+  "data:image/svg+xml;utf8," +
+  encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><rect x="2" y="2" width="12" height="12" rx="3" fill="#f92411"/></svg>',
   );
 
 const graphView = new GraphView(ui.cy, {
@@ -220,14 +219,18 @@ const graphView = new GraphView(ui.cy, {
   },
   onOpenEdge: (source, target) => relabelEdge(source, target),
   onOpenFreeform: (path, board) => void openFreeformNode(path, board),
+  onOpenVault: (path, folder) => void openVaultNode(path, folder),
   onOpenNotion: (path, url) => void openNotionNode(path, url),
   onOpenSlack: (path, url) => void openSlackNode(path, url),
   onOpenGoogleTask: (path, task, url) => void openGoogleTaskNode(path, task, url),
   onOpenAppleNote: (path, note) => void openAppleNoteNode(path, note),
   onOpenWord: (path, doc) => void openWordNode(path, doc),
   onLinkExisting: (source, target) => linkNotes(source, target),
-  onLinkNew: (source, at, folder, kind) => {
-    if (kind === "antigravity") void createAntigravityAt(at, folder, source);
+  onLinkNew: (source, at, kind) => {
+    // A note made on the canvas lands at the vault root: folders are the sidebar's, not the graph's.
+    const folder = null;
+    if (kind === "vault") void createVaultAt(at, folder, source);
+    else if (kind === "antigravity") void createAntigravityAt(at, folder, source);
     else if (kind === "claude") void createClaudeAt(at, folder, source);
     else if (kind === "file" || kind === "folder") void createFsAt(at, folder, kind, source);
     else if (kind === "web") void createWebAt(at, folder, source);
@@ -241,24 +244,18 @@ const graphView = new GraphView(ui.cy, {
     // behind it yet, to be turned into something once it is known what.
     else void createHolderAt(at, folder, source);
   },
-  onReparent: (path, folder) => void moveEntry(path, "file", folder, true),
-  onRefolder: (path, folder) => void moveEntry(path, "dir", folder, true),
-  onGroup: (picked, frame) => void groupIntoFolder(picked, frame),
-  onSelect: (picked, client, frame) => {
+  onSelect: (picked, client) => {
     /*
-     * A rectangle drawn round some things, with no tool armed: what can be done to them,
-     * as a menu whose corner is at the cursor. Laying them out moves only them; a style
-     * lands on every note among them; a folder is the old group tool's answer.
+     * A rectangle drawn round some notes: what can be done to them, as a menu whose corner
+     * is at the cursor. Laying them out moves only them; a style lands on every one.
      */
-    const notes = picked.filter((one) => one.kind === "file").map((one) => one.path);
-    const things = picked.length === 1 ? "1 thing" : `${picked.length} things`;
-    const items: MenuItem[] = [
-      { label: "Run layout", hint: things, run: () => graphView.runLayout(picked.map((one) => one.path)) },
-    ];
-    if (settings.enabled("active") && notes.length) {
-      items.push({ label: "Style…", hint: notes.length === 1 ? "1 note" : `${notes.length} notes`, run: () => void styleNodes(notes, client) });
+    const things = picked.length === 1 ? "1 note" : `${picked.length} notes`;
+    const items: MenuItem[] = [{ label: "Run layout", hint: things, run: () => graphView.runLayout(picked) }];
+    if (settings.enabled("active")) {
+      items.push({ label: "Style…", hint: things, run: () => void styleNodes(picked, client) });
     }
-    items.push({ label: "New folder", run: () => void groupIntoFolder(picked, frame) });
+    // The notes become a vault of their own, standing here as one node.
+    items.push({ label: "Turn into a vault", hint: things, run: () => void turnSelectionIntoVault(picked) });
     showMenu(client, items, () => graphView.clearPicked());
   },
   onNodeMenu: (path, client) => {
@@ -274,6 +271,7 @@ const graphView = new GraphView(ui.cy, {
      */
     const create: MenuItem[] = [
       { label: "Holder", icon: NOTE_DOT, run: () => graphView.startLink(path) },
+      { label: "Vault", icon: NOTE_SQUARE, run: () => graphView.startLink(path, "vault") },
     ];
     const draft = (kind: DraftKind, label: string): void => {
       create.push({ label, icon: TYPE_ICONS[kind], run: () => graphView.startLink(path, kind) });
@@ -301,7 +299,7 @@ const graphView = new GraphView(ui.cy, {
       { label: "Existing node", icon: NOTE_DOT, run: () => graphView.startLink(path, "link") },
       ...attachMenu(
         (option, kind) => () =>
-          graphView.startLink(path, kind, (at, folder, source) => void option.place(at, folder, source)),
+          graphView.startLink(path, kind, (at, source) => void option.place(at, null, source)),
       ),
     ];
     items.push({ label: "Link + Attach", children: attach });
@@ -347,14 +345,20 @@ const graphView = new GraphView(ui.cy, {
     }
     showMenu(client, items);
   },
-  onCanvasMenu: (at, client, folder) => {
+  onCanvasMenu: (at, client) => {
     /*
      * Right-click on empty space. The same two branches as a note's menu, minus the
      * linking: "Create" makes a new thing here, "Attach" puts something that already
      * exists here. Each row wears its graph tile; switched-off integrations appear nowhere.
+     * What is made lands at the vault root: the graph knows nothing of folders.
      */
+    const folder = null;
     // The holder leads: it needs no integration and is what everything else can grow from.
-    const create: MenuItem[] = [{ label: "Holder", icon: NOTE_DOT, run: () => void createHolderAt(at, folder) }];
+    const create: MenuItem[] = [
+      { label: "Holder", icon: NOTE_DOT, run: () => void createHolderAt(at, folder) },
+      // A vault inside this one: a folder that opens as a whole graph of its own.
+      { label: "Vault", icon: NOTE_SQUARE, run: () => void createVaultAt(at, folder) },
+    ];
     if (settings.enabled("applenotes")) {
       create.push({ label: "Apple note", icon: TYPE_ICONS.applenote, run: () => void createAppleNoteAt(at, folder) });
     }
@@ -396,26 +400,11 @@ const graphView = new GraphView(ui.cy, {
         { label: "Folder on disk…", icon: TYPE_ICONS.folder, run: () => void createFsAt(at, folder, "folder") },
       );
     }
-    // A folder with nothing in it has no box, so "folder" IS the rectangle: pick the
-    // notes and the folder is made around them.
-    create.push({ label: "Folder", icon: BOX_ICON, run: () => graphView.startGroup() });
-
     const items: MenuItem[] = [{ label: "Create", children: create }];
     // Nothing to drag here: the click already said where, so a picked option lands at once.
     const attach = attachMenu((option) => () => void option.place(at, folder, null));
     if (attach.length) items.push({ label: "Attach", children: attach });
 
-    // Right-clicked inside a box: that box can be coloured, and told apart from the
-    // others at a glance — which is most of what a folder is for on a canvas.
-    if (folder) {
-      items.push({
-        label: `Style "${basename(folder)}"…`,
-        run: () =>
-          showFolderStylePicker(client, graphView.folderStyle(folder), (style) =>
-            graphView.setFolderStyle(folder, style),
-          ),
-      });
-    }
     showMenu(client, items);
   },
   onHint: (hint) => {
@@ -435,7 +424,17 @@ const filePaths = (): string[] => entries.filter((e) => e.kind === "file").map((
  */
 async function readDocs(): Promise<Doc[]> {
   const drawn = filePaths().filter((path) => !isCardPath(path));
-  const docs = await Promise.all(drawn.map(async (path) => ({ path, text: await vault.read(path) })));
+  const all: Doc[] = await Promise.all(drawn.map(async (path) => ({ path, text: await vault.read(path) })));
+  // A vault inside this one is opaque from out here: its notes are its own graph, and
+  // the one node standing for it is all this canvas shows of it.
+  const vaults = all.filter((doc) => parseType(doc.text) === "vault");
+  const nested = vaults.map((doc) => vaultFolderOf(doc.path, doc.text));
+  const docs = all.filter((doc) => !nested.some((folder) => doc.path.startsWith(folder + "/")));
+  // The one node standing for a vault is sized by what is inside it.
+  for (const doc of vaults) {
+    const folder = vaultFolderOf(doc.path, doc.text);
+    doc.holds = all.filter((other) => other.path.startsWith(folder + "/")).length;
+  }
   waiting = waitedFor(docs); // the graph's own read is also the answer `freshPath` needs
   return docs;
 }
@@ -925,13 +924,13 @@ async function applyRename(path: string, kind: "file" | "dir", name: string): Pr
   else {
     // Renaming a folder re-ids everything under it; without this the box and every
     // note in it would be re-placed from scratch the moment it is named.
-    graphView.carryFrame(path, next);
     graphView.carrySubtree(path, next);
   }
   if (!(await tryVault(`could not rename ${basename(path)}`, () => vault.rename(path, next, kind)))) {
     return path;
   }
   retargetTabs(path, next);
+  if (kind === "file") await followVaultFolder(next); // a vault's folder is named after its note
   // "New note" targets the selected folder, so a rename has to follow it there.
   if (kind === "dir" && (sidebar.activeDir === path || sidebar.activeDir.startsWith(path + "/"))) {
     sidebar.reveal(next + sidebar.activeDir.slice(path.length));
@@ -944,9 +943,8 @@ async function applyRename(path: string, kind: "file" | "dir", name: string): Pr
 }
 
 /**
- * Drag in the tree, or a note dropped into a folder box on the graph. `carry` keeps
- * the graph node exactly where it was let go of — right for a drop on the canvas,
- * wrong for a tree drag, where the node should re-appear inside its new box.
+ * Drag in the tree. `carry` keeps the graph node exactly where it is; without it the
+ * node re-appears in a free spot, as a note that has just arrived does.
  */
 async function moveEntry(path: string, kind: "file" | "dir", dir: string, carry = false): Promise<void> {
   const next = join(dir, basename(path));
@@ -966,10 +964,8 @@ async function moveEntry(path: string, kind: "file" | "dir", dir: string, carry 
   if (carry) {
     if (kind === "file") graphView.carryPosition(path, next);
     else {
-      // Filing a folder changes the id of the box and of everything under it. Without
-      // this the whole box would be re-placed from scratch the moment it was dropped —
-      // the arrangement inside it is the point of dragging it there in one piece.
-      graphView.carryFrame(path, next);
+      // Filing a folder changes the id of everything under it. Without this every note
+      // in it would be re-placed from scratch the moment it was dropped.
       graphView.carrySubtree(path, next);
     }
   }
@@ -996,75 +992,6 @@ async function tryVault(what: string, run: () => Promise<void>): Promise<boolean
     render();
     return false;
   }
-}
-
-/** Deepest folder holding every one of `paths` — where a group of them belongs. */
-function commonDir(paths: string[]): string {
-  const dirs = paths.map((path) => parts(dirname(path)));
-  let shared = dirs[0] ?? [];
-  for (const other of dirs.slice(1)) {
-    let i = 0;
-    while (i < shared.length && i < other.length && shared[i] === other[i]) i++;
-    shared = shared.slice(0, i);
-  }
-  return shared.join("/");
-}
-
-/**
- * A rectangle drawn on the graph becomes a folder holding whatever was inside it —
- * loose notes, whole folder boxes, or both. This is the only way to get a folder onto
- * the graph: a box is drawn from what it holds, so an empty folder has nothing to draw
- * and creating one first gets you nowhere. Everything keeps its position and the box is
- * sized to the rectangle, so the folder appears exactly where it was drawn.
- */
-async function groupIntoFolder(
-  picked: Array<{ path: string; kind: "file" | "dir" }>,
-  frame: { w: number; h: number },
-): Promise<void> {
-  const taken = new Set([...filePaths(), ...entries.filter((e) => e.kind === "dir").map((e) => e.path)]);
-  const dirs = entries.filter((e) => e.kind === "dir").map((e) => e.path);
-  const folder = uniquePath(dirs, commonDir(picked.map((one) => one.path)), "New folder", "");
-  await flushAll();
-  await vault.createDir(folder);
-
-  const moves = new Map<string, string>();
-  const moved: string[] = [];
-  const clashed: string[] = [];
-  for (const { path, kind } of picked) {
-    const next = join(folder, basename(path));
-    // Two things of the same name from different folders: the second one stays put.
-    if (taken.has(next)) {
-      clashed.push(basename(path));
-      continue;
-    }
-    // The box forms around what it holds, where it already is.
-    if (kind === "file") graphView.carryPosition(path, next);
-    else {
-      graphView.carryFrame(path, next);
-      graphView.carrySubtree(path, next);
-    }
-    if (!(await tryVault(`could not move ${basename(path)}`, () => vault.rename(path, next, kind)))) {
-      break; // the vault is unhappy — stop rather than half-group the selection
-    }
-    taken.delete(path);
-    taken.add(next);
-    retargetTabs(path, next);
-    for (const [from, to] of movesFor(path, next, kind)) moves.set(from, to);
-    moved.push(next);
-  }
-
-  const count = await relinkVault(moves);
-  graphView.presetFrame(folder, frame);
-  await syncAfterStructuralChange();
-  sidebar.reveal(folder);
-  ui.crumb.textContent = "/" + folder;
-  ui.status.textContent = clashed.length
-    ? `${moved.length} → ${folder}${relinked(count)}; left ${clashed.join(", ")} (name already taken)`
-    : `${moved.length} → ${folder}${relinked(count)} — type a name`;
-  // Name it on the box itself, so the whole gesture stays on the graph.
-  graphView.renameNode(folder, (name) => {
-    if (name) void applyRename(folder, "dir", name);
-  });
 }
 
 /**
@@ -1106,11 +1033,22 @@ async function pickFolder(): Promise<void> {
     ui.status.textContent = "folder opening needs the File System Access API (Chrome/Edge/Electron)";
     return;
   }
+  let picked: FolderVault;
   try {
-    vault = await FolderVault.pick();
+    picked = await FolderVault.pick();
   } catch {
     return; // user cancelled
   }
+  await openVault(picked);
+}
+
+/**
+ * Makes `next` the vault on screen — picked from disk, or entered from a vault node.
+ * Everything that belongs to a vault is re-read from this one: arrangement, stickies,
+ * issues, settings.
+ */
+async function openVault(next: Vault): Promise<void> {
+  vault = next;
   // Throw the old vault's graph away FIRST. A live instance makes the next render take
   // the `sync` path, which would treat the whole new vault as newly-added notes, scatter
   // them, and then save that over the arrangement this folder already had.
@@ -1530,7 +1468,7 @@ async function refreshSidebar(): Promise<void> {
   sidebar.render(entries, pathOf(pane()));
 }
 
-/** Click (or menu) on empty canvas / inside a folder box: spawn a note there. */
+/** Click (or menu) on empty canvas: spawn a note there. */
 /** Name field floating on the node itself, pre-selected. */
 function renameOnGraph(path: string): void {
   graphView.renameNode(path, (name) => {
@@ -1563,8 +1501,8 @@ async function createHolderAt(
   const path = freshPath(dir, HOLDER_NAME);
   await vault.createFile(path, "");
   entries = [...entries, { path, kind: "file" }]; // so the rename's collision check sees it
-  if (source) graphView.commitLink(source, path, { label: noteName(path), parent: dir || undefined, at });
-  else graphView.commitNode(path, noteName(path), dir || undefined, at);
+  if (source) graphView.commitLink(source, path, { label: noteName(path), at });
+  else graphView.commitNode(path, noteName(path), at);
   graphStale = true;
   ui.status.textContent = `created ${path} — name it; right-click → Turn into makes it something`;
   graphView.renameNode(path, (name) => {
@@ -1598,13 +1536,17 @@ function turnIntoMenu(path: string): MenuItem[] {
     ["files", "file", "File on disk…"],
     ["files", "folder", "Folder on disk…"],
   ];
-  const items: MenuItem[] = rows
-    .filter(([feature]) => settings.enabled(feature))
-    .map(([, kind, label]) => ({
-      label,
-      icon: TYPE_ICONS[kind],
-      run: () => void turnHolderInto(path, kind, label.replace(/…$/, "")),
-    }));
+  const items: MenuItem[] = [
+    // A vault needs no integration: it is this app again, one folder down.
+    { label: "Vault", icon: NOTE_SQUARE, run: () => void turnHolderInto(path, "vault", "vault") },
+    ...rows
+      .filter(([feature]) => settings.enabled(feature))
+      .map(([, kind, label]) => ({
+        label,
+        icon: TYPE_ICONS[kind],
+        run: () => void turnHolderInto(path, kind, label.replace(/…$/, "")),
+      })),
+  ];
   // A holder is as likely to stand for a task Google already has as for one that needs
   // making — so the one integration gets a second row, which picks instead of posting.
   if (settings.enabled("google")) {
@@ -1673,6 +1615,8 @@ async function turnHolderInto(path: string, kind: HolderKind, label: string): Pr
   let next = setField(text, "type", kind);
   if (kind === "web" && pointer) next = setField(next, "url", pointer);
   if ((kind === "file" || kind === "folder") && pointer) next = setField(next, "path", pointer);
+  // A vault is the folder called what the holder is called, beside it.
+  if (kind === "vault") next = setField(next, "vault", noteName(path));
   // A session runs where the vault says its sessions run, when it has said; the note asks
   // otherwise, on its first opening, exactly as a session made from "Create" would.
   const runIn =
@@ -1687,6 +1631,8 @@ async function turnHolderInto(path: string, kind: HolderKind, label: string): Pr
   graphStale = true;
 
   switch (kind) {
+    case "vault":
+      return makeNestedVault(path);
     case "applenote":
       return makeAppleNote(path);
     case "notion":
@@ -1714,6 +1660,258 @@ async function turnHolderInto(path: string, kind: HolderKind, label: string): Pr
     default:
       ui.status.textContent = `${noteName(path)} → ${pointer}`;
   }
+}
+
+/* ---------------------------------------------------------- nested vaults --- */
+
+/**
+ * A vault note is a pointer in the board note's mould: the folder it stands for, and
+ * nothing else. The folder IS a vault — its own `.notes/`, its own arrangement, its own
+ * settings — and clicking the node opens it in a window of its own, beside this one.
+ */
+const vaultTemplate = (folder: string): string => `type:: vault\n\nvault:: ${folder}\n`;
+
+/** The folder a vault note stands for: its `vault::` line, else the folder called what it is. */
+const vaultFolderOf = (path: string, text: string): string => parseField(text, "vault") || noteName(path);
+
+/**
+ * Brings the vault a note stands for into being, if it is not there yet: the folder, and a
+ * copy of this vault's settings in it — a vault starts as its parent is set up, and drifts
+ * from there. Then opens it, in a window of its own.
+ */
+async function makeNestedVault(path: string): Promise<void> {
+  await spawnVaultWindow(await ensureNestedVault(path));
+}
+
+/** The folder a vault note stands for, made a vault if it is not one yet. */
+async function ensureNestedVault(path: string): Promise<string> {
+  const text = await vault.read(path);
+  const folder = vaultFolderOf(path, text);
+  if (!(await vault.exists(join(folder, CONFIG_FILE)))) {
+    await vault.createDir(join(folder, dirname(CONFIG_FILE)));
+    // As this vault is set up right now, defaults and all — not the file, which a vault
+    // that never changed a setting does not have yet.
+    await vault.write(join(folder, CONFIG_FILE), settings.snapshot());
+  }
+  return folder;
+}
+
+/**
+ * A drawn selection becomes a vault: a vault node stands where the notes stood, the notes
+ * move into its folder, and every link from outside that pointed at one of them points at
+ * the vault instead — from out here the vault IS those notes. Links among the notes go
+ * with them unchanged, and so does their arrangement: it seeds the new vault's own.
+ *
+ * The node comes first and gets its name, as every made thing does; committing the name
+ * is what moves the notes. A vault node in the selection stays where it is — its folder
+ * would not follow it, and a vault inside a vault is made by opening one, not by moving.
+ */
+async function turnSelectionIntoVault(picked: string[]): Promise<void> {
+  const notes = picked.filter((path) => graphView.nodeType(path) !== "vault");
+  if (!notes.length) {
+    ui.status.textContent = "nothing to put in a vault — a vault node is not moved into another";
+    return;
+  }
+  await flushAll();
+  // The node stands where the notes were: at their centre.
+  const at = { x: 0, y: 0 };
+  let counted = 0;
+  for (const note of notes) {
+    const pos = graphView.nodePosition(note);
+    if (!pos) continue;
+    at.x += pos.x;
+    at.y += pos.y;
+    counted++;
+  }
+  if (counted) {
+    at.x /= counted;
+    at.y /= counted;
+  }
+  const path = uniquePath(filePaths(), "", "Vault", ".md");
+  await vault.createFile(path, vaultTemplate(noteName(path)));
+  entries = [...entries, { path, kind: "file" }];
+  graphView.commitNode(path, noteName(path), at, "vault");
+  graphStale = true;
+  // The vault is made and filled at once — the square is on the canvas holding the notes
+  // before anything is asked. The name comes after, like any rename: `applyRename` takes
+  // the folder along with it (`followVaultFolder`), so a vault named later is whole.
+  await fillVault(path, notes);
+  // Exactly where the notes were, now that they have gone: the commit above had to steer
+  // clear of them, and the rebuild after the move knows nothing of where they stood.
+  graphView.placeNode(path, at);
+  graphView.renameNode(path, (name) => {
+    if (name) void applyRename(path, "file", name);
+  });
+}
+
+/**
+ * A vault note renamed is a vault renamed: its folder follows the new name, and the
+ * `vault::` line with it — a vault called Research whose folder is still "Vault 2" would
+ * be a lie the sidebar-less canvas has no way to show. A folder that was never made only
+ * needs the line moved; a name another folder already has leaves the folder as it was.
+ */
+async function followVaultFolder(notePath: string): Promise<void> {
+  const text = await vault.read(notePath);
+  if (parseType(text) !== "vault") return;
+  const folder = vaultFolderOf(notePath, text);
+  const wanted = join(dirname(notePath), noteName(notePath));
+  if (folder === wanted) return;
+  const made = await vault.exists(join(folder, CONFIG_FILE));
+  if (made) {
+    if (entries.some((entry) => entry.path === wanted)) {
+      ui.status.textContent = `${wanted} already exists — the vault keeps its folder ${folder}`;
+      return;
+    }
+    if (!(await tryVault(`could not rename the vault's folder ${folder}`, () => vault.rename(folder, wanted, "dir")))) return;
+  }
+  await vault.write(notePath, setField(text, "vault", wanted));
+}
+
+/** Moves `notes` into the vault `vaultPath` stands for, repointing the links they leave behind. */
+async function fillVault(vaultPath: string, notes: string[]): Promise<void> {
+  const folder = await ensureNestedVault(vaultPath);
+  await flushAll();
+  // 1. Outside links first, from the paths as they still are: every link to a note about
+  //    to move points at the vault node instead. The moving notes' own links are left
+  //    alone — among themselves they stay right, and they travel together.
+  const moving = new Set(notes);
+  const resolver = new LinkResolver(filePaths());
+  const toVault = new Map(notes.map((note) => [note, vaultPath]));
+  const repoint = (text: string): string => relinkText(text, toVault, (target) => resolver.resolve(target));
+  let relinkedCount = 0;
+  for (const other of filePaths()) {
+    if (moving.has(other) || other === vaultPath) continue;
+    const text = await vault.read(other);
+    const next = repoint(text);
+    if (next === text) continue;
+    await vault.write(other, next);
+    relinkedCount++;
+  }
+  stickies.rewriteTexts(repoint);
+  // 2. The notes move in, arrangement and all: where each stood seeds the vault's own cache.
+  const positions: Record<string, { x: number; y: number }> = {};
+  const clashed: string[] = [];
+  let moved = 0;
+  for (const note of notes) {
+    const next = join(folder, basename(note));
+    if (await vault.exists(next)) {
+      clashed.push(basename(note));
+      continue;
+    }
+    const pos = graphView.nodePosition(note);
+    if (pos) positions[basename(note)] = { x: pos.x, y: pos.y };
+    if (!(await tryVault(`could not move ${basename(note)}`, () => vault.rename(note, next, "file")))) break;
+    retargetTabs(note, next);
+    moved++;
+  }
+  if (Object.keys(positions).length) {
+    await vault.write(join(folder, LAYOUT_FILE), JSON.stringify({ version: 1, nodes: positions }, null, 1) + "\n");
+  }
+  await syncAfterStructuralChange();
+  ui.status.textContent =
+    `${moved} → ${noteName(vaultPath)}${relinked(relinkedCount)}` +
+    (clashed.length ? `; left ${clashed.join(", ")} (name already taken there)` : "");
+}
+
+/** Click on a vault node: open its vault in a new window — making the vault first if the click is its first. */
+async function openVaultNode(path: string, folder: string | null): Promise<void> {
+  if (!folder || !(await vault.exists(join(folder, CONFIG_FILE)))) {
+    await makeNestedVault(path);
+    return;
+  }
+  await spawnVaultWindow(folder);
+}
+
+/** The message a child window sends once it is listening, and the one it is answered with. */
+const VAULT_READY = "bedrock:vault-ready";
+const VAULT_OPEN = "bedrock:vault-open";
+type VaultOpenMessage = { type: typeof VAULT_OPEN; handle: FileSystemDirectoryHandle; root: string | null };
+
+/**
+ * Opens `folder` — a vault inside this one — as a second window of the app. This window
+ * stays on its own vault; closing the new one is the way back. The folder travels as a
+ * directory handle over `postMessage`, which is the one way a window can hand another a
+ * folder without a picker: so the child is opened from here, says when it is listening,
+ * and is answered with the handle. `root` is this vault's absolute path when known, so
+ * the child can tell the shell its own (git, sessions).
+ */
+async function spawnVaultWindow(folder: string): Promise<void> {
+  const here = vault;
+  if (!(here instanceof FolderVault)) {
+    ui.status.textContent = "a vault inside a vault needs a real folder on disk";
+    return;
+  }
+  await flushAll();
+  await spatial.flush();
+  await settings.flush();
+  const child = await here.child(folder);
+  const root = knownVaultRoot();
+  const address = new URL(location.href);
+  address.searchParams.set("vault", folder);
+  const opened = window.open(address.toString(), "_blank");
+  if (!opened) {
+    ui.status.textContent = "the browser would not open a second window";
+    return;
+  }
+  const onReady = (event: MessageEvent): void => {
+    if (event.source !== opened || event.data !== VAULT_READY) return;
+    window.removeEventListener("message", onReady);
+    const message: VaultOpenMessage = {
+      type: VAULT_OPEN,
+      handle: child.directory,
+      root: root ? `${root}/${folder}` : null,
+    };
+    opened.postMessage(message, location.origin === "null" ? "*" : location.origin);
+  };
+  window.addEventListener("message", onReady);
+}
+
+/**
+ * The other half, in the child window: opened with `?vault=` in its address, it skips the
+ * front door and asks the window that opened it for the folder. Nothing happens until the
+ * handle arrives, and an opener that never answers leaves the door where it was.
+ */
+function adoptVaultFromOpener(): void {
+  const folder = new URL(location.href).searchParams.get("vault");
+  if (!folder || !window.opener) return;
+  const onOpen = (event: MessageEvent<VaultOpenMessage>): void => {
+    if (event.source !== window.opener || event.data?.type !== VAULT_OPEN || !event.data.handle) return;
+    window.removeEventListener("message", onOpen);
+    const next = new FolderVault(event.data.handle);
+    if (event.data.root) localStorage.setItem(ROOT_KEY + next.name, event.data.root);
+    void openVault(next);
+  };
+  window.addEventListener("message", onOpen);
+  (window.opener as Window).postMessage(VAULT_READY, location.origin === "null" ? "*" : location.origin);
+}
+
+/**
+ * "Create → Vault" — from the canvas menu, or from a link draft released on empty space.
+ * The note comes first and gets its name; committing the name is what makes the vault,
+ * named to match, and goes into it.
+ */
+async function createVaultAt(
+  at: { x: number; y: number },
+  folder: string | null,
+  source: string | null = null,
+): Promise<void> {
+  const dir = folder ?? "";
+  const path = uniquePath(filePaths(), dir, "Vault", ".md");
+  await vault.createFile(path, vaultTemplate(noteName(path)));
+  entries = [...entries, { path, kind: "file" }]; // so the rename's collision check sees it
+  if (source) graphView.commitLink(source, path, { label: noteName(path), at, type: "vault" });
+  else graphView.commitNode(path, noteName(path), at, "vault");
+  graphStale = true;
+  await refreshSidebar();
+  ui.status.textContent = `created ${path} — name it, and the vault is made to match`;
+  graphView.renameNode(path, (name) => {
+    void (async () => {
+      // `applyRename` carries the folder (and the `vault::` line) along with the name.
+      const finalPath = name ? ((await applyRename(path, "file", name)) ?? path) : path;
+      if (source) await finishLink(source, finalPath, null);
+      await makeNestedVault(finalPath);
+    })();
+  });
 }
 
 /* ---------------------------------------------------------------- linear --- */
@@ -3099,7 +3297,7 @@ async function createIssueAt(at: { x: number; y: number }, folder: string | null
   const text = issueTemplate();
   await vault.createFile(path, text);
   entries = [...entries, { path, kind: "file" }]; // so the rename's collision check sees it
-  graphView.commitNode(path, noteName(path), dir || undefined, at, "linear");
+  graphView.commitNode(path, noteName(path), at, "linear");
   graphView.setIssueRaw(path, text);
   graphStale = true;
   ui.status.textContent = `created ${path} — name it, and its checklist opens`;
@@ -3205,7 +3403,6 @@ async function createFsAt(
   if (source) {
     graphView.commitLink(source, path, {
       label: noteName(path),
-      parent: dir || undefined,
       at,
       type: kind,
       fspath: target,
@@ -3214,7 +3411,7 @@ async function createFsAt(
     // point of it. The connection is unnamed, as every drawn link is — a click names it.
     void finishLink(source, path, null);
   } else {
-    graphView.commitNode(path, noteName(path), dir || undefined, at, kind, undefined, target);
+    graphView.commitNode(path, noteName(path), at, kind, undefined, target);
   }
   graphStale = true;
   ui.status.textContent = `${noteName(path)} → ${target}`;
@@ -3348,13 +3545,12 @@ async function createWebAt(
   if (source) {
     graphView.commitLink(source, path, {
       label: noteName(path),
-      parent: dir || undefined,
       at,
       type: "web",
       url,
     });
   } else {
-    graphView.commitNode(path, noteName(path), dir || undefined, at, "web", url);
+    graphView.commitNode(path, noteName(path), at, "web", url);
   }
   graphStale = true;
   ui.status.textContent = `${noteName(path)} → ${url}`;
@@ -3576,12 +3772,11 @@ async function createFreeformAt(
   if (source) {
     graphView.commitLink(source, path, {
       label: noteName(path),
-      parent: dir || undefined,
       at,
       type: "freeform",
     });
   } else {
-    graphView.commitNode(path, noteName(path), dir || undefined, at, "freeform");
+    graphView.commitNode(path, noteName(path), at, "freeform");
   }
   graphStale = true;
   await refreshSidebar();
@@ -3681,12 +3876,11 @@ async function createNotionAt(
   if (source) {
     graphView.commitLink(source, path, {
       label: noteName(path),
-      parent: dir || undefined,
       at,
       type: "notion",
     });
   } else {
-    graphView.commitNode(path, noteName(path), dir || undefined, at, "notion");
+    graphView.commitNode(path, noteName(path), at, "notion");
   }
   graphStale = true;
   await refreshSidebar();
@@ -3834,12 +4028,11 @@ async function createAppleNoteAt(
   if (source) {
     graphView.commitLink(source, path, {
       label: noteName(path),
-      parent: dir || undefined,
       at,
       type: "applenote",
     });
   } else {
-    graphView.commitNode(path, noteName(path), dir || undefined, at, "applenote");
+    graphView.commitNode(path, noteName(path), at, "applenote");
   }
   graphStale = true;
   await refreshSidebar();
@@ -3937,12 +4130,11 @@ async function createWordAt(
   if (source) {
     graphView.commitLink(source, path, {
       label: noteName(path),
-      parent: dir || undefined,
       at,
       type: "word",
     });
   } else {
-    graphView.commitNode(path, noteName(path), dir || undefined, at, "word");
+    graphView.commitNode(path, noteName(path), at, "word");
   }
   graphStale = true;
   await refreshSidebar();
@@ -4216,12 +4408,11 @@ async function createGoogleTaskAt(
   if (source) {
     graphView.commitLink(source, path, {
       label: noteName(path),
-      parent: dir || undefined,
       at,
       type: "gtask",
     });
   } else {
-    graphView.commitNode(path, noteName(path), dir || undefined, at, "gtask");
+    graphView.commitNode(path, noteName(path), at, "gtask");
   }
   graphStale = true;
   await refreshSidebar();
@@ -4645,12 +4836,11 @@ async function createSlackAt(
   if (source) {
     graphView.commitLink(source, path, {
       label: noteName(path),
-      parent: dir || undefined,
       at,
       type: "slack",
     });
   } else {
-    graphView.commitNode(path, noteName(path), dir || undefined, at, "slack");
+    graphView.commitNode(path, noteName(path), at, "slack");
   }
   graphStale = true;
   await refreshSidebar();
@@ -4875,12 +5065,11 @@ async function createAntigravityAt(
   if (source) {
     graphView.commitLink(source, path, {
       label: noteName(path),
-      parent: dir || undefined,
       at,
       type: "antigravity",
     });
   } else {
-    graphView.commitNode(path, noteName(path), dir || undefined, at, "antigravity");
+    graphView.commitNode(path, noteName(path), at, "antigravity");
   }
   graphStale = true;
   ui.status.textContent = `created ${path} — name it, and clicking it starts the session`;
@@ -5207,14 +5396,13 @@ async function attachNodeAt(
   if (source) {
     graphView.commitLink(source, path, {
       label: noteName(path),
-      parent: dir || undefined,
       at,
       type: spec.kind,
       url: spec.handle,
     });
     void finishLink(source, path, null);
   } else {
-    graphView.commitNode(path, noteName(path), dir || undefined, at, spec.kind, spec.handle);
+    graphView.commitNode(path, noteName(path), at, spec.kind, spec.handle);
   }
   spec.paint?.(path);
   graphStale = true;
@@ -5550,12 +5738,11 @@ async function createClaudeAt(
   if (source) {
     graphView.commitLink(source, path, {
       label: noteName(path),
-      parent: dir || undefined,
       at,
       type: "claude",
     });
   } else {
-    graphView.commitNode(path, noteName(path), dir || undefined, at, "claude");
+    graphView.commitNode(path, noteName(path), at, "claude");
   }
   graphStale = true;
   ui.status.textContent = `created ${path} — name it, and the session opens${where ? ` in ${where}` : ""}`;
@@ -5893,6 +6080,7 @@ let vaultOpen = false;
 
 el("welcome-open").addEventListener("click", () => void pickFolder());
 el("welcome-new").addEventListener("click", () => void pickFolder());
+adoptVaultFromOpener(); // a window opened from a vault node is handed its folder, no door
 document.addEventListener("keydown", (event) => {
   // The door can be closed over an open vault; before one is open there is nothing behind it.
   if (event.key === "Escape" && vaultOpen && !ui.welcome.hidden) ui.welcome.hidden = true;
