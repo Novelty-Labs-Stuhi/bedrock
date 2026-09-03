@@ -2848,6 +2848,449 @@ ipcMain.handle("notion-open", (_event, rawUrl) => {
   return true;
 });
 
+/*
+ * Google Tasks. A task note is a pointer at a task in Google Tasks — the checkbox items
+ * that show on Google Calendar — and nothing more: the title, the due date and the tick
+ * all live with Google. Linking is OAuth in the real browser, the way Notion's is: the
+ * consent page opens, the code comes back on a loopback port, PKCE guards the exchange.
+ * The client it rides is Bedrock's own — a "Desktop app" client in Bedrock's Google Cloud
+ * project. Its id and secret ship inside the app (Google's model for installed apps has
+ * them there: they say WHICH app is asking, and every token still needs a person clicking
+ * Allow and lands only on that person's machine) but NOT inside the repository: the build
+ * writes them to electron/google-client.json from the environment — .env locally, the
+ * release workflow's secrets in CI — and that file is gitignored, so a clone carries no
+ * client and says so. Anyone who would rather not wear Bedrock's name on the consent
+ * screen can store a client of their own; both the tokens and that client are sealed with
+ * the OS keychain into the app's folder, never the vault.
+ */
+const BUILT_CLIENT_FILE = path.join(__dirname, "google-client.json");
+
+/** The client this build was made with, or null for a build made without one. */
+function builtGoogleClient() {
+  try {
+    const stored = JSON.parse(fs.readFileSync(BUILT_CLIENT_FILE, "utf8"));
+    if (typeof stored.id !== "string" || !stored.id) return null;
+    return { id: stored.id, secret: typeof stored.secret === "string" ? stored.secret : "" };
+  } catch {
+    return null;
+  }
+}
+const GOOGLE_AUTH = "https://accounts.google.com/o/oauth2/v2/auth";
+const GOOGLE_TOKEN = "https://oauth2.googleapis.com/token";
+const GOOGLE_REVOKE = "https://oauth2.googleapis.com/revoke";
+/** Tasks, plus the address of the account — the settings page says whose tasks these are. */
+const GOOGLE_SCOPES = "https://www.googleapis.com/auth/tasks openid email";
+const TASKS_API = "https://tasks.googleapis.com/tasks/v1/";
+/** Where a click lands when a task carries no address of its own. */
+const TASKS_HOME = "https://tasks.google.com/";
+const googleFile = () => path.join(app.getPath("userData"), "google.json");
+const googleClientFile = () => path.join(app.getPath("userData"), "google-client.json");
+
+/** A client of the person's own, when one has been stored; null rides Bedrock's. */
+function readGoogleClient() {
+  try {
+    const stored = JSON.parse(fs.readFileSync(googleClientFile(), "utf8"));
+    if (typeof stored.id !== "string" || !stored.id) return null;
+    return { id: stored.id, secret: stored.secret ? unseal(stored.secret) : "" };
+  } catch {
+    return null;
+  }
+}
+/** The client to ask Google with: the person's own first, else the build's. Throws for neither. */
+function googleClient() {
+  const client = readGoogleClient() || builtGoogleClient();
+  if (!client) {
+    throw new Error(
+      "this build carries no Google client — Settings → Integrations → Google Tasks → Use my own…, with a client from your own Google Cloud project",
+    );
+  }
+  return client;
+}
+
+function readGoogle() {
+  try {
+    const stored = JSON.parse(fs.readFileSync(googleFile(), "utf8"));
+    if (typeof stored.access !== "string") return null;
+    return {
+      access: unseal(stored.access),
+      refresh: typeof stored.refresh === "string" && stored.refresh ? unseal(stored.refresh) : "",
+      expires: Number(stored.expires) || 0,
+      email: typeof stored.email === "string" ? stored.email : "",
+    };
+  } catch {
+    return null; // never linked, or the keychain refused — both mean "not linked"
+  }
+}
+
+function writeGoogle(account) {
+  fs.mkdirSync(path.dirname(googleFile()), { recursive: true });
+  fs.writeFileSync(
+    googleFile(),
+    JSON.stringify({
+      version: 1,
+      access: seal(account.access),
+      refresh: account.refresh ? seal(account.refresh) : "",
+      expires: account.expires,
+      email: account.email,
+    }),
+    { mode: 0o600 },
+  );
+}
+
+/**
+ * The address inside an id_token — read, not verified: it arrived over TLS straight from
+ * Google's token endpoint, and all it does here is decorate the settings page.
+ */
+function emailOf(idToken) {
+  try {
+    const payload = JSON.parse(Buffer.from(String(idToken).split(".")[1], "base64url").toString("utf8"));
+    return String(payload.email || "");
+  } catch {
+    return "";
+  }
+}
+
+/** One round with the token endpoint. Throws Google's own words, with its code alongside. */
+async function googleTokens(body) {
+  const response = await net.fetch(GOOGLE_TOKEN, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams(body).toString(),
+  });
+  const tokens = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw Object.assign(new Error(tokens.error_description || tokens.error || `Google said ${response.status}`), {
+      code: tokens.error || response.status,
+    });
+  }
+  return tokens;
+}
+
+async function googleConnect() {
+  const client = googleClient();
+  const server = http.createServer();
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const port = server.address().port;
+  const redirect = `http://127.0.0.1:${port}/callback`;
+
+  try {
+    const verifier = b64url(crypto.randomBytes(32));
+    const state = b64url(crypto.randomBytes(16));
+    const authUrl = new URL(GOOGLE_AUTH);
+    authUrl.search = new URLSearchParams({
+      response_type: "code",
+      client_id: client.id,
+      redirect_uri: redirect,
+      scope: GOOGLE_SCOPES,
+      state,
+      code_challenge: b64url(crypto.createHash("sha256").update(verifier).digest()),
+      code_challenge_method: "S256",
+      // A refresh token too, so the link outlives the hour — and a consent screen every
+      // time, because Google hands a refresh token out only with one actually shown.
+      access_type: "offline",
+      prompt: "consent",
+    }).toString();
+
+    const code = await new Promise((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error("the browser never came back — try linking again")),
+        5 * 60 * 1000,
+      );
+      server.on("request", (request, response) => {
+        const url = new URL(request.url, `http://127.0.0.1:${port}`);
+        if (url.pathname !== "/callback") {
+          response.writeHead(404).end();
+          return;
+        }
+        response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+        response.end(
+          "<body style='font:15px system-ui;padding:3em;color:#333'>Bedrock is connected to Google Tasks — this tab can close.</body>",
+        );
+        clearTimeout(timer);
+        if (url.searchParams.get("error")) {
+          reject(new Error(url.searchParams.get("error_description") || "you said no in the browser"));
+        } else if (url.searchParams.get("state") !== state) {
+          reject(new Error("the browser came back with somebody else's answer"));
+        } else {
+          resolve(String(url.searchParams.get("code") || ""));
+        }
+      });
+      void shell.openExternal(authUrl.toString());
+    });
+
+    const tokens = await googleTokens({
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: redirect,
+      client_id: client.id,
+      client_secret: client.secret,
+      code_verifier: verifier,
+    });
+    const account = {
+      access: String(tokens.access_token || ""),
+      refresh: String(tokens.refresh_token || ""),
+      expires: Date.now() + (Number(tokens.expires_in) || 3600) * 1000,
+      email: emailOf(tokens.id_token),
+    };
+    if (!account.access) throw new Error("Google sent no token back");
+    // Google's consent screen offers each permission as its own checkbox, unticked, and
+    // "Continue" with the tasks box left empty hands back a token good for nothing here.
+    // Refused now, in words, rather than at the first task that fails.
+    if (!String(tokens.scope || "").includes("/auth/tasks")) {
+      throw new Error(
+        "Google linked the account but without access to tasks — link again and, on Google's screen, tick the box for tasks before you continue",
+      );
+    }
+    writeGoogle(account);
+    return { email: account.email };
+  } finally {
+    server.close();
+  }
+}
+
+/**
+ * A fresh access token off the refresh token. `invalid_grant` is the one answer worth
+ * translating: the person revoked Bedrock, or the client is still in Google's "testing"
+ * publishing state, where every grant dies after seven days — either way, link again.
+ */
+async function googleRefresh(account) {
+  const client = googleClient();
+  let tokens;
+  try {
+    tokens = await googleTokens({
+      grant_type: "refresh_token",
+      refresh_token: account.refresh,
+      client_id: client.id,
+      client_secret: client.secret,
+    });
+  } catch {
+    throw new Error("Google signed this app out — link the account again");
+  }
+  const next = {
+    ...account,
+    access: String(tokens.access_token || account.access),
+    expires: Date.now() + (Number(tokens.expires_in) || 3600) * 1000,
+  };
+  writeGoogle(next);
+  return next;
+}
+
+/** Google's errors, in the words a person will actually meet. */
+function googleError(status, body) {
+  const message = body && body.error && body.error.message ? String(body.error.message) : "";
+  if (status === 404) return "that task is not in Google Tasks any more";
+  if (status === 403 && /insufficient.*scopes/i.test(message)) {
+    return "the link has no access to tasks — link the account again, and tick the box for tasks on Google's screen";
+  }
+  if (status === 403 && /accessNotConfigured|has not been used|is disabled/i.test(message)) {
+    return "the Tasks API is not switched on in this client's Google Cloud project";
+  }
+  if (status === 429 || (status === 403 && /quota|rate/i.test(message))) return "Google is rate-limiting — try again in a moment";
+  return message ? `Google said: ${message}` : `Google said ${status}`;
+}
+
+/**
+ * One Tasks API call with the stored token, renewed when it has aged out or Google says
+ * so. Resolves with the JSON, null for an empty answer; throws Google's words. A 404 is
+ * thrown with its code kept, so a status poll can read "gone" off it.
+ */
+async function tasksFetch(route, init) {
+  let account = readGoogle();
+  if (!account) throw new Error("Google is not linked — Settings → Integrations → Google Tasks");
+  if (account.refresh && account.expires && account.expires - 60 * 1000 < Date.now()) {
+    account = await googleRefresh(account);
+  }
+  for (let attempt = 0; ; attempt++) {
+    const response = await net.fetch(TASKS_API + route, {
+      ...init,
+      headers: { ...((init && init.headers) || {}), authorization: `Bearer ${account.access}`, accept: "application/json" },
+    });
+    if (response.status === 401 && attempt < 1 && account.refresh) {
+      account = await googleRefresh(account);
+      continue;
+    }
+    if (response.status === 401) throw new Error("Google signed this app out — link the account again");
+    if (response.status === 204) return null;
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw Object.assign(new Error(googleError(response.status, body)), { code: response.status });
+    return body;
+  }
+}
+
+/** A task as the pointer a note keeps: where it is, what it says, and whether it is done. */
+function taskRow(list, task) {
+  const stamp = (value) => (value ? Date.parse(String(value)) || 0 : 0);
+  return {
+    list,
+    id: String(task.id || ""),
+    title: String(task.title || "").replace(/\s+/g, " ").trim(),
+    status: task.status === "completed" ? "completed" : "needsAction",
+    due: stamp(task.due),
+    completed: stamp(task.completed),
+    updated: stamp(task.updated),
+    url: String(task.webViewLink || ""),
+  };
+}
+
+/** Every page of a list's tasks. Capped, because a list nobody ever clears can run long. */
+async function allTasks(list, params) {
+  const out = [];
+  let pageToken = "";
+  do {
+    const query = new URLSearchParams({ maxResults: "100", ...params, ...(pageToken ? { pageToken } : {}) });
+    const page = (await tasksFetch(`lists/${encodeURIComponent(list)}/tasks?${query}`)) || {};
+    for (const task of page.items || []) out.push(task);
+    pageToken = String(page.nextPageToken || "");
+  } while (pageToken && out.length < 1000);
+  return out;
+}
+
+let googleConnecting = null;
+
+ipcMain.handle("google-connect", () => {
+  if (!googleConnecting) {
+    googleConnecting = googleConnect().finally(() => {
+      googleConnecting = null;
+    });
+  }
+  return googleConnecting;
+});
+
+ipcMain.handle("google-status", () => {
+  const account = readGoogle();
+  return {
+    linked: !!account,
+    email: account ? account.email : "",
+    ownClient: !!readGoogleClient(),
+    builtClient: !!builtGoogleClient(),
+  };
+});
+
+ipcMain.handle("google-forget", async () => {
+  const account = readGoogle();
+  // Told to Google too, so the grant leaves the account's "third-party access" list; a
+  // revoke that fails changes nothing here — the tokens are gone from this machine anyway.
+  if (account) {
+    await net
+      .fetch(`${GOOGLE_REVOKE}?token=${encodeURIComponent(account.refresh || account.access)}`, { method: "POST" })
+      .catch(() => null);
+  }
+  try {
+    fs.rmSync(googleFile());
+  } catch {
+    /* nothing stored */
+  }
+  return true;
+});
+
+/**
+ * A client of the person's own — id and secret from their Google Cloud project — or, with
+ * an empty id, back to Bedrock's. Changing clients unlinks: a token belongs to the client
+ * that asked for it.
+ */
+ipcMain.handle("google-client", (_event, rawId, rawSecret) => {
+  const id = String(rawId || "").trim();
+  const secret = String(rawSecret || "").trim();
+  try {
+    fs.rmSync(googleFile());
+  } catch {
+    /* nothing stored */
+  }
+  if (!id) {
+    try {
+      fs.rmSync(googleClientFile());
+    } catch {
+      /* nothing stored */
+    }
+    return false;
+  }
+  if (!/\.apps\.googleusercontent\.com$/.test(id)) {
+    throw new Error("that is not a Google OAuth client id — one ends in .apps.googleusercontent.com");
+  }
+  fs.mkdirSync(path.dirname(googleClientFile()), { recursive: true });
+  fs.writeFileSync(googleClientFile(), JSON.stringify({ version: 1, id, secret: secret ? seal(secret) : "" }), {
+    mode: 0o600,
+  });
+  return true;
+});
+
+/** The account's task lists — "My Tasks" and whatever else was made. */
+ipcMain.handle("google-lists", async () => {
+  const body = (await tasksFetch("users/@me/lists?maxResults=100")) || {};
+  return (body.items || []).map((list) => ({
+    id: String(list.id || ""),
+    title: String(list.title || "").trim() || "Untitled list",
+  }));
+});
+
+/** A list's open tasks, in the order Google keeps them — what a note can be attached to. */
+ipcMain.handle("google-tasks", async (_event, rawList) => {
+  const list = String(rawList || "").trim() || "@default";
+  const tasks = await allTasks(list, { showCompleted: "false", showHidden: "false" });
+  return tasks.filter((task) => !task.deleted).map((task) => taskRow(list, task));
+});
+
+/** Makes a task titled `title` in `list` and resolves with it. */
+ipcMain.handle("google-task-create", async (_event, rawList, rawTitle) => {
+  const list = String(rawList || "").trim() || "@default";
+  const title = String(rawTitle || "").trim() || "Untitled";
+  const task = await tasksFetch(`lists/${encodeURIComponent(list)}/tasks`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ title }),
+  });
+  if (!task || !task.id) throw new Error("Google answered, but named no task it made");
+  return taskRow(list, task);
+});
+
+/**
+ * Where each of `refs` (`list/id`) stands now — one read per task, a few at a time. A
+ * task Google no longer has comes back null. Trouble with one task is that task's alone
+ * and leaves it out of the answer, so one bad row never fails the round for the rest;
+ * only a dead login stops the round, because every row would hit it.
+ */
+ipcMain.handle("google-task-status", async (_event, rawRefs) => {
+  const refs = Array.isArray(rawRefs) ? rawRefs.map((ref) => String(ref || "")).filter(Boolean) : [];
+  const out = {};
+  const lookup = async (ref) => {
+    const slash = ref.indexOf("/");
+    if (slash <= 0) return;
+    const list = ref.slice(0, slash);
+    const id = ref.slice(slash + 1);
+    try {
+      const task = await tasksFetch(`lists/${encodeURIComponent(list)}/tasks/${encodeURIComponent(id)}`);
+      out[ref] = task && !task.deleted ? taskRow(list, task) : null;
+    } catch (err) {
+      if (err && err.code === 404) out[ref] = null;
+      else if (/link the account again|not linked/.test(String(err && err.message))) throw err;
+    }
+  };
+  for (let i = 0; i < refs.length; i += 6) await Promise.all(refs.slice(i, i + 6).map(lookup));
+  return out;
+});
+
+/** Opens THE task in Google Tasks on the web, or the Tasks app itself for one with no address. */
+ipcMain.handle("google-open", (_event, rawUrl) => {
+  const url = String(rawUrl || "").trim();
+  let target = new URL(TASKS_HOME);
+  try {
+    const parsed = new URL(url);
+    if (/(^|\.)google\.com$/.test(parsed.hostname)) target = parsed;
+  } catch {
+    /* no address on the note — the app's front door then */
+  }
+  // A browser signed into several Google accounts opens the link under whichever is its
+  // default, and a task that lives in another account is simply not found — Tasks then
+  // falls back to the overview. Naming the linked account pins the tab to the right one.
+  const account = readGoogle();
+  if (account && account.email && !target.searchParams.has("authuser")) target.searchParams.set("authuser", account.email);
+  void shell.openExternal(target.toString());
+  return true;
+});
+
 app.whenReady().then(() => {
   protocol.handle("app", serve);
   if (process.platform === "darwin" && !app.isPackaged && fs.existsSync(DEV_ICON)) {

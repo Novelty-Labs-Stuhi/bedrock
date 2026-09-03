@@ -16,7 +16,7 @@
   ],
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "node scripts/google-client.cjs && tsc && vite build",
     "preview": "vite preview",
     "start": "npm run build && electron .",
     "app": "electron .",

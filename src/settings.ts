@@ -22,6 +22,7 @@ export type Feature =
   | "freeform"
   | "notion"
   | "slack"
+  | "google"
   | "applenotes"
   | "word";
 
@@ -47,6 +48,7 @@ const DEFAULTS: Record<Feature, boolean> = {
   freeform: false,
   notion: false,
   slack: false,
+  google: false,
   applenotes: false,
   word: false,
 };
@@ -218,6 +220,10 @@ export type Setup = {
       thread, and where new ones begin is a property of the vault, not of each note. */
   slackChannel: string;
   slackChannelName: string;
+  /** The Google Tasks list new tasks go in — its id, with the name alongside. "" is the
+      account's default list ("My Tasks"), which needs no choosing. */
+  googleList: string;
+  googleListName: string;
   /**
    * Where a new Antigravity session runs when the note does not say — the same question
    * `claudeFolder` answers, asked separately because the two are rarely the same folder:
@@ -254,6 +260,8 @@ const SETUP_DEFAULT: Setup = {
   linearProjectName: "",
   slackChannel: "",
   slackChannelName: "",
+  googleList: "",
+  googleListName: "",
   antigravityFolder: "",
   gitRemote: "",
   wordFolder: "",
@@ -458,6 +466,11 @@ const INTEGRATIONS: Row[] = [
     feature: "slack",
     name: "Slack",
     what: "thread notes — start a thread in one channel, or attach one going already; a click opens it in Slack (desktop app)",
+  },
+  {
+    feature: "google",
+    name: "Google Tasks",
+    what: "task notes — the tasks on your Google Calendar; make one or attach one, and the node wears a tick when it is done (desktop app)",
   },
   {
     feature: "applenotes",

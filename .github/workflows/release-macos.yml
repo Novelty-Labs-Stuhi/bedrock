@@ -101,8 +101,13 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # The Google Tasks sign-in client. `npm run build` writes these into the
+          # gitignored electron/google-client.json (scripts/google-client.cjs), so the
+          # dmg carries them and the repository never does.
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
         # Not `npm run package:mac` — that sources .env, which is gitignored and
-        # absent here. The three vars above are what notarize-dmg.cjs reads.
+        # absent here. The Apple vars above are what notarize-dmg.cjs reads.
         run: |
           npm run build
           npx electron-builder --mac dmg --publish never

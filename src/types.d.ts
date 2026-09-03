@@ -105,6 +105,30 @@ interface Window {
         an address that is not a Slack message link. */
     slackOpen(url: string): Promise<boolean>;
 
+    /** OAuth in the browser: opens Google's consent page and catches the answer on a
+        loopback port. Resolves with the account's address once linked. */
+    googleConnect(): Promise<{ email: string }>;
+    /** `ownClient` is a client of the person's own standing in for Bedrock's; `builtClient`
+        is whether this build was made with Bedrock's at all (a clone built without the
+        secret has none, and can only link over a client of the person's own). */
+    googleStatus(): Promise<{ linked: boolean; email: string; ownClient: boolean; builtClient: boolean }>;
+    /** Revokes the grant with Google (best effort) and forgets the tokens here. */
+    googleForget(): Promise<boolean>;
+    /** Stores a Google OAuth client of the person's own, or with an empty id goes back to
+        Bedrock's. Either way the account is unlinked — a token belongs to its client. */
+    googleClient(id: string, secret: string): Promise<boolean>;
+    /** The account's task lists. */
+    googleLists(): Promise<Array<{ id: string; title: string }>>;
+    /** A list's open tasks, in Google's order. "" or "@default" means the default list. */
+    googleTasks(list: string): Promise<GoogleTask[]>;
+    /** Makes a task titled `title` in `list` and resolves with it. */
+    googleTaskCreate(list: string, title: string): Promise<GoogleTask>;
+    /** Where each `list/id` stands now: the task, null when Google no longer has it, and
+        absent when that one read failed — the round goes on for the rest. */
+    googleTaskStatus(refs: string[]): Promise<Record<string, GoogleTask | null>>;
+    /** Opens THE task in Google Tasks on the web — or Tasks itself for one with no address. */
+    googleOpen(url: string): Promise<boolean>;
+
     /** Whether Freeform is on this Mac, and whether Bedrock's shortcut — Apple's only
         door into making a board — is in the Shortcuts library. */
     freeformStatus(): Promise<{ app: boolean; shortcut: boolean }>;
@@ -209,6 +233,22 @@ type SlackThread = {
   at: number;
   latest: number;
   /** The thread's permalink — what the note keeps, and what a click opens. */
+  url: string;
+};
+
+/** A Google task as the pointer Bedrock keeps: the title, the due date and the tick stay
+    with Google. */
+type GoogleTask = {
+  /** The list it is in, and Google's id for it — together the whole handle. */
+  list: string;
+  id: string;
+  title: string;
+  status: "needsAction" | "completed";
+  /** Due, completed and last touched — epoch milliseconds, 0 for "not". */
+  due: number;
+  completed: number;
+  updated: number;
+  /** The task's own address in Google Tasks on the web — what a click opens. */
   url: string;
 };
 

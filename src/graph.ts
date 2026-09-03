@@ -296,6 +296,21 @@ const SLACK_ICON =
       "</g></svg>",
   );
 
+/**
+ * A Google task node wears Tasks' mark — the blue ring and check — drawn as SVG, on the
+ * white tile the other services sit on. Drawn rather than lifted for the same reason
+ * Slack's is: there is no app on this Mac to lift it from.
+ */
+const GTASK_ICON =
+  "data:image/svg+xml;utf8," +
+  encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 160 160">' +
+      '<rect width="160" height="160" rx="36" fill="#ffffff"/>' +
+      '<circle cx="80" cy="84" r="44" fill="none" stroke="#1a73e8" stroke-width="13"/>' +
+      '<path d="M60 84l17 17 40-46" fill="none" stroke="#1a73e8" stroke-width="13" stroke-linecap="round" stroke-linejoin="round"/>' +
+      "</svg>",
+  );
+
 /** And a Word document node: Word's own icon, lifted the same way. */
 const WORD_ICON =
   "data:image/png;base64,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";
@@ -389,6 +404,15 @@ const TYPE_STYLES: Record<string, Record<string, unknown>> = {
     "background-opacity": 0,
     "pie-size": "0%",
   },
+  // A Google task: the note holds the task's handle, and a click opens it in Google
+  // Tasks — the date and the tick are set there, and the tick comes back as a badge.
+  gtask: {
+    shape: "round-rectangle",
+    "background-image": GTASK_ICON,
+    "background-fit": "cover",
+    "background-opacity": 0,
+    "pie-size": "0%",
+  },
   // And an Apple note, the last of the siblings: a click opens it in Notes itself.
   applenote: {
     shape: "round-rectangle",
@@ -430,6 +454,7 @@ export const TYPE_ICONS: Record<string, string> = {
   freeform: FREEFORM_ICON,
   notion: NOTION_ICON,
   slack: SLACK_ICON,
+  gtask: GTASK_ICON,
   applenote: APPLE_NOTES_ICON,
   word: WORD_ICON,
 };
@@ -998,6 +1023,16 @@ export function buildElements(docs: Doc[], described: ReadonlySet<string> = new 
         // A thread node opens its thread off the permalink riding here; empty is a note
         // whose thread has not been started yet — a click starts it (see main.ts).
         ...(type === "slack" ? { sthread: parseField(doc.text, "thread") ?? "" } : {}),
+        // A task node carries its handle (what the poll asks Google about), its address
+        // (what a click opens), and the poll's own word that it is finished — a note with
+        // a `done::` line is never asked about again.
+        ...(type === "gtask"
+          ? {
+              gtask: parseField(doc.text, "task") ?? "",
+              gurl: parseField(doc.text, "url") ?? "",
+              gdone: parseField(doc.text, "done") ?? "",
+            }
+          : {}),
         // And an Apple note node its note, over the id Apple minted for it.
         ...(type === "applenote" ? { anote: parseField(doc.text, "note") ?? "" } : {}),
         // A Word node opens its document off the path riding here; empty means the
@@ -1065,6 +1100,7 @@ export type DraftKind =
   | "freeform"
   | "notion"
   | "slack"
+  | "gtask"
   | "applenote"
   | "word";
 
@@ -1104,6 +1140,7 @@ const DRAFT_NAMES: Record<DraftKind, string> = {
   freeform: "Freeform board",
   notion: "Notion page",
   slack: "Slack thread",
+  gtask: "Google task",
   applenote: "Apple note",
   word: "Word document",
 };
@@ -1148,6 +1185,11 @@ export type GraphHandlers = {
    * for a note whose thread was never started, which is an invitation to start it.
    */
   onOpenSlack: (path: string, url: string | null) => void;
+  /**
+   * Click on a Google task node: hand over the task's handle and address stored on the
+   * node — a null handle is a note whose task was never made, an invitation to make it.
+   */
+  onOpenGoogleTask: (path: string, task: string | null, url: string | null) => void;
   /**
    * Click on an Apple note node: hand over the note id stored on the node — null, again,
    * for one that has not been made yet.
@@ -1840,6 +1882,15 @@ export class GraphView {
         this.handlers.onOpenSlack(node.id(), (node.data("sthread") as string) || null);
         return;
       }
+      // A task node is a Google task's doorway: clicking it opens the task in Google Tasks.
+      if (ntype === "gtask" && this.settings.enabled("google")) {
+        this.handlers.onOpenGoogleTask(
+          node.id(),
+          (node.data("gtask") as string) || null,
+          (node.data("gurl") as string) || null,
+        );
+        return;
+      }
       // And an Apple note node its note's, in Notes itself.
       if (ntype === "applenote" && this.settings.enabled("applenotes")) {
         this.handlers.onOpenAppleNote(node.id(), (node.data("anote") as string) || null);
@@ -2516,6 +2567,7 @@ export class GraphView {
     if (type === "freeform") return { fboard: pointer };
     if (type === "notion") return { nurl: pointer };
     if (type === "slack") return { sthread: pointer };
+    if (type === "gtask") return { gurl: pointer };
     if (type === "applenote") return { anote: pointer };
     if (type === "word") return { wdoc: pointer };
     if (type === "file" || type === "folder") return { fspath: pointer };
@@ -2757,17 +2809,24 @@ export class GraphView {
     const cy = this.cy;
     if (!cy) return;
     const alive = new Set<string>();
-    if (this.settings.enabled("linear")) {
+    // A finished Google task wears the same mark: one vocabulary for "done" on the canvas.
+    const issues = this.settings.enabled("linear");
+    const tasks = this.settings.enabled("google");
+    if (issues || tasks) {
       cy.nodes().forEach((node) => {
         const dot = node as NodeSingular;
-        if (dot.data("ntype") !== "linear" || dot.data("istate") !== "done") return;
+        const ntype = dot.data("ntype") as string;
+        const finished =
+          (issues && ntype === "linear" && dot.data("istate") === "done") ||
+          (tasks && ntype === "gtask" && !!dot.data("gdone"));
+        if (!finished) return;
         if (this.issue?.path === dot.id()) return; // unfolded: its own head tick says it
         alive.add(dot.id());
         let el = this.badgeEls.get(dot.id());
         if (!el) {
           el = document.createElement("div");
           el.className = "issue-badge";
-          el.title = "Done";
+          el.title = ntype === "gtask" ? "Completed in Google Tasks" : "Done";
           this.overlay.appendChild(el);
           this.badgeEls.set(dot.id(), el);
         }
@@ -3509,6 +3568,38 @@ export class GraphView {
   setSlackThread(path: string, url: string): void {
     const node = this.cy?.getElementById(path);
     if (node && node.nonempty()) node.data("sthread", url);
+  }
+
+  /** And for a task made (or attached) after its note: its handle and its address. */
+  setGoogleTask(path: string, task: string, url: string): void {
+    const node = this.cy?.getElementById(path);
+    if (!node || node.empty()) return;
+    node.data("gtask", task);
+    node.data("gurl", url);
+  }
+
+  /** The poll's word that a task is finished, onto the live node and its badge. */
+  setTaskDone(path: string, done: string): void {
+    const node = this.cy?.getElementById(path);
+    if (!node || node.empty() || node.data("gdone") === done) return;
+    node.data("gdone", done);
+    this.drawIssueBadges();
+  }
+
+  /** Every task note on the canvas: its handle, and whether the poll has closed it. */
+  taskNodes(): Array<{ path: string; task: string; done: string }> {
+    const cy = this.cy;
+    if (!cy) return [];
+    const out: Array<{ path: string; task: string; done: string }> = [];
+    cy.nodes().forEach((node) => {
+      if (node.data("ntype") !== "gtask") return;
+      out.push({
+        path: node.id(),
+        task: (node.data("gtask") as string) || "",
+        done: (node.data("gdone") as string) || "",
+      });
+    });
+    return out;
   }
 
   /** And for an Apple note made after its note here. */
