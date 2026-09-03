@@ -222,6 +222,7 @@ const graphView = new GraphView(ui.cy, {
   onOpenFreeform: (path, board) => void openFreeformNode(path, board),
   onOpenNotion: (path, url) => void openNotionNode(path, url),
   onOpenSlack: (path, url) => void openSlackNode(path, url),
+  onOpenGoogleTask: (path, task, url) => void openGoogleTaskNode(path, task, url),
   onOpenAppleNote: (path, note) => void openAppleNoteNode(path, note),
   onOpenWord: (path, doc) => void openWordNode(path, doc),
   onLinkExisting: (source, target) => linkNotes(source, target),
@@ -233,6 +234,7 @@ const graphView = new GraphView(ui.cy, {
     else if (kind === "freeform") void createFreeformAt(at, folder, source);
     else if (kind === "notion") void createNotionAt(at, folder, source);
     else if (kind === "slack") void createSlackAt(at, folder, source);
+    else if (kind === "gtask") void createGoogleTaskAt(at, folder, source);
     else if (kind === "applenote") void createAppleNoteAt(at, folder, source);
     else if (kind === "word") void createWordAt(at, folder, source);
     // A plain draft released on empty space grows a holder: a named node with nothing
@@ -242,6 +244,23 @@ const graphView = new GraphView(ui.cy, {
   onReparent: (path, folder) => void moveEntry(path, "file", folder, true),
   onRefolder: (path, folder) => void moveEntry(path, "dir", folder, true),
   onGroup: (picked, frame) => void groupIntoFolder(picked, frame),
+  onSelect: (picked, client, frame) => {
+    /*
+     * A rectangle drawn round some things, with no tool armed: what can be done to them,
+     * as a menu whose corner is at the cursor. Laying them out moves only them; a style
+     * lands on every note among them; a folder is the old group tool's answer.
+     */
+    const notes = picked.filter((one) => one.kind === "file").map((one) => one.path);
+    const things = picked.length === 1 ? "1 thing" : `${picked.length} things`;
+    const items: MenuItem[] = [
+      { label: "Run layout", hint: things, run: () => graphView.runLayout(picked.map((one) => one.path)) },
+    ];
+    if (settings.enabled("active") && notes.length) {
+      items.push({ label: "Style…", hint: notes.length === 1 ? "1 note" : `${notes.length} notes`, run: () => void styleNodes(notes, client) });
+    }
+    items.push({ label: "New folder", run: () => void groupIntoFolder(picked, frame) });
+    showMenu(client, items, () => graphView.clearPicked());
+  },
   onNodeMenu: (path, client) => {
     /*
      * Right-click on a note. Everything here starts by drawing a LINK from this note, so
@@ -269,6 +288,7 @@ const graphView = new GraphView(ui.cy, {
     if (settings.enabled("freeform")) draft("freeform", "Freeform board");
     if (settings.enabled("notion")) draft("notion", "Notion page");
     if (settings.enabled("slack")) draft("slack", "Slack thread");
+    if (settings.enabled("google")) draft("gtask", "Google task");
     if (settings.enabled("applenotes")) draft("applenote", "Apple note");
     if (settings.enabled("word")) draft("word", "Word document");
 
@@ -343,6 +363,9 @@ const graphView = new GraphView(ui.cy, {
     }
     if (settings.enabled("slack")) {
       create.push({ label: "Slack thread", icon: TYPE_ICONS.slack, run: () => void createSlackAt(at, folder) });
+    }
+    if (settings.enabled("google")) {
+      create.push({ label: "Google task", icon: TYPE_ICONS.gtask, run: () => void createGoogleTaskAt(at, folder) });
     }
     if (settings.enabled("word")) {
       create.push({ label: "Word document", icon: TYPE_ICONS.word, run: () => void createWordAt(at, folder) });
@@ -596,6 +619,7 @@ async function drawGraph(): Promise<void> {
   graphStale = false;
   graphView.render(await readDocs(), lastFile, await describedEdges());
   void pollSessions(); // the dots belong to the graph that has just gone up
+  void pollTasks(); // and the ticks
   refreshWebIcons(); // likewise the faces: a page linked in another window is scraped here too
 }
 
@@ -1359,6 +1383,7 @@ function applyFeatures(): void {
   applyLook();
   graphView.refreshOverlay();
   watchSessions();
+  watchTasks();
   void ensureCardDirs();
 }
 
@@ -1563,6 +1588,7 @@ function turnIntoMenu(path: string): MenuItem[] {
     ["applenotes", "applenote", "Apple note"],
     ["notion", "notion", "Notion page"],
     ["slack", "slack", "Slack thread"],
+    ["google", "gtask", "Google task"],
     ["word", "word", "Word document"],
     ["freeform", "freeform", "Freeform board"],
     ["antigravity", "antigravity", "Antigravity session"],
@@ -1572,13 +1598,23 @@ function turnIntoMenu(path: string): MenuItem[] {
     ["files", "file", "File on disk…"],
     ["files", "folder", "Folder on disk…"],
   ];
-  return rows
+  const items: MenuItem[] = rows
     .filter(([feature]) => settings.enabled(feature))
     .map(([, kind, label]) => ({
       label,
       icon: TYPE_ICONS[kind],
       run: () => void turnHolderInto(path, kind, label.replace(/…$/, "")),
     }));
+  // A holder is as likely to stand for a task Google already has as for one that needs
+  // making — so the one integration gets a second row, which picks instead of posting.
+  if (settings.enabled("google")) {
+    items.push({
+      label: "Existing Google task…",
+      icon: TYPE_ICONS.gtask,
+      run: () => void turnHolderIntoTask(path),
+    });
+  }
+  return items;
 }
 
 /**
@@ -1597,13 +1633,15 @@ async function turnHolderInto(path: string, kind: HolderKind, label: string): Pr
         ? await notionReady()
         : kind === "slack"
           ? await slackReady()
-          : kind === "word"
-            ? await wordReady()
-            : kind === "freeform"
-              ? await freeformReady()
-              : kind === "antigravity"
-                ? await antigravityReady()
-                : true;
+          : kind === "gtask"
+            ? await googleReady()
+            : kind === "word"
+              ? await wordReady()
+              : kind === "freeform"
+                ? await freeformReady()
+                : kind === "antigravity"
+                  ? await antigravityReady()
+                  : true;
   if (!ready) return;
 
   let pointer: string | null = null;
@@ -1655,6 +1693,8 @@ async function turnHolderInto(path: string, kind: HolderKind, label: string): Pr
       return makeNotionPage(path);
     case "slack":
       return makeSlackThread(path);
+    case "gtask":
+      return makeGoogleTask(path);
     case "word":
       return makeWordDoc(path);
     case "freeform":
@@ -1818,6 +1858,65 @@ function integrationPage(feature: Feature): SetupPage | null {
           },
         ],
       };
+    }
+
+    case "google": {
+      if (!bridge) {
+        return {
+          status: "desktop app only",
+          lines: [
+            {
+              label: "Why",
+              value: "the sign-in window and the keychain the tokens live in are the shell's — npm start",
+            },
+          ],
+        };
+      }
+      const linked = googleState?.linked ?? false;
+      const email = googleState?.email ?? "";
+      const lines: SetupLine[] = [
+        {
+          label: "What this is",
+          value:
+            "task notes — notes that point at Google Tasks, the checkbox items on your Google Calendar. Bedrock keeps the pointer; the title, the date and the tick live with Google, and a click opens the task there.",
+        },
+        {
+          label: "Account",
+          value: googleWord
+            ? googleWord
+            : linked
+              ? `linked${email ? ` — ${email}` : ""}. Unlinking forgets the tokens; notes keep their task links.`
+              : "not linked yet. Linking opens Google in your browser to ask you — the tokens land in the OS keychain, never the vault.",
+          action: { id: "connect", label: linked ? "Unlink" : "Link…" },
+        },
+      ];
+      if (linked) {
+        lines.push({
+          label: "List",
+          value: setup.googleListName || "My Tasks — the account's default list",
+          action: { id: "list", label: setup.googleList ? "Change…" : "Choose…" },
+        });
+      }
+      lines.push(
+        {
+          label: "What is checked",
+          value: `every ${TASK_POLL_MINUTES} minutes, on the clock, each open task note asks Google whether it is done. A finished task gets a done:: line and a tick on its tile, and is never asked about again.`,
+        },
+        {
+          label: "Client",
+          value: googleState?.ownClient
+            ? `your own Google Cloud OAuth client.${googleState.builtClient ? " Going back to Bedrock's unlinks the account." : ""}`
+            : googleState?.builtClient === false
+              ? "none — this build was made without Bedrock's client (a clone built without the secret has none). Linking needs a Desktop-app client from your own Google Cloud project."
+              : "Bedrock's own — the consent screen says Bedrock. To wear your own name there instead, use a Desktop-app client from your own Google Cloud project.",
+          action:
+            googleState?.ownClient && !googleState.builtClient
+              ? { id: "client", label: "Change…" }
+              : { id: "client", label: googleState?.ownClient ? "Use Bedrock's" : "Use my own…" },
+        },
+      );
+      const status = !googleState ? "not read yet" : linked ? email || "linked" : "not linked";
+      return { status, ready: linked, lines };
     }
 
     case "slack": {
@@ -2358,6 +2457,9 @@ function runIntegrationAction(feature: Feature, action: string): void {
   else if (feature === "freeform" && action === "test") void testFreeform();
   else if (feature === "slack" && action === "connect") void setUpSlack();
   else if (feature === "slack" && action === "channel") void pickSlackChannel();
+  else if (feature === "google" && action === "connect") void connectGoogle();
+  else if (feature === "google" && action === "list") void pickGoogleList();
+  else if (feature === "google" && action === "client") void setUpGoogleClient();
   else if (feature === "notion" && action === "connect") void connectNotion();
   else if (feature === "notion" && action === "unlink") void unlinkNotion();
   else if (feature === "applenotes" && action === "test") void testAppleNotes();
@@ -3024,6 +3126,20 @@ async function styleNode(path: string, at: Client): Promise<void> {
   await flushAll(); // the note may be open and mid-edit — don't read behind its own buffer
   const text = await vault.read(path);
   showStylePicker(at, parseStyle(text), (style) => writeStyle(path, style));
+}
+
+/**
+ * The same panel for a drawn selection: one pick, every note in it. The panel starts from
+ * the first note's look, since it has to start from something; a pick then applies to all
+ * of them, so a mixed selection reads as one after the first click.
+ */
+async function styleNodes(paths: string[], at: Client): Promise<void> {
+  if (!paths.length) return;
+  await flushAll();
+  const text = await vault.read(paths[0]);
+  showStylePicker(at, parseStyle(text), (style) => {
+    for (const path of paths) writeStyle(path, style);
+  });
 }
 
 /**
@@ -3846,6 +3962,463 @@ async function createWordAt(
   });
 }
 
+
+/* --------------------------------------------------------- google tasks --- */
+
+/**
+ * A task note is a pointer in the same mould: the list and the id that name the task, as
+ * one `list/id` handle, and the task's own web address for a click to open. `done::` is
+ * the poll's — written the first time Google says the task is completed, a fact about the
+ * task kept in the file so it survives restarts, and the reason a finished task is never
+ * asked about again. No handle means "not made yet", which a click makes.
+ */
+const googleTemplate = (task: GoogleTask | null): string =>
+  task
+    ? `type:: gtask\n\ntask:: ${taskRef(task)}\n${task.url ? `url:: ${task.url}\n` : ""}`
+    : `type:: gtask\n`;
+
+/** The one string that names a task to Google: which list, which id. */
+const taskRef = (task: GoogleTask): string => `${task.list}/${task.id}`;
+
+/** What a task is called in a menu or a note's name: its title, or a stand-in for none. */
+const taskLabel = (task: GoogleTask): string => task.title || "Untitled task";
+
+/** The due date, when there is one — what tells two tasks with one title apart. */
+const taskHint = (task: GoogleTask): string => (task.due ? `due ${when(task.due)}` : "");
+
+/** Whether an account is linked and whose; null until the shell says. */
+let googleState: { linked: boolean; email: string; ownClient: boolean; builtClient: boolean } | null = null;
+
+/** The last link attempt's outcome, worded for the page. */
+let googleWord = "";
+
+async function refreshGoogle(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  googleState = await bridge.googleStatus().catch(() => null);
+  redrawSettings();
+}
+
+/**
+ * The OAuth round trip: a browser tab asks, the shell catches the answer. Coming back
+ * linked proves the whole road, so it is also what switches the integration on. Linked,
+ * the same button unlinks — the tokens are revoked and forgotten, the notes keep their
+ * task links.
+ */
+async function connectGoogle(relink = false): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) {
+    ui.status.textContent = "Google Tasks needs the desktop app — npm start";
+    return;
+  }
+  // `relink` is a link that went wrong being done over: straight to the browser, and the
+  // fresh tokens simply replace the old — no unlink question in between.
+  if (googleState?.linked && !relink) {
+    const who = googleState.email ? ` (${googleState.email})` : "";
+    if (!(await askConfirm(`Unlink Google${who}? Notes keep their task links.`, "Unlink"))) return;
+    await bridge.googleForget().catch(() => false);
+    googleWord = "";
+    ui.status.textContent = "Google Tasks: unlinked — the tokens are forgotten";
+    await refreshGoogle();
+    return;
+  }
+  googleWord = "waiting on the browser — allow Bedrock there…";
+  ui.status.textContent = "Google Tasks: finish linking in the browser tab that opened";
+  redrawSettings();
+  try {
+    const { email } = await bridge.googleConnect();
+    settings.set("google", true);
+    googleWord = "";
+    ui.status.textContent = `Google Tasks: linked${email ? ` as ${email}` : ""}`;
+  } catch (err) {
+    googleWord = shellError(err);
+    ui.status.textContent = `Google Tasks: ${googleWord}`;
+  }
+  await refreshGoogle();
+  void pollTasks(); // the tiles already on the canvas can say something true now
+}
+
+/** Which list new tasks go in — the one question the vault answers about Google. */
+async function pickGoogleList(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge || !googleState?.linked) return;
+  ui.status.textContent = "Google Tasks: reading the lists…";
+  let lists: Array<{ id: string; title: string }>;
+  try {
+    lists = await bridge.googleLists();
+  } catch (err) {
+    ui.status.textContent = `Google Tasks: ${shellError(err)}`;
+    return;
+  }
+  if (!lists.length) {
+    ui.status.textContent = "Google Tasks: the account has no lists";
+    return;
+  }
+  const picked = await askPick(
+    "Which list should new tasks go in?",
+    lists.map((list) => ({ label: list.title })),
+    "Search lists…",
+  );
+  const list = lists.find((one) => one.title === picked);
+  if (!list) return;
+  settings.setSetup({ googleList: list.id, googleListName: list.title });
+  ui.status.textContent = `Google Tasks: new tasks go in “${list.title}”`;
+  redrawSettings();
+}
+
+/**
+ * A Google OAuth client of the person's own, in place of Bedrock's — for anyone who would
+ * rather the consent screen wore their name, or who forked the app. Two pastes; the secret
+ * goes to the keychain. Either direction unlinks, because a token belongs to its client.
+ */
+async function setUpGoogleClient(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  // With no client in the build there is nothing to go back to: "Change…" pastes another.
+  if (googleState?.ownClient && googleState.builtClient) {
+    const sure = await askConfirm(
+      "Go back to Bedrock's own Google client? This unlinks the account — link it again afterwards.",
+      "Use Bedrock's",
+    );
+    if (!sure) return;
+    await bridge.googleClient("", "").catch(() => false);
+    googleWord = "";
+    ui.status.textContent = "Google Tasks: back on Bedrock's client — link the account again";
+    await refreshGoogle();
+    return;
+  }
+  const id = await askText(
+    "Paste your OAuth client id — a Desktop app client from your own Google Cloud project, ending in .apps.googleusercontent.com. Any account already linked is unlinked.",
+    "",
+    "Next",
+  );
+  if (!id?.trim()) return;
+  const secret = await askText("And its client secret — kept in this machine's keychain, never in the vault", "", "Use this client");
+  if (secret === null) return;
+  try {
+    await bridge.googleClient(id.trim(), secret.trim());
+    googleWord = "";
+    ui.status.textContent = "Google Tasks: using your client — now link the account";
+  } catch (err) {
+    ui.status.textContent = `Google Tasks: ${shellError(err)}`;
+  }
+  await refreshGoogle();
+}
+
+/**
+ * Whether a Google action may go ahead, asked of the shell rather than of a flag, so the
+ * answer is never one unlink out of date.
+ */
+async function googleReady(): Promise<boolean> {
+  const bridge = window.bedrock;
+  if (!bridge) {
+    ui.status.textContent = "Google tasks need the desktop app — npm start";
+    return false;
+  }
+  googleState = await bridge.googleStatus().catch(() => null);
+  if (!googleState?.linked) {
+    ui.status.textContent = "Google Tasks: link the account first — Settings → Integrations → Google Tasks";
+    redrawSettings();
+    return false;
+  }
+  return true;
+}
+
+/** The task's handle and address, onto the file and the live node. */
+async function writeGoogleTask(path: string, task: GoogleTask): Promise<void> {
+  await flushAll(); // the note may be open and mid-edit; the write must not clobber
+  let text = setField(await vault.read(path), "task", taskRef(task));
+  text = setField(text, "url", task.url || null);
+  await vault.write(path, text);
+  graphView.setGoogleTask(path, taskRef(task), task.url);
+  graphStale = true;
+  for (let i = 0; i < panes.length; i++) if (pathOf(panes[i]) === path) await renderPage(i);
+}
+
+/**
+ * Makes the task a note stands for: the note's name becomes a task in the vault's list,
+ * with nothing else set — the date, the notes and the tick are Google's to take, which is
+ * why the task is opened there the moment it exists.
+ */
+async function makeGoogleTask(path: string): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  const { googleList, googleListName } = settings.setup();
+  const where = googleListName || "My Tasks";
+  ui.status.textContent = `Google Tasks: making “${noteName(path)}” in ${where}…`;
+  let task: GoogleTask;
+  try {
+    task = await bridge.googleTaskCreate(googleList, noteName(path));
+  } catch (err) {
+    await googleTrouble(shellError(err));
+    return;
+  }
+  await writeGoogleTask(path, task);
+  void bridge.googleOpen(task.url);
+  ui.status.textContent = `${noteName(path)} → a task in ${where}, open in Google Tasks — give it a date there`;
+}
+
+/**
+ * Something went wrong talking to Google, said so it cannot be missed. A status-bar line
+ * is right for "the page was made"; for "nothing happened, and here is why" it is a line
+ * nobody reads. Trouble with the link itself gets the one button that mends it.
+ */
+async function googleTrouble(message: string): Promise<void> {
+  ui.status.textContent = `Google Tasks: ${message}`;
+  if (/link (the account )?again|not linked|access to tasks/.test(message)) {
+    if (await askConfirm(`Google Tasks: ${message}`, "Link again")) await connectGoogle(true);
+    return;
+  }
+  await askConfirm(`Google Tasks: ${message}`, "OK");
+}
+
+/**
+ * Click on a task node: open the task. A note whose task was never made (the making
+ * failed, or the line was stripped by hand) is made now and opened — a task on a list is
+ * nobody else's business, so unlike a Slack post there is nothing to ask first.
+ */
+async function openGoogleTaskNode(path: string, task: string | null, url: string | null): Promise<void> {
+  // One tick later, for the same reason `openFsNode` waits: the click's own free
+  // handler clears the hint right after this, and the message has to outlive that.
+  const say = (message: string): void => {
+    window.setTimeout(() => {
+      ui.status.textContent = message;
+    }, 0);
+  };
+  const bridge = window.bedrock;
+  if (!bridge) {
+    say("Google tasks need the desktop app — npm start");
+    return;
+  }
+  if (task) {
+    await bridge.googleOpen(url ?? "");
+    say(url ? `${noteName(path)} → Google Tasks` : `${noteName(path)} → Google Tasks (the note has no task address, so the list opens)`);
+    return;
+  }
+  if (!(await googleReady())) return;
+  await makeGoogleTask(path);
+}
+
+/**
+ * "New Google task" — from the canvas menu, or from a link draft released on empty space.
+ * The note comes first and gets its name, and committing the name is what makes the task.
+ */
+async function createGoogleTaskAt(
+  at: { x: number; y: number },
+  folder: string | null,
+  source: string | null = null,
+): Promise<void> {
+  if (!(await googleReady())) return;
+  const dir = folder ?? "";
+  const path = uniquePath(filePaths(), dir, "Google task", ".md");
+  await vault.createFile(path, googleTemplate(null));
+  entries = [...entries, { path, kind: "file" }]; // so the rename's collision check sees it
+  if (source) {
+    graphView.commitLink(source, path, {
+      label: noteName(path),
+      parent: dir || undefined,
+      at,
+      type: "gtask",
+    });
+  } else {
+    graphView.commitNode(path, noteName(path), dir || undefined, at, "gtask");
+  }
+  graphStale = true;
+  await refreshSidebar();
+  const where = settings.setup().googleListName || "My Tasks";
+  ui.status.textContent = `created ${path} — name it, and that name becomes a task in ${where}`;
+  graphView.renameNode(path, (name) => {
+    void (async () => {
+      const finalPath = name ? ((await applyRename(path, "file", name)) ?? path) : path;
+      if (!source) {
+        await makeGoogleTask(finalPath);
+        return;
+      }
+      // Linked task: the link is written home first, unnamed — a click on the line
+      // names it — and then the task is made.
+      await finishLink(source, finalPath, null);
+      await makeGoogleTask(finalPath);
+    })();
+  });
+}
+
+/** A task that already exists, made into a note named after it. */
+const attachGoogleTask = (
+  task: GoogleTask,
+  at: { x: number; y: number },
+  folder: string | null,
+  source: string | null,
+): Promise<void> =>
+  attachNodeAt(
+    {
+      kind: "gtask",
+      title: taskLabel(task),
+      text: googleTemplate(task),
+      handle: task.url,
+      // The handle is what the poll asks about, and it is not the address: it rides on
+      // the node here, or the task would go unasked until the next rebuild.
+      paint: (path) => graphView.setGoogleTask(path, taskRef(task), task.url),
+      done: `${taskLabel(task)} → its task in Google Tasks`,
+    },
+    at,
+    folder,
+    source,
+  );
+
+/**
+ * One task, chosen by hand: the vault's list first, or — `fromLists` — a list first and
+ * then a task in it. "Another list…" at the foot of every task list leads to the same
+ * place. Null when the choosing was given up.
+ */
+async function pickGoogleTask(fromLists = false): Promise<GoogleTask | null> {
+  const bridge = window.bedrock;
+  if (!bridge) return null;
+  const OTHER = "Another list…";
+  let list = settings.setup().googleList;
+  let listName = settings.setup().googleListName || "My Tasks";
+  let askList = fromLists;
+  for (;;) {
+    if (askList) {
+      ui.status.textContent = "Google Tasks: reading the lists…";
+      let lists: Array<{ id: string; title: string }>;
+      try {
+        lists = await bridge.googleLists();
+      } catch (err) {
+        ui.status.textContent = `Google Tasks: ${shellError(err)}`;
+        return null;
+      }
+      const chosen = await askPick("Which list?", lists.map((one) => ({ label: one.title })), "Search lists…");
+      const found = lists.find((one) => one.title === chosen);
+      if (!found) return null;
+      list = found.id;
+      listName = found.title;
+      askList = false;
+    }
+    ui.status.textContent = `Google Tasks: reading ${listName}…`;
+    let tasks: GoogleTask[];
+    try {
+      tasks = await bridge.googleTasks(list);
+    } catch (err) {
+      ui.status.textContent = `Google Tasks: ${shellError(err)}`;
+      return null;
+    }
+    const rows = tasks.map((task) => ({ label: taskLabel(task), hint: taskHint(task) }));
+    rows.push({ label: OTHER, hint: "" });
+    const picked = await askPick(`Which task in ${listName}?`, rows, "Search tasks…");
+    if (picked === null) return null;
+    if (picked === OTHER) {
+      askList = true;
+      continue;
+    }
+    ui.status.textContent = statusText();
+    return tasks.find((task) => taskLabel(task) === picked) ?? null;
+  }
+}
+
+/** "From another list…" — the row under the vault's list's tasks. */
+async function pickGoogleTaskAt(
+  at: { x: number; y: number },
+  folder: string | null,
+  source: string | null = null,
+): Promise<void> {
+  if (!(await googleReady())) return;
+  const task = await pickGoogleTask(true);
+  if (task) await attachGoogleTask(task, at, folder, source);
+}
+
+/**
+ * Right-click → "Turn into → Existing Google task…": the holder becomes a pointer at a
+ * task Google already has, keeping its own name, place and look — the way every other
+ * turning keeps them. Nothing is written until a task has been picked.
+ */
+async function turnHolderIntoTask(path: string): Promise<void> {
+  if (!(await googleReady())) return;
+  const task = await pickGoogleTask();
+  if (!task) return;
+  await flushAll();
+  const text = await vault.read(path);
+  const already = parseType(text);
+  if (already) {
+    ui.status.textContent = `${noteName(path)} is already a ${already} note`;
+    return;
+  }
+  let next = setField(text, "type", "gtask");
+  next = setField(next, "task", taskRef(task));
+  if (task.url) next = setField(next, "url", task.url);
+  if (!(await tryVault(`could not turn ${noteName(path)} into a Google task`, () => vault.write(path, next)))) return;
+  syncOpenPanes(path, next);
+  graphView.setNodeType(path, "gtask", task.url || undefined);
+  graphView.setGoogleTask(path, taskRef(task), task.url);
+  graphStale = true;
+  ui.status.textContent = `${noteName(path)} → “${taskLabel(task)}” in Google Tasks`;
+  void pollTasks(); // it may be done already
+}
+
+/* ------------------------------------------------ what the tasks are up to --- */
+
+/** Tasks are asked about on the clock — every five minutes, on the five. */
+const TASK_POLL_MINUTES = 5;
+let taskTimer: number | undefined;
+let taskPolling = false;
+
+/**
+ * Asks Google where every OPEN task note stands, and closes the ones it says are done: a
+ * `done::` line in the note, a tick on the tile. Only the open ones — the line is the
+ * poll's own word that it never needs to ask about that note again, kept in the file
+ * so a restart does not forget it. Nothing is ever written the other way: Bedrock reads
+ * the tick, it does not set it. Runs only while the integration is on, the graph is on
+ * screen, and there is a task to ask about — a vault with none never wakes the shell.
+ */
+async function pollTasks(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge || !settings.enabled("google") || taskPolling) return;
+  if (!panes.some((p) => tabOf(p)?.kind === "graph")) return;
+  const open = graphView.taskNodes().filter((note) => note.task && !note.done);
+  if (!open.length) return;
+  taskPolling = true;
+  try {
+    const status = await bridge.googleTaskStatus(open.map((note) => note.task)).catch(() => null);
+    if (!status) return; // the shell is unhappy; the tiles keep saying what they last said
+    for (const note of open) {
+      const found = status[note.task];
+      if (!found || found.status !== "completed") continue;
+      const stamp = new Date(found.completed || Date.now()).toISOString();
+      await flushAll(); // the note may be open and mid-edit; the write must not clobber
+      const text = await vault.read(note.path).catch(() => null);
+      if (text === null) continue; // gone from the vault since the graph was drawn
+      const next = setField(text, "done", stamp);
+      if (!(await tryVault(`could not mark ${noteName(note.path)} done`, () => vault.write(note.path, next)))) continue;
+      syncOpenPanes(note.path, next);
+      graphView.setTaskDone(note.path, stamp);
+    }
+  } finally {
+    taskPolling = false;
+  }
+}
+
+/** Milliseconds until the next five-minute mark on the clock, plus a breath past it. */
+const untilNextMark = (): number => {
+  const period = TASK_POLL_MINUTES * 60 * 1000;
+  return period - (Date.now() % period) + 500;
+};
+
+/** Starts or stops the clock to match the toggle. Each tick books the next mark itself. */
+function watchTasks(): void {
+  const wanted = settings.enabled("google") && !!window.bedrock;
+  if (wanted && taskTimer === undefined) {
+    const book = (): void => {
+      taskTimer = window.setTimeout(() => {
+        void pollTasks();
+        book();
+      }, untilNextMark());
+    };
+    book();
+    void pollTasks(); // don't make the first tick wait out the clock
+  } else if (!wanted && taskTimer !== undefined) {
+    clearTimeout(taskTimer);
+    taskTimer = undefined;
+  }
+}
 
 /* --------------------------------------------------------- slack threads --- */
 
@@ -4711,6 +5284,26 @@ const ATTACHABLES: Attachable[] = [
     },
   },
   {
+    kind: "gtask",
+    feature: "google",
+    label: "Google task",
+    options: async () => {
+      // The open tasks in the vault's list, in Google's own order; a task in any other
+      // list comes in through a pick that starts by asking which list.
+      const bridge = shellOrThrow();
+      const tasks = await bridge.googleTasks(settings.setup().googleList).catch((err: unknown) => {
+        throw new Error(shellError(err));
+      });
+      const rows: AttachOption[] = tasks.map((task) => ({
+        label: taskLabel(task),
+        hint: taskHint(task),
+        place: (at, folder, source) => attachGoogleTask(task, at, folder, source),
+      }));
+      rows.push({ label: "From another list…", place: pickGoogleTaskAt });
+      return rows;
+    },
+  },
+  {
     kind: "slack",
     feature: "slack",
     label: "Slack thread",
@@ -5111,6 +5704,7 @@ ui.graph.addEventListener("click", () => openGraph());
 const redrawSettings = mountSettings(ui.settings, ui.settingsPanel, settings, {
   page: integrationPage,
   onAction: runIntegrationAction,
+  onLayoutAll: () => graphView.runLayoutAll(),
 });
 // All of these are the shell's to know, and all can change while the app runs — an agy
 // install, a claude install, a `/login` inside a session, a commit made in a terminal.
@@ -5121,6 +5715,7 @@ ui.settings.addEventListener("click", () => {
   void refreshFreeform();
   void refreshNotion();
   void refreshSlack();
+  void refreshGoogle();
   void refreshAppleNotes();
   void refreshWord();
 });
@@ -5135,6 +5730,8 @@ window.bedrock?.onMenu((what) => {
 });
 settings.onChange = applyFeatures;
 settings.onLook = applyLook;
+// Sizes follow the rule the moment it changes; the scroll setting is read per wheel tick.
+settings.onLayout = () => graphView.applySizing();
 // A card is a file in a visible folder, so making or deleting one must show in the tree.
 stickies.onFilesChanged = () => void refreshSidebar();
 
@@ -5289,6 +5886,7 @@ const escapeAttr = (s: string): string => escapeHtml(s).replace(/"/g, "&quot;");
 // the front door, and everything attaches when a real folder is picked (`pickFolder`).
 void adoptLinearKey(); // a key stored on a previous run connects itself
 void refreshSlack(); // and so does a Slack token
+void refreshGoogle(); // and a Google account
 
 /** Whether any real vault has been opened this run — what lets Esc close the door. */
 let vaultOpen = false;

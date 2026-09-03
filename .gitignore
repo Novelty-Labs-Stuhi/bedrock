@@ -18,3 +18,8 @@ release
 .vscode
 .idea
 .claude/settings.local.json
+
+# Google OAuth client: the console's download, and the file the build writes from .env
+# (scripts/google-client.cjs). Neither belongs in history — GitHub refuses the push.
+client_secret*.json
+electron/google-client.json
