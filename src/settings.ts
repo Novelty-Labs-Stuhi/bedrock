@@ -8,6 +8,7 @@
 // commit button snapshots the vault wholesale.
 
 import { swatchRow } from "./node-style";
+import { SIZINGS, type Sizing } from "./scoring";
 import type { Vault } from "./vault";
 
 export type Feature =
@@ -88,6 +89,31 @@ export type Look = {
 };
 
 const LOOK_DEFAULT: Look = { bg: "", node: "", edge: "", folder: "", fence: true, captions: true };
+
+/* ------------------------------------------------------------------ layout --- */
+
+/**
+ * How the canvas is sized and moved about. Per vault like the look: a vault of a few
+ * dozen notes and a vault of a thousand want their hubs drawn differently, and the
+ * question is asked of the vault, not of the app.
+ */
+export type LayoutPrefs = {
+  /** What a note's diameter is read off — see `scoring.ts`. */
+  sizing: Sizing;
+  /** The smallest and the biggest a note is drawn, in canvas pixels. */
+  sizeMin: number;
+  sizeMax: number;
+  /**
+   * What a plain scroll does. "pan" is the trackpad's reading — two fingers move the
+   * canvas, a pinch zooms it; "zoom" is the mouse's, where the wheel zooms and the canvas
+   * is dragged with the right button held. Right-drag pans in both.
+   */
+  scroll: "pan" | "zoom";
+};
+
+export const LAYOUT_DEFAULT: LayoutPrefs = { sizing: "degree", sizeMin: 20, sizeMax: 68, scroll: "pan" };
+/** What a note can be sized between, whatever gets typed. */
+export const SIZE_RANGE = { min: 6, max: 200 };
 
 /**
  * Backgrounds are their own palette, and not the notes' one: a hue picked to be told
@@ -268,17 +294,23 @@ const SETUP_DEFAULT: Setup = {
   notesFolder: "",
 };
 
+const clampSize = (value: number): number =>
+  Math.round(Math.min(SIZE_RANGE.max, Math.max(SIZE_RANGE.min, value)));
+
 export class SettingsStore {
   private vault: Vault | null = null;
   private features: Record<Feature, boolean> = { ...DEFAULTS };
   private looks: Look = { ...LOOK_DEFAULT };
   private setups: Setup = { ...SETUP_DEFAULT };
+  private layouts: LayoutPrefs = { ...LAYOUT_DEFAULT };
   private timer: number | undefined;
   private dirty = false;
   /** Fired after any toggle, so the menu and the canvas follow at once. */
   onChange: (() => void) | null = null;
   /** Fired after any appearance change — only the canvas cares. */
   onLook: (() => void) | null = null;
+  /** Fired after a sizing or scrolling change — again the canvas's business alone. */
+  onLayout: (() => void) | null = null;
 
   /** Reads this vault's config, after flushing any owed to the previous one. */
   async attach(vault: Vault): Promise<void> {
@@ -287,6 +319,7 @@ export class SettingsStore {
     this.features = { ...DEFAULTS };
     this.looks = { ...LOOK_DEFAULT };
     this.setups = { ...SETUP_DEFAULT };
+    this.layouts = { ...LAYOUT_DEFAULT };
     let raw = "";
     try {
       raw = await vault.read(CONFIG_FILE);
@@ -299,6 +332,7 @@ export class SettingsStore {
         features?: Record<string, unknown>;
         look?: Record<string, unknown>;
         setup?: Record<string, unknown>;
+        layout?: Record<string, unknown>;
         claude?: { folder?: unknown };
       };
       for (const key of Object.keys(DEFAULTS) as Feature[]) {
@@ -320,6 +354,13 @@ export class SettingsStore {
         if (typeof value === "string") this.setups[key] = value as never;
       }
       if (this.setups.claudeWindow !== "terminal") this.setups.claudeWindow = "app";
+      const sizing = parsed.layout?.sizing;
+      if (SIZINGS.some((row) => row.key === sizing)) this.layouts.sizing = sizing as Sizing;
+      for (const key of ["sizeMin", "sizeMax"] as const) {
+        const value = parsed.layout?.[key];
+        if (typeof value === "number" && Number.isFinite(value)) this.layouts[key] = clampSize(value);
+      }
+      if (parsed.layout?.scroll === "zoom") this.layouts.scroll = "zoom";
       // Version 2 kept the Claude folder on its own; it is a setup like any other now.
       if (!this.setups.claudeFolder && typeof parsed.claude?.folder === "string") {
         this.setups.claudeFolder = parsed.claude.folder;
@@ -360,6 +401,23 @@ export class SettingsStore {
     return { ...this.setups };
   }
 
+  layout(): LayoutPrefs {
+    return { ...this.layouts };
+  }
+
+  setLayout(patch: Partial<LayoutPrefs>): void {
+    let changed = false;
+    for (const [key, value] of Object.entries(patch) as Array<[keyof LayoutPrefs, never]>) {
+      const next = key === "sizeMin" || key === "sizeMax" ? (clampSize(value) as never) : value;
+      if (this.layouts[key] === next) continue;
+      this.layouts[key] = next;
+      changed = true;
+    }
+    if (!changed) return;
+    this.schedule();
+    this.onLayout?.();
+  }
+
   setSetup(patch: Partial<Setup>): void {
     let changed = false;
     for (const [key, value] of Object.entries(patch) as Array<[keyof Setup, never]>) {
@@ -395,7 +453,7 @@ export class SettingsStore {
       await this.vault.write(
         CONFIG_FILE,
         JSON.stringify(
-          { version: 3, features: this.features, look: this.looks, setup: this.setups },
+          { version: 3, features: this.features, look: this.looks, setup: this.setups, layout: this.layouts },
           null,
           1,
         ) + "\n",
@@ -507,12 +565,15 @@ export type SetupPage = { status: string; ready?: boolean; lines: SetupLine[] };
 export type PanelHooks = {
   page?: (feature: Feature) => SetupPage | null;
   onAction?: (feature: Feature, action: string) => void;
+  /** The Layout tab's one button: relax the whole graph from where it is. */
+  onLayoutAll?: () => void;
 };
 
-type Tab = "general" | "features" | "integrations";
+type Tab = "general" | "layout" | "features" | "integrations";
 
 const TABS: Array<{ key: Tab; name: string }> = [
   { key: "general", name: "General" },
+  { key: "layout", name: "Layout" },
   { key: "features", name: "Features" },
   { key: "integrations", name: "Integrations" },
 ];
@@ -618,6 +679,40 @@ export function mountSettings(
     );
   };
 
+  /** A row of radio choices in the Layout tab, each with a line saying what it means. */
+  const choices = (field: string, picked: string, rows: Array<{ key: string; name: string; what: string }>): string =>
+    rows
+      .map(
+        (row) =>
+          `<label class="setting"><input type="radio" name="layout-${field}" data-layout="${field}" value="${row.key}"` +
+          `${row.key === picked ? " checked" : ""} /><span><b>${row.name}</b><small>${row.what}</small></span></label>`,
+      )
+      .join("");
+
+  const layout = (): string => {
+    const prefs = store.layout();
+    const number = (field: "sizeMin" | "sizeMax", label: string): string =>
+      `<label class="settings-num"><span>${label}</span>` +
+      `<input type="number" data-layout="${field}" value="${prefs[field]}" min="${SIZE_RANGE.min}" max="${SIZE_RANGE.max}" step="1" /> px</label>`;
+    return (
+      `<div class="settings-look"><h5>Run the layout</h5>` +
+      `<small>nothing on the canvas moves until you ask: this relaxes every note and folder from where it is now` +
+      ` — springs on the links, breathing room between neighbours — and a drag round some notes offers the same for` +
+      ` just those</small>` +
+      `<button type="button" class="settings-run" data-layout-run>Lay out the whole graph</button></div>` +
+      `<div class="settings-look"><h5>Note sizes</h5><small>what a note's circle is sized by</small>` +
+      choices("sizing", prefs.sizing, SIZINGS) +
+      `<div class="settings-nums">${number("sizeMin", "smallest")}${number("sizeMax", "biggest")}</div></div>` +
+      `<div class="settings-look"><h5>Scrolling</h5>` +
+      `<small>a drag on empty canvas draws a selection; the right button (or Space) held down drags the canvas itself</small>` +
+      choices("scroll", prefs.scroll, [
+        { key: "pan", name: "Trackpad", what: "two fingers move the canvas, a pinch zooms it" },
+        { key: "zoom", name: "Mouse", what: "the wheel zooms; hold the right button to move the canvas" },
+      ]) +
+      `</div>`
+    );
+  };
+
   const features = (): string =>
     FEATURES.map((row) => switchRow(row, store.enabled(row.feature))).join("");
 
@@ -632,7 +727,8 @@ export function mountSettings(
     ).join("");
 
   const draw = (): void => {
-    const body = tab === "general" ? general() : tab === "features" ? features() : integrations();
+    const body =
+      tab === "general" ? general() : tab === "layout" ? layout() : tab === "features" ? features() : integrations();
     host.innerHTML =
       `<div class="settings-card">` +
       `<div class="settings-head"><h3>Settings</h3>` +
@@ -663,6 +759,21 @@ export function mountSettings(
       store.setLook({ captions: box.checked });
       return;
     }
+    const field = box.dataset.layout as keyof LayoutPrefs | undefined;
+    if (field === "sizing") {
+      store.setLayout({ sizing: box.value as Sizing });
+      return;
+    }
+    if (field === "scroll") {
+      store.setLayout({ scroll: box.value === "zoom" ? "zoom" : "pan" });
+      return;
+    }
+    if (field === "sizeMin" || field === "sizeMax") {
+      const value = Number(box.value);
+      if (Number.isFinite(value)) store.setLayout({ [field]: value });
+      box.value = String(store.layout()[field]); // say what was kept, if it had to be clamped
+      return;
+    }
     const feature = box.dataset.feature as Feature | undefined;
     if (!feature) return;
     store.set(feature, box.checked);
@@ -688,6 +799,11 @@ export function mountSettings(
 
     if (hit.classList.contains("settings-close")) {
       show(false);
+      return;
+    }
+    if (hit.dataset.layoutRun !== undefined) {
+      show(false); // the run is the thing to watch, and the window is over it
+      hooks.onLayoutAll?.();
       return;
     }
     const picked = hit.dataset.tab as Tab | undefined;

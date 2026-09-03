@@ -244,6 +244,23 @@ const graphView = new GraphView(ui.cy, {
   onReparent: (path, folder) => void moveEntry(path, "file", folder, true),
   onRefolder: (path, folder) => void moveEntry(path, "dir", folder, true),
   onGroup: (picked, frame) => void groupIntoFolder(picked, frame),
+  onSelect: (picked, client, frame) => {
+    /*
+     * A rectangle drawn round some things, with no tool armed: what can be done to them,
+     * as a menu whose corner is at the cursor. Laying them out moves only them; a style
+     * lands on every note among them; a folder is the old group tool's answer.
+     */
+    const notes = picked.filter((one) => one.kind === "file").map((one) => one.path);
+    const things = picked.length === 1 ? "1 thing" : `${picked.length} things`;
+    const items: MenuItem[] = [
+      { label: "Run layout", hint: things, run: () => graphView.runLayout(picked.map((one) => one.path)) },
+    ];
+    if (settings.enabled("active") && notes.length) {
+      items.push({ label: "Style…", hint: notes.length === 1 ? "1 note" : `${notes.length} notes`, run: () => void styleNodes(notes, client) });
+    }
+    items.push({ label: "New folder", run: () => void groupIntoFolder(picked, frame) });
+    showMenu(client, items, () => graphView.clearPicked());
+  },
   onNodeMenu: (path, client) => {
     /*
      * Right-click on a note. Everything here starts by drawing a LINK from this note, so
@@ -3112,6 +3129,20 @@ async function styleNode(path: string, at: Client): Promise<void> {
 }
 
 /**
+ * The same panel for a drawn selection: one pick, every note in it. The panel starts from
+ * the first note's look, since it has to start from something; a pick then applies to all
+ * of them, so a mixed selection reads as one after the first click.
+ */
+async function styleNodes(paths: string[], at: Client): Promise<void> {
+  if (!paths.length) return;
+  await flushAll();
+  const text = await vault.read(paths[0]);
+  showStylePicker(at, parseStyle(text), (style) => {
+    for (const path of paths) writeStyle(path, style);
+  });
+}
+
+/**
  * One write at a time, in the order the panel asked for them. Each pick reads the note
  * afresh: a style write must not carry a copy of the file taken before the pick before
  * it, or the last two clicks in the panel would undo each other.
@@ -5673,6 +5704,7 @@ ui.graph.addEventListener("click", () => openGraph());
 const redrawSettings = mountSettings(ui.settings, ui.settingsPanel, settings, {
   page: integrationPage,
   onAction: runIntegrationAction,
+  onLayoutAll: () => graphView.runLayoutAll(),
 });
 // All of these are the shell's to know, and all can change while the app runs — an agy
 // install, a claude install, a `/login` inside a session, a commit made in a terminal.
@@ -5698,6 +5730,8 @@ window.bedrock?.onMenu((what) => {
 });
 settings.onChange = applyFeatures;
 settings.onLook = applyLook;
+// Sizes follow the rule the moment it changes; the scroll setting is read per wheel tick.
+settings.onLayout = () => graphView.applySizing();
 // A card is a file in a visible folder, so making or deleting one must show in the tree.
 stickies.onFilesChanged = () => void refreshSidebar();
 

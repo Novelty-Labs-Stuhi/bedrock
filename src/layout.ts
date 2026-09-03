@@ -204,3 +204,187 @@ export function seedGrid(rects: Rect[], margin: number): void {
   });
 }
 
+
+/* ------------------------------------------------------------- relaxation --- */
+
+export type Bounds = NonNullable<ArrangeOptions["bounds"]>;
+
+/**
+ * A rectangle as the incremental solver sees it: `fixed` ones are scenery — they push
+ * and pull the others but never move themselves — and `bounds` is the frame a folder's
+ * note may not leave.
+ */
+export type Body = Rect & { fixed?: boolean; bounds?: Bounds };
+
+export type RelaxOptions = Omit<ArrangeOptions, "bounds"> & {
+  /** How many ticks the cooling schedule runs over. Past it the schedule sits at its floor. */
+  iterations?: number;
+};
+
+/**
+ * `arrangeRects`, one tick at a time and from wherever things already are.
+ *
+ * The whole-graph solve starts from a grid because it has nothing to start from; this
+ * starts from the arrangement on screen, because the arrangement on screen is months of
+ * somebody's work. Every tick moves the free bodies a little way along the same forces —
+ * springs on the links, short-range repulsion, a weak pull to the centre of the moving
+ * set, and the overlap projection — so a caller can draw the graph between ticks and the
+ * layout is seen happening rather than arriving. Fixed bodies take part in every force
+ * and move in none of them: what was not selected stays exactly where it was.
+ */
+export class Relaxation {
+  private tick = 0;
+  private readonly edgeLength: number;
+  private readonly margin: number;
+  private readonly iterations: number;
+  private readonly gravity: number;
+  private readonly edges: Array<{ a: Body; b: Body; weight: number }>;
+  private readonly free: Body[];
+
+  constructor(
+    private readonly bodies: Body[],
+    links: Link[],
+    options: RelaxOptions = {},
+  ) {
+    this.edgeLength = options.edgeLength ?? 80;
+    this.margin = options.margin ?? 16;
+    this.iterations = options.iterations ?? 200;
+    this.gravity = options.gravity ?? 0.012;
+    const byId = new Map(bodies.map((body) => [body.id, body]));
+    this.edges = links
+      .map((link) => ({ a: byId.get(link.a), b: byId.get(link.b), weight: link.weight }))
+      .filter(
+        (edge): edge is { a: Body; b: Body; weight: number } =>
+          !!edge.a && !!edge.b && edge.a !== edge.b && !(edge.a.fixed && edge.b.fixed),
+      );
+    this.free = bodies.filter((body) => !body.fixed);
+  }
+
+  /** How many bodies this relaxation is allowed to move. */
+  moving(): number {
+    return this.free.length;
+  }
+
+  /** One iteration. Returns the furthest any body moved, in model units. */
+  step(): number {
+    if (this.free.length === 0) return 0;
+    const cool = Math.max(0.12, 1 - this.tick / this.iterations) * 0.9;
+    this.tick++;
+    const before = this.free.map((body) => ({ x: body.x, y: body.y }));
+
+    // Springs toward the target gap. A fixed end cannot give, so the free end takes the
+    // whole correction — the spring is exactly as stiff either way.
+    for (const edge of this.edges) {
+      const dx = edge.b.x - edge.a.x;
+      const dy = edge.b.y - edge.a.y;
+      const dist = Math.hypot(dx, dy) || 0.01;
+      const ux = dx / dist;
+      const uy = dy / dist;
+      const target = this.edgeLength + extent(edge.a, ux, uy) + extent(edge.b, ux, uy);
+      const pull = ((dist - target) / dist) * 0.5 * cool * Math.min(edge.weight, 3);
+      const share = edge.a.fixed || edge.b.fixed ? 2 : 1;
+      if (!edge.a.fixed) {
+        edge.a.x += dx * pull * share;
+        edge.a.y += dy * pull * share;
+      }
+      if (!edge.b.fixed) {
+        edge.b.x -= dx * pull * share;
+        edge.b.y -= dy * pull * share;
+      }
+    }
+
+    // Short-range repulsion, so unlinked bodies do not pile into one spot.
+    const bodies = this.bodies;
+    for (let i = 0; i < bodies.length; i++) {
+      for (let j = i + 1; j < bodies.length; j++) {
+        const a = bodies[i];
+        const b = bodies[j];
+        if (a.fixed && b.fixed) continue;
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const dist2 = dx * dx + dy * dy || 0.01;
+        const reach = this.edgeLength + extent(a, 1, 0) + extent(b, 1, 0);
+        if (dist2 > reach * reach * 4) continue;
+        const dist = Math.sqrt(dist2);
+        const push = ((reach * reach) / dist2) * 0.35 * cool;
+        const share = a.fixed || b.fixed ? 2 : 1;
+        if (!a.fixed) {
+          a.x -= (dx / dist) * push * share;
+          a.y -= (dy / dist) * push * share;
+        }
+        if (!b.fixed) {
+          b.x += (dx / dist) * push * share;
+          b.y += (dy / dist) * push * share;
+        }
+      }
+    }
+
+    // Gravity toward the centre of what is moving: a selection stays an island rather
+    // than scattering to the corners of its frame.
+    let cx = 0;
+    let cy = 0;
+    for (const body of this.free) {
+      cx += body.x;
+      cy += body.y;
+    }
+    cx /= this.free.length;
+    cy /= this.free.length;
+    for (const body of this.free) {
+      body.x += (cx - body.x) * this.gravity * cool;
+      body.y += (cy - body.y) * this.gravity * cool;
+    }
+
+    this.separate();
+
+    let furthest = 0;
+    this.free.forEach((body, index) => {
+      furthest = Math.max(furthest, Math.hypot(body.x - before[index].x, body.y - before[index].y));
+    });
+    return furthest;
+  }
+
+  /** Projects until nothing overlaps (or gives up), so the hard constraint holds at the end. */
+  settle(): void {
+    for (let pass = 0; pass < 600; pass++) {
+      if (this.separate() === 0) break;
+    }
+  }
+
+  /**
+   * `separateRects`, with fixed bodies as walls: a free body overlapping a fixed one
+   * takes the whole push, two free bodies split it. Returns how many pairs it fixed.
+   */
+  private separate(): number {
+    const bodies = this.bodies;
+    let fixed = 0;
+    for (let i = 0; i < bodies.length; i++) {
+      for (let j = i + 1; j < bodies.length; j++) {
+        const a = bodies[i];
+        const b = bodies[j];
+        if (a.fixed && b.fixed) continue;
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        if (dx === 0 && dy === 0) {
+          dx = (i + 1) * 0.01;
+          dy = (j + 1) * 0.01;
+        }
+        const overlapX = (a.w + b.w) / 2 + this.margin - Math.abs(dx);
+        const overlapY = (a.h + b.h) / 2 + this.margin - Math.abs(dy);
+        if (overlapX <= 0 || overlapY <= 0) continue;
+        fixed++;
+        const share = a.fixed || b.fixed ? 1 : 0.5;
+        if (overlapX < overlapY) {
+          const push = overlapX * share * (dx >= 0 ? 1 : -1);
+          if (!a.fixed) a.x -= push;
+          if (!b.fixed) b.x += push;
+        } else {
+          const push = overlapY * share * (dy >= 0 ? 1 : -1);
+          if (!a.fixed) a.y -= push;
+          if (!b.fixed) b.y += push;
+        }
+      }
+    }
+    for (const body of this.free) if (body.bounds) clampRect(body, body.bounds);
+    return fixed;
+  }
+}

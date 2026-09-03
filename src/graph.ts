@@ -19,7 +19,8 @@ import {
 } from "./frames";
 import { edgeNotePath, edgeTitle, isEdgeNote } from "./edges";
 import { inlineEdit, type InlineEditor } from "./inline";
-import { layoutGraph } from "./apply-layout";
+import { layoutGraph, relaxLayout, type Relaxer } from "./apply-layout";
+import { scoreNodes, sizeFor } from "./scoring";
 import {
   LinkResolver,
   parseField,
@@ -736,6 +737,11 @@ function styleSheet(look: Look): cytoscape.StylesheetJson {
       },
     },
     { selector: "node.draft-source", style: { "border-width": 3, "border-color": ink } },
+    // What a drawn rectangle took in, lit for as long as its actions menu is open.
+    {
+      selector: "node.picked",
+      style: { "overlay-color": ink, "overlay-opacity": 0.18, "overlay-padding": 5 },
+    },
     // Folder box under a dragged note: dashed while resisting, solid once armed.
     {
       selector: "node.drop-hover",
@@ -1241,6 +1247,13 @@ export type GraphHandlers = {
    * `frame` is the rectangle in model units, so the box appears exactly as it was drawn.
    */
   onGroup: (picked: Array<{ path: string; kind: "file" | "dir" }>, frame: Frame) => void;
+  /**
+   * A rectangle was drawn around `picked` with no tool armed: offer what can be done to
+   * them, in a menu whose top-left corner is at `client` — the cursor, where the drag
+   * ended. `frame` is the rectangle in model units, in case the answer is "make a folder".
+   * The picked nodes stay lit until `clearPicked` is called.
+   */
+  onSelect: (picked: Array<{ path: string; kind: "file" | "dir" }>, client: { x: number; y: number }, frame: Frame) => void;
   /** Transient instruction for the status bar (null clears it). */
   onHint: (hint: string | null) => void;
 };
@@ -1340,6 +1353,15 @@ export class GraphView {
   private fittedSize: { w: number; h: number } | null = null;
   private userMoved = false;
   private fitting = false;
+  /** Cytoscape's renderer, for the per-gesture texture switch; null if a future version hid it. */
+  private renderer: { textureOnViewport?: boolean } | null = null;
+  /** A right-button (or Space) drag of the canvas, while one is under way. */
+  private panning = false;
+  /** Whether the last right-button press moved the canvas — then its release is not a click. */
+  private panned = false;
+  private spaceHeld = false;
+  /** The layout run in progress, if any: what is stepping it, and how to stop. */
+  private layoutRun: { relaxer: Relaxer; frame: number } | null = null;
 
   constructor(
     private container: HTMLElement,
@@ -1357,19 +1379,64 @@ export class GraphView {
     // Right-click drives the context menu, so suppress the native one.
     this.container.addEventListener("contextmenu", (event) => event.preventDefault());
 
-    // Shift+drag draws the folder rectangle straight away, without arming the tool
-    // first. Capture phase and stopPropagation, or cytoscape pans the canvas instead.
+    // Any touch of the canvas renders live from then on — see the texture note in `build`.
+    this.container.addEventListener(
+      "pointerdown",
+      () => {
+        if (this.renderer) this.renderer.textureOnViewport = false;
+      },
+      { capture: true, passive: true },
+    );
+    // Cytoscape's own wheel handling is switched off (`userZoomingEnabled`), so the wheel
+    // is read here — see `onWheel` for what it means. Once, on the container: a rebuild
+    // makes a new cytoscape but never a new container.
+    this.container.addEventListener("wheel", (event) => this.onWheel(event), { capture: true, passive: false });
+
+    /*
+     * The canvas is moved the way a board is, not the way a map used to be: a plain drag on
+     * empty ground draws a rectangle (see `wire`), and the canvas itself is dragged with the
+     * right button, the middle button, or the left with Space held. Capture phase and
+     * stopPropagation for the ones cytoscape would otherwise read as something else; the
+     * right button is let through, so a right-click that does not move still opens the
+     * menu (`panned` tells the two apart in the `cxttap` handler).
+     *
+     * Shift+drag still draws the folder rectangle straight away, as it always did.
+     */
     this.container.addEventListener(
       "mousedown",
       (event) => {
+        this.panned = false;
+        if (this.layoutRun) this.stopLayout(); // a hand on the canvas takes it back
+        if (event.button === 2 || event.button === 1 || (event.button === 0 && this.spaceHeld)) {
+          if (event.button !== 2) event.stopPropagation();
+          this.beginPan(event);
+          return;
+        }
         if (!event.shiftKey || event.button !== 0 || this.lasso || this.draftSource) return;
         event.stopPropagation();
-        this.beginMarquee(event);
+        this.beginMarquee(event, "group");
       },
       true,
     );
+    const typing = (target: EventTarget | null): boolean => {
+      const el = target as HTMLElement | null;
+      return !!el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName));
+    };
+    document.addEventListener("keydown", (event) => {
+      if (event.key === " " && !typing(event.target)) this.spaceHeld = true;
+    });
+    document.addEventListener("keyup", (event) => {
+      if (event.key === " ") this.spaceHeld = false;
+    });
+    window.addEventListener("blur", () => {
+      this.spaceHeld = false;
+    });
     document.addEventListener("keydown", (event) => {
       if (event.key !== "Escape") return;
+      if (this.layoutRun) {
+        this.stopLayout(); // where it got to is where it stays
+        return;
+      }
       // An aimed arrow is the innermost thing open: it goes first, and alone.
       if (this.draftRow !== null) {
         this.cancelRowLink();
@@ -1503,6 +1570,7 @@ export class GraphView {
     });
 
     ensureFrames(cy, this.frames); // frame only folders that gained a box
+    this.applySizing(); // the definitions carry the plain link count; the vault's rule is applied here
     this.paintFolders();
     // The open card's note may have just left the canvas — a finished issue folds away.
     if (this.issue && cy.getElementById(this.issue.path).empty()) this.closeIssue();
@@ -1559,7 +1627,13 @@ export class GraphView {
       elements: buildElements(docs, described),
       style: styleSheet(this.settings.look()),
       layout: LAYOUT,
-      wheelSensitivity: 0.2,
+      /*
+       * Neither gesture is cytoscape's to read any more — see the wheel and mousedown
+       * handling in `wire` and the constructor. Programmatic pan and zoom (fit, follow) are
+       * untouched: only the USER flags are off.
+       */
+      userPanningEnabled: false,
+      userZoomingEnabled: false,
       /*
        * Draw at twice the screen's own resolution, whatever it says that is.
        *
@@ -1596,6 +1670,7 @@ export class GraphView {
     // the graph feel like it forgot everything the moment the app closed.
     if (this.spatial.hasLayout()) this.restore(this.cy);
     else this.settle(); // solved straight away — there is no simulation to wait for
+    this.applySizing();
     this.paintFolders();
     this.paintWebIcons(); // a rebuild within one session keeps the faces already fetched
     this.markActive(active);
@@ -1935,8 +2010,24 @@ export class GraphView {
       // Nothing else: a stray click on the canvas must not litter the vault.
     });
 
+    // A plain drag on empty ground draws the selection rectangle. Cytoscape still sees
+    // the press, so a press that does not move stays a tap; `beginMarquee` waits for the
+    // pointer to travel before it draws anything.
+    cy.on("mousedown", (event) => {
+      if (event.target !== cy) return;
+      const original = event.originalEvent as MouseEvent | undefined;
+      if (!original || original.button !== 0 || original.shiftKey || original.metaKey) return;
+      if (this.lasso || this.draftSource || this.spaceHeld || this.panning) return;
+      this.beginMarquee(original, "select");
+    });
+
     // One right-click gesture; the menu's contents depend on what is under it.
     cy.on("cxttap", (event) => {
+      // The right button dragged the canvas: letting go of it is not a click.
+      if (this.panned) {
+        this.panned = false;
+        return;
+      }
       if (this.draftSource) {
         this.cancelDraft();
         return;
@@ -2078,25 +2169,71 @@ export class GraphView {
      */
     try {
       const renderer = (cy as unknown as { renderer(): { textureOnViewport?: boolean } }).renderer();
-      if (renderer && "textureOnViewport" in renderer) {
-        this.container.addEventListener(
-          "wheel",
-          (event) => {
-            renderer.textureOnViewport = event.deltaY < 0;
-          },
-          { capture: true, passive: true },
-        );
-        this.container.addEventListener(
-          "pointerdown",
-          () => {
-            renderer.textureOnViewport = false;
-          },
-          { capture: true, passive: true },
-        );
-      }
+      this.renderer = renderer && "textureOnViewport" in renderer ? renderer : null;
     } catch {
-      /* a future cytoscape hid its renderer — live everywhere is still right */
+      this.renderer = null; /* a future cytoscape hid its renderer — live everywhere is still right */
     }
+  }
+
+  /* ------------------------------------------------------------ navigation --- */
+
+  /**
+   * What a scroll does. A pinch — which arrives as a wheel with ctrl held, on every
+   * platform Chromium runs on — always zooms, about the fingers. A plain scroll is the
+   * one question the vault answers for itself (`LayoutPrefs.scroll`): two fingers on a
+   * trackpad are asking to move the canvas, a wheel on a mouse is asking to zoom it, and
+   * the two are indistinguishable at the event. Zooming in draws from the photograph
+   * (`textureOnViewport`); moving and zooming out render live, so what comes into view
+   * is real. The page must not scroll behind any of it.
+   */
+  private onWheel(event: WheelEvent): void {
+    const cy = this.cy;
+    if (!cy) return;
+    event.preventDefault();
+    const pinch = event.ctrlKey || event.metaKey;
+    const scale = event.deltaMode === 1 ? 33 : event.deltaMode === 2 ? cy.height() : 1;
+    if (!pinch && this.settings.layout().scroll === "pan") {
+      if (this.renderer) this.renderer.textureOnViewport = false;
+      cy.panBy({ x: -event.deltaX * scale, y: -event.deltaY * scale });
+      return;
+    }
+    // A pinch's deltas are small and mean a ratio; a wheel's are cytoscape's own scale.
+    const factor = pinch ? Math.exp(-event.deltaY * 0.01) : Math.pow(10, ((event.deltaY * scale) / -250) * 0.2);
+    const level = Math.min(cy.maxZoom(), Math.max(cy.minZoom(), cy.zoom() * factor));
+    if (level === cy.zoom()) return;
+    if (this.renderer) this.renderer.textureOnViewport = factor > 1;
+    const box = this.container.getBoundingClientRect();
+    cy.zoom({ level, renderedPosition: { x: event.clientX - box.left, y: event.clientY - box.top } });
+  }
+
+  /**
+   * Drags the canvas under the pointer until the button comes up. Read off the document,
+   * so a drag that leaves the window still lets go cleanly.
+   */
+  private beginPan(event: MouseEvent): void {
+    const cy = this.cy;
+    if (!cy || this.panning) return;
+    event.preventDefault();
+    this.panning = true;
+    if (this.renderer) this.renderer.textureOnViewport = false;
+    const from = { x: event.clientX, y: event.clientY };
+    let last = from;
+    this.container.classList.add("panning");
+    const onMove = (move: MouseEvent): void => {
+      const dx = move.clientX - last.x;
+      const dy = move.clientY - last.y;
+      last = { x: move.clientX, y: move.clientY };
+      if (!this.panned && Math.hypot(move.clientX - from.x, move.clientY - from.y) > 4) this.panned = true;
+      if (dx || dy) cy.panBy({ x: dx, y: dy });
+    };
+    const onUp = (): void => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      this.container.classList.remove("panning");
+      this.panning = false;
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
   }
 
   /**
@@ -2261,7 +2398,7 @@ export class GraphView {
     if (!this.cy || this.lasso) return;
     const sheet = document.createElement("div");
     sheet.className = "lasso-sheet";
-    sheet.addEventListener("mousedown", (event) => this.beginMarquee(event));
+    sheet.addEventListener("mousedown", (event) => this.beginMarquee(event, "group"));
     this.overlay.appendChild(sheet);
     this.lasso = sheet;
     this.handlers.onHint(
@@ -2279,15 +2416,23 @@ export class GraphView {
     return this.lasso !== null;
   }
 
-  private beginMarquee(event: MouseEvent): void {
+  /**
+   * Draws the rectangle from a press until its release. "group" is the folder tool — the
+   * release makes a folder of what is inside. "select" is the plain drag on empty canvas:
+   * nothing is drawn until the pointer has travelled a few pixels (a press that stays put
+   * is a click, and cytoscape's tap handles it), and the release lights what was taken in
+   * and asks `onSelect` what to do with it.
+   */
+  private beginMarquee(event: MouseEvent, mode: "group" | "select"): void {
     const cy = this.cy;
     if (!cy) return;
-    event.preventDefault();
+    if (mode === "group") event.preventDefault();
     const container = this.container.getBoundingClientRect();
     const from = { x: event.clientX - container.left, y: event.clientY - container.top };
     const rect = document.createElement("div");
     rect.className = "lasso-rect";
-    this.overlay.appendChild(rect);
+    let drawn = mode === "group";
+    if (drawn) this.overlay.appendChild(rect);
 
     const place = (to: { x: number; y: number }): Area => {
       const area = {
@@ -2305,25 +2450,42 @@ export class GraphView {
     let area = place(from);
 
     const onMove = (move: MouseEvent): void => {
-      area = place({ x: move.clientX - container.left, y: move.clientY - container.top });
+      const to = { x: move.clientX - container.left, y: move.clientY - container.top };
+      if (!drawn) {
+        if (Math.hypot(to.x - from.x, to.y - from.y) < 4) return;
+        drawn = true;
+        this.overlay.appendChild(rect);
+      }
+      area = place(to);
       const count = this.notesIn(area).length;
-      this.handlers.onHint(count === 1 ? "1 thing — release to group it" : `${count} things — release to group them`);
+      const things = count === 1 ? "1 thing" : `${count} things`;
+      this.handlers.onHint(mode === "group" ? `${things} — release to group` : `${things} — release for what can be done with them`);
     };
-    const onUp = (): void => {
+    const onUp = (up: MouseEvent): void => {
       document.removeEventListener("mousemove", onMove);
       document.removeEventListener("mouseup", onUp);
       rect.remove();
+      if (!drawn) return; // never became a drag: the click it was is cytoscape's
       const picked = this.notesIn(area);
-      this.cancelGroup();
+      if (mode === "group") this.cancelGroup();
       if (!picked.length) {
-        this.handlers.onHint("nothing in that rectangle — nothing grouped");
+        this.handlers.onHint(mode === "group" ? "nothing in that rectangle — nothing grouped" : null);
         return;
       }
       const zoom = cy.zoom();
-      this.handlers.onGroup(picked, {
+      const frame = {
         w: Math.max(160, (area.x2 - area.x1) / zoom),
         h: Math.max(120, (area.y2 - area.y1) / zoom),
+      };
+      if (mode === "group") {
+        this.handlers.onGroup(picked, frame);
+        return;
+      }
+      this.handlers.onHint(null);
+      cy.batch(() => {
+        for (const one of picked) cy.getElementById(one.path).addClass("picked");
       });
+      this.handlers.onSelect(picked, { x: up.clientX, y: up.clientY }, frame);
     };
     document.addEventListener("mousemove", onMove);
     document.addEventListener("mouseup", onUp);
@@ -3949,10 +4111,106 @@ export class GraphView {
   private resizeNode(id: string): void {
     const node = this.cy?.getElementById(id);
     if (!node || node.empty() || node.data("kind") !== "file") return;
-    // Links either way, which is what `buildElements` counts too. The half-drawn draft
-    // edge is not one of them.
-    const links = node.connectedEdges().filter((edge) => edge.id() !== DRAFT_EDGE).length;
-    node.data("size", nodeSize(links));
+    // One more link changes every note's standing under PageRank, not just these two's.
+    this.applySizing();
+  }
+
+  /* ---------------------------------------------------------------- sizing --- */
+
+  /**
+   * Sizes every note by the vault's rule (`LayoutPrefs`): a score per note from the live
+   * graph — connections, PageRank or eigenvector centrality — turned into a diameter
+   * between the vault's smallest and biggest. Run after every build and sync, and after
+   * the settings change it, so the circles always say the same thing.
+   */
+  applySizing(): void {
+    const cy = this.cy;
+    if (!cy) return;
+    const { sizing, sizeMin, sizeMax } = this.settings.layout();
+    const notes = cy.nodes().filter((node) => node.data("kind") === "file" && node.id() !== DRAFT_NODE);
+    // The half-drawn draft edge is not a link anybody made.
+    const edges = cy.edges().filter((edge) => edge.id() !== DRAFT_EDGE);
+    const scores = scoreNodes(notes, edges, sizing);
+    let top = 0;
+    for (const score of scores.values()) top = Math.max(top, score);
+    cy.batch(() => {
+      notes.forEach((node) => {
+        node.data("size", sizeFor(scores.get(node.id()) ?? 0, top, sizing, sizeMin, sizeMax));
+      });
+    });
+    this.drawOverlay(); // rings and badges sit on the rim, and the rim moved
+  }
+
+  /* ---------------------------------------------------------------- layout --- */
+
+  /**
+   * Relaxes the arrangement of `paths` — notes, or whole folder boxes — from where they
+   * are, and shows it happening: a few solver ticks per frame until nothing moves. Only
+   * these move; everything else on the canvas is scenery they settle around. Esc, or a
+   * hand on the canvas, stops it where it is — nothing is ever thrown back.
+   */
+  runLayout(paths: Iterable<string>): void {
+    const cy = this.cy;
+    if (!cy) return;
+    this.stopLayout();
+    this.clearPicked();
+    if (this.draftSource) this.cancelDraft();
+    const relaxer = relaxLayout(cy, this.frames, new Set(paths));
+    if (!relaxer) {
+      this.handlers.onHint("nothing there to lay out");
+      return;
+    }
+    const things = relaxer.count === 1 ? "1 thing" : `${relaxer.count} things`;
+    this.handlers.onHint(`Laying out ${things} — Esc stops it where it is`);
+    let frames = 0;
+    const tick = (): void => {
+      if (!this.layoutRun) return;
+      const moving = relaxer.step(3);
+      this.drawOverlay();
+      frames += 1;
+      // A floor of a second or so, so a small move still reads as a move and not a jump;
+      // a ceiling, so a stubborn arrangement does not run forever.
+      if (moving && frames < 120) {
+        this.layoutRun.frame = requestAnimationFrame(tick);
+        return;
+      }
+      this.finishLayout();
+    };
+    this.layoutRun = { relaxer, frame: requestAnimationFrame(tick) };
+  }
+
+  /** The whole canvas at once: every note in every folder, and every folder box. */
+  runLayoutAll(): void {
+    const cy = this.cy;
+    if (!cy) return;
+    const all: string[] = [];
+    cy.nodes().forEach((node) => {
+      const kind = node.data("kind") as string | undefined;
+      if ((kind === "file" || kind === "dir") && !isAnchor(node.id()) && node.id() !== DRAFT_NODE) all.push(node.id());
+    });
+    this.runLayout(all);
+  }
+
+  /** Stops the run and keeps whatever it had reached — projected clean, then saved. */
+  stopLayout(): void {
+    if (!this.layoutRun) return;
+    cancelAnimationFrame(this.layoutRun.frame);
+    this.finishLayout();
+  }
+
+  private finishLayout(): void {
+    const run = this.layoutRun;
+    if (!run) return;
+    this.layoutRun = null;
+    run.relaxer.finish();
+    this.drawOverlay();
+    this.capture(); // where it came to rest is the arrangement from now on
+    this.handlers.onHint(null);
+  }
+
+  /** Puts out the light on a drawn selection — the menu it opened has gone. */
+  clearPicked(): void {
+    this.cy?.nodes(".picked").removeClass("picked");
   }
 }
 

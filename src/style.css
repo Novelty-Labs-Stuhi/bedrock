@@ -1871,3 +1871,44 @@ button.issue-id:hover {
   height: 12px;
   vertical-align: -2px;
 }
+
+/* ------------------------------------------------------------- navigation --- */
+
+/* The canvas being dragged by the right button, the middle one, or Space+drag. */
+#cy.panning,
+#cy.panning canvas {
+  cursor: grabbing;
+}
+
+/* ------------------------------------------------------------ layout tab --- */
+
+.settings-run {
+  margin: 4px 0 2px;
+  padding: 4px 12px;
+  font-size: 12px;
+}
+
+/* The two bounds a note is sized between, side by side under the strategies. */
+.settings-nums {
+  display: flex;
+  gap: 18px;
+  padding: 4px 2px 2px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.settings-num {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.settings-num input {
+  width: 58px;
+  padding: 2px 4px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+}

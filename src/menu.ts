@@ -168,7 +168,11 @@ async function openBranch(
 /** Identity of the currently open menu — see `fill`. */
 let openToken: object = {};
 
-export function showMenu(at: { x: number; y: number }, items: MenuItem[]): void {
+/**
+ * `onClose` runs however the menu goes away — a row picked, a click elsewhere, Esc — so a
+ * caller that lit something up for the menu's sake can put it out again.
+ */
+export function showMenu(at: { x: number; y: number }, items: MenuItem[], onClose?: () => void): void {
   closeMenu();
   const token = {};
   openToken = token;
@@ -193,6 +197,7 @@ export function showMenu(at: { x: number; y: number }, items: MenuItem[]): void 
     panels = [];
     openToken = {};
     dismiss = null;
+    onClose?.();
   };
   document.addEventListener("mousedown", onPointerDown, true);
   document.addEventListener("keydown", onKeyDown, true);
