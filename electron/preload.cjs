@@ -76,6 +76,15 @@ contextBridge.exposeInMainWorld("bedrock", {
   // The menu bar's two renderer-side doors: Settings…, Open Vault….
   onMenu: (fn) => ipcRenderer.on("menu", (_e, what) => fn(what)),
 
+  // Windows. `windowRoot` is this window saying which vault it has open; `windowState`
+  // asks whether this window is full screen and what the other windows are holding;
+  // `windowShow` raises one of them, on a note if one is named. `onGoto` is the other
+  // end of that: a window being raised is told where to land.
+  windowRoot: (root) => ipcRenderer.invoke("window-root", root),
+  windowState: () => ipcRenderer.invoke("window-state"),
+  windowShow: (id, focus) => ipcRenderer.invoke("window-show", id, focus),
+  onGoto: (fn) => ipcRenderer.on("goto", (_e, focus) => fn(focus)),
+
   // Sessions run by the CLI, in the person's own terminal. `claudeCliStatus` is what the
   // settings window gates the mode on; starting one hands it over and returns its id.
   claudeCliStatus: () => ipcRenderer.invoke("claude-cli-status"),

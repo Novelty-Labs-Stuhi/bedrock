@@ -79,6 +79,63 @@ function createWindow() {
 }
 
 /*
+ * WHICH VAULT IS IN WHICH WINDOW.
+ *
+ * Only the renderer knows: a window's address carries `?root=` when it was opened for a
+ * folder, but File > Open Vault… changes the vault without changing the address, and a
+ * handle-backed vault has no path at all. So each window says what it has open (see
+ * `window-root`) and this is the answer to "is that vault already on screen somewhere".
+ *
+ * What it is for: opening the vault behind a node used to mean a new window every time,
+ * even when that vault was already open in one — and on a Mac, a new window opened from a
+ * full-screen one lands on its own space, which throws the person out of what they were
+ * looking at. With this the renderer can raise the window that already has it, or open the
+ * vault in place.
+ */
+const vaultRoots = new Map(); // webContents id -> the absolute folder that window has open
+
+const normalRoot = (root) => (typeof root === "string" && root ? path.resolve(root) : null);
+
+ipcMain.handle("window-root", (event, root) => {
+  const id = event.sender.id;
+  const at = normalRoot(root);
+  if (at) vaultRoots.set(id, at);
+  else vaultRoots.delete(id);
+  // A window that has gone takes its claim with it, or a closed vault goes on looking open.
+  event.sender.once("destroyed", () => vaultRoots.delete(id));
+  return true;
+});
+
+ipcMain.handle("window-state", (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  return {
+    // macOS native full screen, and the same flag on Windows/Linux. `isMaximized` is NOT
+    // this: a maximised window still opens a second window beside it, which is fine.
+    fullScreen: !!win && win.isFullScreen(),
+    windows: BrowserWindow.getAllWindows().map((other) => ({
+      id: other.webContents.id,
+      root: vaultRoots.get(other.webContents.id) ?? null,
+      self: !!win && other.id === win.id,
+    })),
+  };
+});
+
+/**
+ * Brings one window forward, and optionally tells it which note to land on — the same
+ * thing `?focus=` does for a window being opened. False when that window has gone in the
+ * meantime, which the caller answers by opening the vault the ordinary way.
+ */
+ipcMain.handle("window-show", (event, id, focus) => {
+  const target = BrowserWindow.getAllWindows().find((win) => win.webContents.id === id);
+  if (!target || target.isDestroyed()) return false;
+  if (target.isMinimized()) target.restore();
+  target.show();
+  target.focus();
+  if (focus) target.webContents.send("goto", focus);
+  return true;
+});
+
+/*
  * The standard menus, plus File > New Window: one bedrock window per project. A new
  * window comes up on the local vault like a first launch does — "Open folder…" then
  * points it at whichever project it is for, and each folder keeps its own arrangement,

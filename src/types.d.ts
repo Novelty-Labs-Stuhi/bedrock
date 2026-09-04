@@ -196,6 +196,20 @@ interface Window {
     /** The menu bar speaking: Settings… or Open Vault… was picked. */
     onMenu(fn: (what: "settings" | "open-vault") => void): void;
 
+    /** This window saying which vault it now has open, so the others can be asked whether
+        a vault is already on screen. Null when it has none, or none with a known path. */
+    windowRoot(root: string | null): Promise<boolean>;
+    /** Whether this window is full screen, and what every Bedrock window has open. */
+    windowState(): Promise<{
+      fullScreen: boolean;
+      windows: Array<{ id: number; root: string | null; self: boolean }>;
+    }>;
+    /** Raises a window, landing it on `focus` (a vault-relative note path) if one is
+        given. False when that window has gone since it was listed. */
+    windowShow(id: number, focus?: string | null): Promise<boolean>;
+    /** A window being raised, told where to land — the live twin of `?focus=`. */
+    onGoto(fn: (focus: string) => void): void;
+
     /** Where the `claude` CLI is (null when it is not installed). The whole prerequisite
         for terminal mode: there is nothing else to install, and no window to own. */
     claudeCliStatus(): Promise<{ cli: string | null; platform: string }>;

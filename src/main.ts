@@ -15,7 +15,7 @@ import {
 } from "./links";
 import { showStylePicker } from "./node-style";
 import { askChoice, askConfirm, askPick, askText } from "./dialog";
-import { EDGE_DIR, isEdgeNote, renamedEdgeNote } from "./edges";
+import { ARROW, EDGE_DIR, edgeNotePath, isEdgeNote, renamedEdgeNote } from "./edges";
 import { showMenu, type MenuItem } from "./menu";
 import {
   CONFIG_FILE,
@@ -247,8 +247,10 @@ const graphView = new GraphView(ui.cy, {
   },
   onSelect: (picked, client) => {
     /*
-     * A rectangle drawn round some notes: what can be done to them, as a menu whose corner
-     * is at the cursor. Laying them out moves only them; a style lands on every one.
+     * Right-click on a lit selection: what can be done to those notes, as a menu whose
+     * corner is at the cursor. Laying them out moves only them; a style lands on every one.
+     * The selection stays lit when the menu goes — it is the canvas's state now, not the
+     * menu's — so it can be dragged, or acted on again, straight afterwards.
      */
     const things = picked.length === 1 ? "1 note" : `${picked.length} notes`;
     const items: MenuItem[] = [{ label: "Run layout", hint: things, run: () => graphView.runLayout(picked) }];
@@ -257,8 +259,10 @@ const graphView = new GraphView(ui.cy, {
     }
     // The notes become a vault of their own, standing here as one node.
     items.push({ label: "Turn into a vault", hint: things, run: () => void turnSelectionIntoVault(picked) });
-    showMenu(client, items, () => graphView.clearPicked());
+    items.push({ label: "Delete", hint: things, run: () => void deleteNotes(picked) });
+    showMenu(client, items);
   },
+  onDeleteSelection: (picked) => void deleteNotes(picked),
   onNodeMenu: (path, client) => {
     /*
      * Right-click on a note. Everything here starts by drawing a LINK from this note, so
@@ -356,6 +360,13 @@ const graphView = new GraphView(ui.cy, {
         run: () => graphView.setEdgeMark(source, target, mark === "radiate" ? null : "radiate"),
       });
     }
+    // Cutting the line means taking the link out of the note that draws it — there is
+    // nothing else holding the connection up. Last, and it asks first.
+    items.push({
+      label: "Delete connection",
+      hint: `${noteName(source)}${ARROW}${noteName(target)}`,
+      run: () => void deleteEdge(source, target),
+    });
     showMenu(client, items);
   },
   onCanvasMenu: (at, client) => {
@@ -538,6 +549,18 @@ async function refresh(): Promise<void> {
   graphStale = true;
   render();
   if (tabOf(panes[0])?.kind === "graph") await drawGraph();
+}
+
+/**
+ * Closes every tab showing `path`, in both panes. `pruneTabs` cannot do this one: it keeps
+ * a connection note's tab open on purpose, because such a note is never in `entries()`.
+ */
+function dropTabs(path: string): void {
+  for (const p of panes) {
+    p.tabs = p.tabs.filter((tab) => tab.kind === "graph" || tab.path !== path);
+    p.active = Math.max(0, Math.min(p.active, p.tabs.length - 1));
+  }
+  pinGraph();
 }
 
 /** Drops tabs whose file is gone, in both panes, and keeps the graph where it belongs. */
@@ -1074,6 +1097,33 @@ async function deleteEntry(path: string, kind: "file" | "dir"): Promise<void> {
   ui.status.textContent = `deleted ${path}${unlinkedFrom(unlinked)}`;
 }
 
+/**
+ * Every note of a drawn selection, in one gesture: one ask, one pass over the links, one
+ * redraw. Note by note through `deleteEntry` would ask as many times as there are notes and
+ * rewrite the whole vault's links between each — and a link from one doomed note to another
+ * would be taken out of a file that is about to go anyway.
+ *
+ * A vault node goes the way the note menu's Delete sends it, as a file: the folder it opens
+ * is left on disk, so nothing inside a vault is ever deleted by a rectangle drawn outside it.
+ */
+async function deleteNotes(paths: string[]): Promise<void> {
+  const live = new Set(filePaths());
+  const gone = new Set(paths.filter((path) => live.has(path)));
+  if (!gone.size) return;
+  const what = gone.size === 1 ? `Delete ${[...gone][0]}?` : `Delete these ${gone.size} notes?`;
+  if (!(await askConfirm(what))) return;
+  graphView.clearPicked(); // whatever happens next, the selection has been answered
+  await flushAll(); // an open buffer would write the links back over the pass below
+  const before = filePaths();
+  for (const path of gone) await vault.remove(path, "file");
+  entries = await vault.entries();
+  const unlinked = await unlinkVault(gone, before);
+  await refresh();
+  await showAll();
+  ui.status.textContent =
+    gone.size === 1 ? `deleted ${[...gone][0]}${unlinkedFrom(unlinked)}` : `deleted ${gone.size} notes${unlinkedFrom(unlinked)}`;
+}
+
 async function pickFolder(): Promise<void> {
   const bridge = window.bedrock;
   if (bridge) {
@@ -1126,6 +1176,9 @@ async function openVault(next: Vault): Promise<void> {
   await refresh();
   ui.welcome.hidden = true;
   vaultOpen = true;
+  // The shell keeps a note of which window holds which vault, so opening the vault behind
+  // a node can raise the window that already has it instead of making another one.
+  void window.bedrock?.windowRoot(knownVaultRoot());
 }
 
 /* ----------------------------------------------------------------- paths --- */
@@ -1522,6 +1575,40 @@ async function applyEdgeLabel(source: string, target: string, fresh: string | nu
     : `unnamed: ${noteName(source)} → ${noteName(target)}`;
 }
 
+/**
+ * Cuts a connection. The link in the source note is what MAKES the edge (see `edges.ts`),
+ * so this is the same rewrite a deleted note's incoming links get: a link on a line of its
+ * own goes with the line, and one buried in a sentence leaves its words behind as text.
+ * Only links from THIS note to that one are touched — the other direction, if there is one,
+ * is a connection somebody else drew and is its own line to cut.
+ *
+ * The note describing the connection goes with it. A description of a link that no longer
+ * exists is a file nothing on the canvas can ever reach again.
+ */
+async function deleteEdge(source: string, target: string): Promise<void> {
+  const title = `${noteName(source)}${ARROW}${noteName(target)}`;
+  const note = edgeNotePath(source, target);
+  const described = await vault.exists(note);
+  const ask = described
+    ? `Delete the connection ${title}, and what was written about it?`
+    : `Delete the connection ${title}?`;
+  if (!(await askConfirm(ask, "Delete"))) return;
+  await flushAll(); // the source note may be open, with the link still in its buffer
+  const resolver = new LinkResolver(filePaths());
+  const spelling = target.replace(/\.md$/i, "");
+  const cut = (t: string): boolean => resolver.resolve(t) === target || t.trim() === spelling.trim();
+  const text = await vault.read(source);
+  const next = unlinkText(text, cut);
+  if (next !== text) await vault.write(source, next);
+  if (described) {
+    dropTabs(note);
+    await vault.remove(note, "file");
+  }
+  await refresh();
+  await showAll();
+  ui.status.textContent = next === text ? `nothing to cut: ${title}` : `deleted the connection ${title}`;
+}
+
 /** Sidebar-only refresh — avoids render()'s graph fit, which would jump the viewport. */
 async function refreshSidebar(): Promise<void> {
   entries = await vault.entries();
@@ -1911,6 +1998,23 @@ async function spawnVaultWindow(folder: string): Promise<void> {
   await settings.flush();
   const child = await here.child(folder);
   const root = knownVaultRoot();
+  const at = root ? `${root.replace(/[\\/]+$/, "")}/${folder}` : null;
+  // The same three answers a vault reached by path gets (see `openVaultAt`), as far as a
+  // folder handle allows: raise the window that already has it, or — from full screen,
+  // where a second window would land on a space of its own — open it in this one.
+  const state = (await window.bedrock?.windowState().catch(() => null)) ?? null;
+  const already = at ? state?.windows.find((win) => !win.self && win.root && samePath(win.root, at)) : null;
+  if (already && (await window.bedrock?.windowShow(already.id).catch(() => false))) {
+    ui.status.textContent = `${folder} is already open — brought that window forward`;
+    return;
+  }
+  if (state?.fullScreen) {
+    const came = vault.name;
+    if (at) localStorage.setItem(ROOT_KEY + child.name, at);
+    await openVault(child);
+    ui.status.textContent = `${child.name} — ⌘O to go back to ${came}`;
+    return;
+  }
   const address = new URL(location.href);
   address.searchParams.set("vault", folder);
   const opened = window.open(address.toString(), "_blank");
@@ -1924,27 +2028,68 @@ async function spawnVaultWindow(folder: string): Promise<void> {
     const message: VaultOpenMessage = {
       type: VAULT_OPEN,
       handle: child.directory,
-      root: root ? `${root}/${folder}` : null,
+      root: at,
     };
     opened.postMessage(message, location.origin === "null" ? "*" : location.origin);
   };
   window.addEventListener("message", onReady);
 }
 
+/** Two paths meaning the same folder. Trailing slashes are noise; the shell resolves the
+    roots it hands back (`path.resolve`), so what arrives here is already tidy. */
+const samePath = (a: string, b: string): boolean =>
+  a.replace(/[\\/]+$/, "") === b.replace(/[\\/]+$/, "");
+
 /**
- * Opens ANY folder on the disk as a vault, in a window of its own — a parent of this
- * vault, a sibling, the vault a reference points into. Nothing travels but the path: the
- * new window's address carries it, and the shell reaches the folder from there (see
- * `ShellVault`). `focus` is a note in it to land on, "/"-relative to the folder.
+ * Opens ANY folder on the disk as a vault — a parent of this vault, a sibling, the vault a
+ * reference points into. `focus` is a note in it to land on, "/"-relative to the folder.
+ *
+ * A window of its own is the LAST answer, not the first. In order:
+ *
+ * 1. This window already has that vault: nothing to open, just go to the note.
+ * 2. Another window has it: raise that one and let it go to the note. Two windows on one
+ *    folder are two arrangements of the same graph fighting to be saved, and finding the
+ *    one that is already open is what somebody actually meant.
+ * 3. This window is FULL SCREEN: open the vault in place. A new window opened from a
+ *    full-screen window is put on a space of its own by macOS, which throws the person out
+ *    of what they were looking at and leaves an empty full-screen window behind them.
+ * 4. Otherwise: a window of its own, as before. Nothing travels but the path — the address
+ *    carries it and the shell reaches the folder from there (see `ShellVault`).
  */
 async function openVaultAt(root: string, focus: string | null = null): Promise<void> {
-  if (!window.bedrock) {
+  const bridge = window.bedrock;
+  if (!bridge) {
     ui.status.textContent = "opening a vault by its path needs the desktop app";
+    return;
+  }
+  const here = knownVaultRoot();
+  if (here && samePath(here, root)) {
+    if (focus) graphView.focusNode(focus);
     return;
   }
   await flushAll();
   await spatial.flush();
   await settings.flush();
+  // What the shell knows about the windows: whether this one is full screen, and which of
+  // them already has this folder. Neither is worth failing an open over.
+  const state = await bridge.windowState().catch(() => null);
+  const already = state?.windows.find((win) => !win.self && win.root && samePath(win.root, root));
+  if (already && (await bridge.windowShow(already.id, focus).catch(() => false))) {
+    ui.status.textContent = `${vaultNameOf(root)} is already open — brought that window forward`;
+    return;
+  }
+  if (state?.fullScreen) {
+    // In place: the vault this window is showing changes, the window does not move. There
+    // is no window to close to come back, so the status bar says what the way back is —
+    // ⌘O reaches any folder, this one included, and lands it in this same window.
+    const came = vault.name;
+    const next = new ShellVault(root);
+    localStorage.setItem(ROOT_KEY + next.name, root);
+    await openVault(next);
+    if (focus) graphView.focusNode(focus);
+    ui.status.textContent = `${next.name} — ⌘O to go back to ${came}`;
+    return;
+  }
   const address = new URL(location.href);
   address.searchParams.delete("vault");
   address.searchParams.set("root", root);
@@ -1952,6 +2097,9 @@ async function openVaultAt(root: string, focus: string | null = null): Promise<v
   else address.searchParams.delete("focus");
   if (!window.open(address.toString(), "_blank")) ui.status.textContent = "the browser would not open a second window";
 }
+
+/** What a folder's vault is called: its own name, the way `ShellVault` reads it. */
+const vaultNameOf = (root: string): string => root.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || root;
 
 /**
  * The other half: opened with `?root=` in its address, the window skips the front door
@@ -6350,9 +6498,10 @@ ui.settings.addEventListener("click", () => {
 ui.floatControls.hidden = !!window.bedrock;
 window.bedrock?.onMenu((what) => {
   if (what === "settings") ui.settings.click();
-  // The folder picker refuses to open without a real click, so the menu item opens the
-  // front door instead — its buttons are real clicks, and Esc backs out over a vault.
-  else ui.welcome.hidden = false;
+  // Straight to the OS's own folder sheet. It is the shell that opens it, so unlike the
+  // browser's `showDirectoryPicker` it needs no click of its own to be allowed; the front
+  // door stands behind it as the way out, and Esc backs out of that over an open vault.
+  else void pickFolder();
 });
 settings.onChange = applyFeatures;
 settings.onLook = applyLook;
@@ -6521,6 +6670,21 @@ el("welcome-open").addEventListener("click", () => void pickFolder());
 el("welcome-new").addEventListener("click", () => void pickFolder());
 adoptVaultFromOpener(); // a window opened from a vault node is handed its folder, no door
 adoptVaultFromPath(); // and one opened from a reference is told its path
+
+/*
+ * A window that was not opened FOR a vault asks which one straight away: the OS's folder
+ * sheet, not a door with an "Open a vault" button on it to press first. The shell opens
+ * that sheet, so it needs no click to be allowed one — which is the only reason the door
+ * ever came first (a browser tab's `showDirectoryPicker` does need one, and there the door
+ * stays the way in). Cancelling the sheet leaves the door standing behind it, so a window
+ * whose picker was dismissed is not a dead one.
+ */
+if (window.bedrock) {
+  const opened = new URL(location.href).searchParams;
+  if (!opened.get("root") && !opened.get("vault")) void pickFolder();
+}
+// A window that was raised instead of opened is told which note it was raised for.
+window.bedrock?.onGoto((focus) => graphView.focusNode(focus));
 document.addEventListener("keydown", (event) => {
   // The door can be closed over an open vault; before one is open there is nothing behind it.
   if (event.key === "Escape" && vaultOpen && !ui.welcome.hidden) ui.welcome.hidden = true;

@@ -30,8 +30,10 @@
           <button id="settings" title="Settings">⚙</button>
         </div>
 
-        <!-- The front door. No vault opens by itself: the app starts here, and File →
-             Open Vault… comes back here (the picker needs a real click to open). -->
+        <!-- The front door — the way in behind the folder sheet, not in front of it. The
+             desktop app opens that sheet on its own at start and on File → Open Vault…, and
+             this is what a dismissed sheet leaves standing. In a browser tab it comes first:
+             `showDirectoryPicker` is only allowed to open on a real click. -->
         <div id="welcome">
           <button id="welcome-open" class="welcome-btn">
             <b>Open a vault</b>

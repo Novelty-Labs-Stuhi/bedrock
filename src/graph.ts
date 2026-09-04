@@ -719,7 +719,8 @@ function styleSheet(look: Look): cytoscape.StylesheetJson {
       },
     },
     { selector: "node.draft-source", style: { "border-width": 3, "border-color": ink } },
-    // What a drawn rectangle took in, lit for as long as its actions menu is open.
+    // What a drawn rectangle took in, lit until something puts it out: a click on the
+    // canvas, a click on a note, Esc, or the selection being acted on.
     {
       selector: "node.picked",
       style: { "overlay-color": ink, "overlay-opacity": 0.18, "overlay-padding": 5 },
@@ -1239,16 +1240,28 @@ export type GraphHandlers = {
    */
   onLinkNew: (source: string, at: cytoscape.Position, kind: DraftKind) => void;
   /**
-   * A rectangle was drawn around `picked`: offer what can be done to them, in a menu whose
-   * top-left corner is at `client` — the cursor, where the drag ended. The picked nodes
-   * stay lit until `clearPicked` is called.
+   * What can be done to a drawn selection, as a menu whose top-left corner is at `client`.
+   * Asked for by right-clicking any note of a lit selection — the rectangle itself only
+   * selects, so the notes can be dragged as a group first and acted on after. They stay
+   * lit through the menu and beyond it, until something puts the selection out.
    */
   onSelect: (picked: string[], client: { x: number; y: number }) => void;
+  /** Delete/Backspace with a drawn selection lit: every note in it goes, after one ask. */
+  onDeleteSelection: (picked: string[]) => void;
   /** Transient instruction for the status bar (null clears it). */
   onHint: (hint: string | null) => void;
 };
 
-type DragState = { path: string };
+/**
+ * A note being dragged. `group` is the REST of a drawn selection when the note under the
+ * cursor belongs to one: each of those notes is moved by the same delta, from where it
+ * stood when the drag began, so the selection travels as the shape it is.
+ */
+type DragState = {
+  path: string;
+  from: cytoscape.Position;
+  group: Array<{ node: NodeSingular; at: cytoscape.Position }>;
+};
 
 /** A rectangle in rendered (screen) coordinates, relative to the canvas. */
 type Area = { x1: number; y1: number; x2: number; y2: number };
@@ -1390,7 +1403,28 @@ export class GraphView {
       }
       if (this.draftSource) this.cancelDraft();
       if (this.issue) this.closeIssue();
+      this.clearPicked();
     });
+    /*
+     * Delete (or Backspace) with a selection lit takes every note in it — the one gesture
+     * the graph has that reaches the disk, so it is guarded twice: not while anything is
+     * being typed into, and not while the graph is off screen, where a lit selection the
+     * user cannot see must not answer a Backspace meant for something else. The asking is
+     * `onDeleteSelection`'s.
+     */
+    document.addEventListener("keydown", (event) => {
+      if (event.key !== "Delete" && event.key !== "Backspace") return;
+      if (typing(event.target) || !this.onScreen()) return;
+      const picked = this.pickedPaths();
+      if (!picked.length) return;
+      event.preventDefault();
+      this.handlers.onDeleteSelection(picked);
+    });
+  }
+
+  /** Whether the canvas is the thing on screen — a hidden tab hears no keys. */
+  private onScreen(): boolean {
+    return this.container.isConnected && this.container.offsetParent !== null;
   }
 
   /**
@@ -1779,6 +1813,9 @@ export class GraphView {
         this.finishDraftOnNode(node);
         return;
       }
+      // Clicking a note opens it, which is done with the selection. A drag is not a tap,
+      // so moving a group and letting it go leaves it lit.
+      this.clearPicked();
       if (node.data("kind") !== "file") return;
       // A session node is where the work is happening, not a page about it: clicking it
       // opens the session in a terminal. With the integration off it opens like any note.
@@ -1872,6 +1909,9 @@ export class GraphView {
 
     cy.on("tap", (event) => {
       if (event.target !== cy) return; // background only
+      // "Until you click somewhere": a click on bare canvas is that somewhere. Cytoscape
+      // does not call a drag a tap, so letting go of a dragged group never lands here.
+      this.clearPicked();
       // An aimed arrow released on nothing is a change of mind, not a new note.
       if (this.draftRow !== null) {
         this.cancelRowLink();
@@ -1920,7 +1960,10 @@ export class GraphView {
         return;
       }
       const node = hit as NodeSingular | null;
-      if (node && node.data("kind") === "file") this.handlers.onNodeMenu(node.id(), client);
+      // A note of a lit selection speaks for the whole of it: the rectangle no longer
+      // opens a menu of its own, so this is where a selection's actions are asked for.
+      if (node && node.hasClass("picked")) this.handlers.onSelect(this.pickedPaths(), client);
+      else if (node && node.data("kind") === "file") this.handlers.onNodeMenu(node.id(), client);
       else this.handlers.onCanvasMenu({ ...event.position }, client);
     });
 
@@ -1972,10 +2015,22 @@ export class GraphView {
     cy.on("grab", "node", (event) => {
       const node = event.target as NodeSingular;
       if (node.data("kind") !== "file") return;
-      this.drag = { path: node.id() };
+      // Taking hold of one note of a drawn selection takes hold of all of them. Their
+      // starting positions are read once, here: during the drag each is put back at its
+      // own start plus however far the held note has come, which is what keeps the group
+      // rigid however far the cursor travels.
+      const group: Array<{ node: NodeSingular; at: cytoscape.Position }> = [];
+      if (node.hasClass("picked")) {
+        cy.nodes(".picked").forEach((other) => {
+          if (other.id() === node.id()) return;
+          group.push({ node: other as NodeSingular, at: { ...(other as NodeSingular).position() } });
+        });
+      }
+      this.drag = { path: node.id(), from: { ...node.position() }, group };
     });
 
     cy.on("drag", "node", () => {
+      this.carryGroup();
       this.drawPulses(); // a note's own ring stays under the cursor with it
       this.placeIssueCard(); // as does an open card, if this is its node
       this.drawIssueBadges(); // and the badge on an issue's corner
@@ -1984,7 +2039,10 @@ export class GraphView {
     cy.on("free", "node", () => {
       const drag = this.drag;
       this.drag = null;
-      if (drag) {
+      if (drag && !drag.group.length) {
+        // Only a lone note slides clear of what it landed on. A selection was arranged by
+        // hand or by a layout run, and nudging each of its notes apart on release would
+        // take that arrangement apart at the moment of putting it down.
         const node = cy.getElementById(drag.path) as NodeSingular;
         if (node.nonempty()) this.settleAfterDrop(cy, node);
       }
@@ -2094,6 +2152,23 @@ export class GraphView {
   }
 
   /**
+   * Moves the rest of a held selection with the note under the cursor: each back to where
+   * it started, plus however far that note has come. Recomputed from the starts on every
+   * frame rather than by adding up per-frame deltas, so nothing drifts over a long drag.
+   */
+  private carryGroup(): void {
+    const cy = this.cy;
+    const drag = this.drag;
+    if (!cy || !drag || !drag.group.length) return;
+    const at = (cy.getElementById(drag.path) as NodeSingular).position();
+    const dx = at.x - drag.from.x;
+    const dy = at.y - drag.from.y;
+    cy.batch(() => {
+      for (const held of drag.group) held.node.position({ x: held.at.x + dx, y: held.at.y + dy });
+    });
+  }
+
+  /**
    * Where a note ends up once it is let go of.
    *
    * A drag itself is completely free — the note goes wherever the cursor does, straight
@@ -2113,8 +2188,13 @@ export class GraphView {
   /**
    * Draws the selection rectangle from a press on empty canvas until its release. Nothing
    * is drawn until the pointer has travelled a few pixels (a press that stays put is a
-   * click, and cytoscape's tap handles it); the release lights what was taken in and asks
-   * `onSelect` what to do with it.
+   * click, and cytoscape's tap handles it); the release lights what was taken in and leaves
+   * it lit.
+   *
+   * Releasing used to open the actions menu at once, which made the selection a thing that
+   * existed only for as long as that menu did. A lit selection is now a state the canvas is
+   * in: drag any of its notes and they all move, right-click one for what can be done to
+   * them, Delete takes them, and a click anywhere puts it out.
    */
   private beginMarquee(event: MouseEvent): void {
     const cy = this.cy;
@@ -2149,20 +2229,25 @@ export class GraphView {
       }
       area = place(to);
       const count = this.notesIn(area).length;
-      this.handlers.onHint(`${count === 1 ? "1 note" : `${count} notes`} — release for what can be done with them`);
+      this.handlers.onHint(`${count === 1 ? "1 note" : `${count} notes`} — release to select them`);
     };
-    const onUp = (up: MouseEvent): void => {
+    const onUp = (): void => {
       document.removeEventListener("mousemove", onMove);
       document.removeEventListener("mouseup", onUp);
       rect.remove();
       if (!drawn) return; // never became a drag: the click it was is cytoscape's
       const picked = this.notesIn(area);
-      this.handlers.onHint(null);
-      if (!picked.length) return;
+      if (!picked.length) {
+        this.handlers.onHint(null);
+        this.clearPicked(); // a rectangle round nothing is a way of clearing one
+        return;
+      }
       cy.batch(() => {
+        this.clearPicked(); // one selection at a time: the last rectangle is the one that counts
         for (const path of picked) cy.getElementById(path).addClass("picked");
       });
-      this.handlers.onSelect(picked, { x: up.clientX, y: up.clientY });
+      const things = picked.length === 1 ? "1 note" : `${picked.length} notes`;
+      this.handlers.onHint(`${things} selected — drag any of them to move them all, right-click for more`);
     };
     document.addEventListener("mousemove", onMove);
     document.addEventListener("mouseup", onUp);
@@ -3662,7 +3747,12 @@ export class GraphView {
     return node && node.nonempty() ? { ...node.position() } : null;
   }
 
-  /** Puts out the light on a drawn selection — the menu it opened has gone. */
+  /** The notes of the lit selection, if there is one. */
+  pickedPaths(): string[] {
+    return this.cy?.nodes(".picked").map((node) => node.id()) ?? [];
+  }
+
+  /** Puts out the light on a drawn selection. */
   clearPicked(): void {
     this.cy?.nodes(".picked").removeClass("picked");
   }
