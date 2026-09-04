@@ -15,8 +15,11 @@ contextBridge.exposeInMainWorld("bedrock", {
   gitPush: (root, remote) => ipcRenderer.invoke("git-push", root, remote),
   gitPull: (root, remote) => ipcRenderer.invoke("git-pull", root, remote),
   gitStatus: (root) => ipcRenderer.invoke("git-status", root),
-  pickPath: (kind) => ipcRenderer.invoke("fs-pick", kind),
+  pickPath: (kind, options) => ipcRenderer.invoke("fs-pick", kind, options),
   openPath: (target) => ipcRenderer.invoke("fs-open", target),
+  vaultFs: (root, op, rel, arg) => ipcRenderer.invoke("vault-fs", root, op, rel, arg),
+  peekNote: (target, root) => ipcRenderer.invoke("note-peek", target, root),
+  vaultIndex: (root) => ipcRenderer.invoke("vault-index", root),
   agyStatus: () => ipcRenderer.invoke("agy-status"),
   agyCreate: (folder, name) => ipcRenderer.invoke("agy-create", folder, name),
   agyOpen: (options) => ipcRenderer.invoke("agy-open", options),
@@ -72,6 +75,15 @@ contextBridge.exposeInMainWorld("bedrock", {
   wordOpen: (path) => ipcRenderer.invoke("word-open", path),
   // The menu bar's two renderer-side doors: Settings…, Open Vault….
   onMenu: (fn) => ipcRenderer.on("menu", (_e, what) => fn(what)),
+
+  // Windows. `windowRoot` is this window saying which vault it has open; `windowState`
+  // asks whether this window is full screen and what the other windows are holding;
+  // `windowShow` raises one of them, on a note if one is named. `onGoto` is the other
+  // end of that: a window being raised is told where to land.
+  windowRoot: (root) => ipcRenderer.invoke("window-root", root),
+  windowState: () => ipcRenderer.invoke("window-state"),
+  windowShow: (id, focus) => ipcRenderer.invoke("window-show", id, focus),
+  onGoto: (fn) => ipcRenderer.on("goto", (_e, focus) => fn(focus)),
 
   // Sessions run by the CLI, in the person's own terminal. `claudeCliStatus` is what the
   // settings window gates the mode on; starting one hands it over and returns its id.

@@ -20,11 +20,21 @@ interface Window {
         itself. Answers rather than throws for "not a repository yet" and "no git here". */
     gitStatus(root: string): Promise<GitStatus>;
     /** The OS's own picker; a folder pick can create the folder right in the dialog.
-        Null when the dialog was dismissed. */
-    pickPath(kind: "file" | "folder"): Promise<string | null>;
+        Null when the dialog was dismissed. `defaultPath` is where the sheet opens. */
+    pickPath(kind: "file" | "folder", options?: PickOptions): Promise<string | null>;
     /** Opens a path the OS way — default app for a file, Finder/Explorer for a folder.
         Resolves "opened", "missing", or whatever the OS said went wrong. */
     openPath(target: string): Promise<string>;
+    /** A vault by its path on disk, one operation at a time — what `ShellVault` is made
+        of. `rel` is "/"-relative to `root`; nothing outside `root` is touched. */
+    vaultFs(root: string, op: string, rel?: string, arg?: unknown): Promise<unknown>;
+    /** What a note anywhere on the disk is — see `NotePeek`. `root` is this vault's
+        folder, so the answer can say whether the note is inside it. Null when the file
+        is not there. */
+    peekNote(target: string, root: string): Promise<NotePeek | null>;
+    /** Every note in the system of vaults `root` is part of, by name and place — see
+        `VaultIndex`. Made fresh from the disk on each call; nothing is kept. */
+    vaultIndex(root: string): Promise<VaultIndex>;
     /** Where the `agy` CLI is (null when it is not installed), and whether it has ever run
         on this machine. There is no sign-in question: the CLI holds its own OAuth login in
         the keychain and asks for one in the terminal, where it can be answered. */
@@ -186,6 +196,20 @@ interface Window {
     /** The menu bar speaking: Settings… or Open Vault… was picked. */
     onMenu(fn: (what: "settings" | "open-vault") => void): void;
 
+    /** This window saying which vault it now has open, so the others can be asked whether
+        a vault is already on screen. Null when it has none, or none with a known path. */
+    windowRoot(root: string | null): Promise<boolean>;
+    /** Whether this window is full screen, and what every Bedrock window has open. */
+    windowState(): Promise<{
+      fullScreen: boolean;
+      windows: Array<{ id: number; root: string | null; self: boolean }>;
+    }>;
+    /** Raises a window, landing it on `focus` (a vault-relative note path) if one is
+        given. False when that window has gone since it was listed. */
+    windowShow(id: number, focus?: string | null): Promise<boolean>;
+    /** A window being raised, told where to land — the live twin of `?focus=`. */
+    onGoto(fn: (focus: string) => void): void;
+
     /** Where the `claude` CLI is (null when it is not installed). The whole prerequisite
         for terminal mode: there is nothing else to install, and no window to own. */
     claudeCliStatus(): Promise<{ cli: string | null; platform: string }>;
@@ -251,6 +275,45 @@ type GoogleTask = {
   /** The task's own address in Google Tasks on the web — what a click opens. */
   url: string;
 };
+
+/** How the OS picker is opened: where, on what, and saying what. */
+type PickOptions = {
+  defaultPath?: string;
+  filters?: Array<{ name: string; extensions: string[] }>;
+  title?: string;
+  message?: string;
+};
+
+/** What the shell can say about a note on the disk, wherever it is, before anything is made of it. */
+type NotePeek = {
+  /** The file name with the extension shed — what a reference to it is named after. */
+  name: string;
+  /** Its `type::` line, or null for a plain note. */
+  type: string | null;
+  /** The nearest folder above it that is a Bedrock vault (has `.notes/config.json`), or null. */
+  vault: string | null;
+  /** Its path inside the root asked about, "/"-separated — null when it is outside that root. */
+  relative: string | null;
+};
+
+/** One note as the search index knows it: by name and place, never read. */
+type IndexedNote = {
+  /** Absolute path on this disk. */
+  path: string;
+  /** The file name with the extension shed. */
+  name: string;
+  /** The nearest vault folder above it, or null for a note under no vault. */
+  vault: string | null;
+  /** Its folder, relative to the top of the system, "/"-separated — what tells twins apart. */
+  place: string;
+  /** Its path inside the root asked about, or null when it is outside that root. */
+  relative: string | null;
+  /** Inside the root asked about, but in a vault of its own there — so not on that root's canvas. */
+  nested: boolean;
+};
+
+/** The system of vaults a folder is part of: the top of it, and every note under that. */
+type VaultIndex = { top: string; notes: IndexedNote[] };
 
 /** A Notion page as the pointer Bedrock keeps: never the page itself. */
 type NotionPage = {

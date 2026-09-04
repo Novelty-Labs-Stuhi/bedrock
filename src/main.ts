@@ -15,7 +15,7 @@ import {
 } from "./links";
 import { showStylePicker } from "./node-style";
 import { askChoice, askConfirm, askPick, askText } from "./dialog";
-import { EDGE_DIR, isEdgeNote, renamedEdgeNote } from "./edges";
+import { ARROW, EDGE_DIR, edgeNotePath, isEdgeNote, renamedEdgeNote } from "./edges";
 import { showMenu, type MenuItem } from "./menu";
 import {
   CONFIG_FILE,
@@ -50,7 +50,7 @@ import {
 } from "./linear";
 import type { IssueChange } from "./graph";
 import {
-  FolderVault,
+  FolderVault, ShellVault,
   LocalVault,
   basename,
   canPickFolder,
@@ -221,6 +221,7 @@ const graphView = new GraphView(ui.cy, {
   onOpenFreeform: (path, board) => void openFreeformNode(path, board),
   onOpenVault: (path, folder) => void openVaultNode(path, folder),
   onOpenNotion: (path, url) => void openNotionNode(path, url),
+  onOpenRef: (path, target, corner) => void openRefNode(path, target, corner),
   onOpenSlack: (path, url) => void openSlackNode(path, url),
   onOpenGoogleTask: (path, task, url) => void openGoogleTaskNode(path, task, url),
   onOpenAppleNote: (path, note) => void openAppleNoteNode(path, note),
@@ -246,8 +247,10 @@ const graphView = new GraphView(ui.cy, {
   },
   onSelect: (picked, client) => {
     /*
-     * A rectangle drawn round some notes: what can be done to them, as a menu whose corner
-     * is at the cursor. Laying them out moves only them; a style lands on every one.
+     * Right-click on a lit selection: what can be done to those notes, as a menu whose
+     * corner is at the cursor. Laying them out moves only them; a style lands on every one.
+     * The selection stays lit when the menu goes — it is the canvas's state now, not the
+     * menu's — so it can be dragged, or acted on again, straight afterwards.
      */
     const things = picked.length === 1 ? "1 note" : `${picked.length} notes`;
     const items: MenuItem[] = [{ label: "Run layout", hint: things, run: () => graphView.runLayout(picked) }];
@@ -256,8 +259,10 @@ const graphView = new GraphView(ui.cy, {
     }
     // The notes become a vault of their own, standing here as one node.
     items.push({ label: "Turn into a vault", hint: things, run: () => void turnSelectionIntoVault(picked) });
-    showMenu(client, items, () => graphView.clearPicked());
+    items.push({ label: "Delete", hint: things, run: () => void deleteNotes(picked) });
+    showMenu(client, items);
   },
+  onDeleteSelection: (picked) => void deleteNotes(picked),
   onNodeMenu: (path, client) => {
     /*
      * Right-click on a note. Everything here starts by drawing a LINK from this note, so
@@ -296,7 +301,19 @@ const graphView = new GraphView(ui.cy, {
     // to — picking the thing arms the draft, and dropping it decides where. See
     // `startLink`'s `release`.
     const attach: MenuItem[] = [
-      { label: "Existing node", icon: NOTE_DOT, run: () => graphView.startLink(path, "link") },
+      // One row, two ways in. A CLICK starts the arrow: the draft lands on a note already
+      // on this canvas. HOVERING opens the search beside it: every note in the system of
+      // vaults — this one, the folders above it, the vaults beside it — found by name in
+      // a panel with a type box first and the few notes that match under it. That pick
+      // decides what the draft is: a plain link when the note is here, a reference node
+      // when it is not.
+      {
+        label: "Existing node",
+        icon: NOTE_DOT,
+        run: () => graphView.startLink(path, "link"),
+        search: { placeholder: "Type a note's name…" },
+        children: () => existingNodeRows(path, null, null),
+      },
       ...attachMenu(
         (option, kind) => () =>
           graphView.startLink(path, kind, (at, source) => void option.place(at, null, source)),
@@ -343,6 +360,13 @@ const graphView = new GraphView(ui.cy, {
         run: () => graphView.setEdgeMark(source, target, mark === "radiate" ? null : "radiate"),
       });
     }
+    // Cutting the line means taking the link out of the note that draws it — there is
+    // nothing else holding the connection up. Last, and it asks first.
+    items.push({
+      label: "Delete connection",
+      hint: `${noteName(source)}${ARROW}${noteName(target)}`,
+      run: () => void deleteEdge(source, target),
+    });
     showMenu(client, items);
   },
   onCanvasMenu: (at, client) => {
@@ -402,8 +426,18 @@ const graphView = new GraphView(ui.cy, {
     }
     const items: MenuItem[] = [{ label: "Create", children: create }];
     // Nothing to drag here: the click already said where, so a picked option lands at once.
-    const attach = attachMenu((option) => () => void option.place(at, folder, null));
-    if (attach.length) items.push({ label: "Attach", children: attach });
+    // What already exists, starting with a note. One on this canvas is already here, so
+    // the row is for one elsewhere: a folder above this vault, or a vault beside it.
+    const attach: MenuItem[] = [
+      {
+        label: "Existing node",
+        icon: TYPE_ICONS.ref,
+        search: { placeholder: "Type a note's name…" },
+        children: () => existingNodeRows(null, at, folder),
+      },
+      ...attachMenu((option) => () => void option.place(at, folder, null)),
+    ];
+    items.push({ label: "Attach", children: attach });
 
     showMenu(client, items);
   },
@@ -424,7 +458,9 @@ const filePaths = (): string[] => entries.filter((e) => e.kind === "file").map((
  */
 async function readDocs(): Promise<Doc[]> {
   const drawn = filePaths().filter((path) => !isCardPath(path));
-  const all: Doc[] = await Promise.all(drawn.map(async (path) => ({ path, text: await vault.read(path) })));
+  const texts = await readTexts(drawn);
+  const all: Doc[] = drawn.flatMap((path) => (texts.has(path) ? [{ path, text: texts.get(path)! }] : []));
+  if (all.length < drawn.length) ui.status.textContent = `${drawn.length - all.length} note(s) could not be read and are not drawn`;
   // A vault inside this one is opaque from out here: its notes are its own graph, and
   // the one node standing for it is all this canvas shows of it.
   const vaults = all.filter((doc) => parseType(doc.text) === "vault");
@@ -437,6 +473,27 @@ async function readDocs(): Promise<Doc[]> {
   }
   waiting = waitedFor(docs); // the graph's own read is also the answer `freshPath` needs
   return docs;
+}
+
+/**
+ * Every note's text in one go. A vault reached by path answers a list in one round trip
+ * rather than one call per note; either way a note that cannot be read is left out rather
+ * than taking the whole graph down with it — one broken symlink in a folder of thousands
+ * is not a reason to see nothing.
+ */
+async function readTexts(paths: string[]): Promise<Map<string, string>> {
+  if (vault.readMany) return vault.readMany(paths);
+  const out = new Map<string, string>();
+  await Promise.all(
+    paths.map(async (path) => {
+      try {
+        out.set(path, await vault.read(path));
+      } catch {
+        /* left out */
+      }
+    }),
+  );
+  return out;
 }
 
 /**
@@ -492,6 +549,18 @@ async function refresh(): Promise<void> {
   graphStale = true;
   render();
   if (tabOf(panes[0])?.kind === "graph") await drawGraph();
+}
+
+/**
+ * Closes every tab showing `path`, in both panes. `pruneTabs` cannot do this one: it keeps
+ * a connection note's tab open on purpose, because such a note is never in `entries()`.
+ */
+function dropTabs(path: string): void {
+  for (const p of panes) {
+    p.tabs = p.tabs.filter((tab) => tab.kind === "graph" || tab.path !== path);
+    p.active = Math.max(0, Math.min(p.active, p.tabs.length - 1));
+  }
+  pinGraph();
 }
 
 /** Drops tabs whose file is gone, in both panes, and keeps the graph where it belongs. */
@@ -1028,7 +1097,48 @@ async function deleteEntry(path: string, kind: "file" | "dir"): Promise<void> {
   ui.status.textContent = `deleted ${path}${unlinkedFrom(unlinked)}`;
 }
 
+/**
+ * Every note of a drawn selection, in one gesture: one ask, one pass over the links, one
+ * redraw. Note by note through `deleteEntry` would ask as many times as there are notes and
+ * rewrite the whole vault's links between each — and a link from one doomed note to another
+ * would be taken out of a file that is about to go anyway.
+ *
+ * A vault node goes the way the note menu's Delete sends it, as a file: the folder it opens
+ * is left on disk, so nothing inside a vault is ever deleted by a rectangle drawn outside it.
+ */
+async function deleteNotes(paths: string[]): Promise<void> {
+  const live = new Set(filePaths());
+  const gone = new Set(paths.filter((path) => live.has(path)));
+  if (!gone.size) return;
+  const what = gone.size === 1 ? `Delete ${[...gone][0]}?` : `Delete these ${gone.size} notes?`;
+  if (!(await askConfirm(what))) return;
+  graphView.clearPicked(); // whatever happens next, the selection has been answered
+  await flushAll(); // an open buffer would write the links back over the pass below
+  const before = filePaths();
+  for (const path of gone) await vault.remove(path, "file");
+  entries = await vault.entries();
+  const unlinked = await unlinkVault(gone, before);
+  await refresh();
+  await showAll();
+  ui.status.textContent =
+    gone.size === 1 ? `deleted ${[...gone][0]}${unlinkedFrom(unlinked)}` : `deleted ${gone.size} notes${unlinkedFrom(unlinked)}`;
+}
+
 async function pickFolder(): Promise<void> {
+  const bridge = window.bedrock;
+  if (bridge) {
+    // The desktop app opens a vault by its PATH: the OS's own folder dialog says where, and
+    // the shell reaches the folder from there (`ShellVault`). So where a vault is on the
+    // disk is always known — git, sessions and the search across vaults all ask — and
+    // nobody is ever asked twice. The folder handle stays the browser's way in.
+    const chosen = await bridge.pickPath("folder").catch(() => null);
+    if (!chosen) return; // the dialog was dismissed
+    const root = chosen.replace(/[\\/]+$/, "");
+    const next = new ShellVault(root);
+    localStorage.setItem(ROOT_KEY + next.name, root);
+    await openVault(next);
+    return;
+  }
   if (!canPickFolder()) {
     ui.status.textContent = "folder opening needs the File System Access API (Chrome/Edge/Electron)";
     return;
@@ -1066,6 +1176,9 @@ async function openVault(next: Vault): Promise<void> {
   await refresh();
   ui.welcome.hidden = true;
   vaultOpen = true;
+  // The shell keeps a note of which window holds which vault, so opening the vault behind
+  // a node can raise the window that already has it instead of making another one.
+  void window.bedrock?.windowRoot(knownVaultRoot());
 }
 
 /* ----------------------------------------------------------------- paths --- */
@@ -1462,6 +1575,40 @@ async function applyEdgeLabel(source: string, target: string, fresh: string | nu
     : `unnamed: ${noteName(source)} → ${noteName(target)}`;
 }
 
+/**
+ * Cuts a connection. The link in the source note is what MAKES the edge (see `edges.ts`),
+ * so this is the same rewrite a deleted note's incoming links get: a link on a line of its
+ * own goes with the line, and one buried in a sentence leaves its words behind as text.
+ * Only links from THIS note to that one are touched — the other direction, if there is one,
+ * is a connection somebody else drew and is its own line to cut.
+ *
+ * The note describing the connection goes with it. A description of a link that no longer
+ * exists is a file nothing on the canvas can ever reach again.
+ */
+async function deleteEdge(source: string, target: string): Promise<void> {
+  const title = `${noteName(source)}${ARROW}${noteName(target)}`;
+  const note = edgeNotePath(source, target);
+  const described = await vault.exists(note);
+  const ask = described
+    ? `Delete the connection ${title}, and what was written about it?`
+    : `Delete the connection ${title}?`;
+  if (!(await askConfirm(ask, "Delete"))) return;
+  await flushAll(); // the source note may be open, with the link still in its buffer
+  const resolver = new LinkResolver(filePaths());
+  const spelling = target.replace(/\.md$/i, "");
+  const cut = (t: string): boolean => resolver.resolve(t) === target || t.trim() === spelling.trim();
+  const text = await vault.read(source);
+  const next = unlinkText(text, cut);
+  if (next !== text) await vault.write(source, next);
+  if (described) {
+    dropTabs(note);
+    await vault.remove(note, "file");
+  }
+  await refresh();
+  await showAll();
+  ui.status.textContent = next === text ? `nothing to cut: ${title}` : `deleted the connection ${title}`;
+}
+
 /** Sidebar-only refresh — avoids render()'s graph fit, which would jump the viewport. */
 async function refreshSidebar(): Promise<void> {
   entries = await vault.entries();
@@ -1837,6 +1984,11 @@ type VaultOpenMessage = { type: typeof VAULT_OPEN; handle: FileSystemDirectoryHa
  */
 async function spawnVaultWindow(folder: string): Promise<void> {
   const here = vault;
+  // A vault reached by path opens its inner vaults by path too: no handle to hand over.
+  if (here instanceof ShellVault) {
+    await openVaultAt(`${here.root.replace(/[\\/]+$/, "")}/${folder}`);
+    return;
+  }
   if (!(here instanceof FolderVault)) {
     ui.status.textContent = "a vault inside a vault needs a real folder on disk";
     return;
@@ -1846,6 +1998,23 @@ async function spawnVaultWindow(folder: string): Promise<void> {
   await settings.flush();
   const child = await here.child(folder);
   const root = knownVaultRoot();
+  const at = root ? `${root.replace(/[\\/]+$/, "")}/${folder}` : null;
+  // The same three answers a vault reached by path gets (see `openVaultAt`), as far as a
+  // folder handle allows: raise the window that already has it, or — from full screen,
+  // where a second window would land on a space of its own — open it in this one.
+  const state = (await window.bedrock?.windowState().catch(() => null)) ?? null;
+  const already = at ? state?.windows.find((win) => !win.self && win.root && samePath(win.root, at)) : null;
+  if (already && (await window.bedrock?.windowShow(already.id).catch(() => false))) {
+    ui.status.textContent = `${folder} is already open — brought that window forward`;
+    return;
+  }
+  if (state?.fullScreen) {
+    const came = vault.name;
+    if (at) localStorage.setItem(ROOT_KEY + child.name, at);
+    await openVault(child);
+    ui.status.textContent = `${child.name} — ⌘O to go back to ${came}`;
+    return;
+  }
   const address = new URL(location.href);
   address.searchParams.set("vault", folder);
   const opened = window.open(address.toString(), "_blank");
@@ -1859,11 +2028,105 @@ async function spawnVaultWindow(folder: string): Promise<void> {
     const message: VaultOpenMessage = {
       type: VAULT_OPEN,
       handle: child.directory,
-      root: root ? `${root}/${folder}` : null,
+      root: at,
     };
     opened.postMessage(message, location.origin === "null" ? "*" : location.origin);
   };
   window.addEventListener("message", onReady);
+}
+
+/** Two paths meaning the same folder. Trailing slashes are noise; the shell resolves the
+    roots it hands back (`path.resolve`), so what arrives here is already tidy. */
+const samePath = (a: string, b: string): boolean =>
+  a.replace(/[\\/]+$/, "") === b.replace(/[\\/]+$/, "");
+
+/**
+ * Opens ANY folder on the disk as a vault — a parent of this vault, a sibling, the vault a
+ * reference points into. `focus` is a note in it to land on, "/"-relative to the folder.
+ *
+ * A window of its own is the LAST answer, not the first. In order:
+ *
+ * 1. This window already has that vault: nothing to open, just go to the note.
+ * 2. Another window has it: raise that one and let it go to the note. Two windows on one
+ *    folder are two arrangements of the same graph fighting to be saved, and finding the
+ *    one that is already open is what somebody actually meant.
+ * 3. This window is FULL SCREEN: open the vault in place. A new window opened from a
+ *    full-screen window is put on a space of its own by macOS, which throws the person out
+ *    of what they were looking at and leaves an empty full-screen window behind them.
+ * 4. Otherwise: a window of its own, as before. Nothing travels but the path — the address
+ *    carries it and the shell reaches the folder from there (see `ShellVault`).
+ */
+async function openVaultAt(root: string, focus: string | null = null): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) {
+    ui.status.textContent = "opening a vault by its path needs the desktop app";
+    return;
+  }
+  const here = knownVaultRoot();
+  if (here && samePath(here, root)) {
+    if (focus) graphView.focusNode(focus);
+    return;
+  }
+  await flushAll();
+  await spatial.flush();
+  await settings.flush();
+  // What the shell knows about the windows: whether this one is full screen, and which of
+  // them already has this folder. Neither is worth failing an open over.
+  const state = await bridge.windowState().catch(() => null);
+  const already = state?.windows.find((win) => !win.self && win.root && samePath(win.root, root));
+  if (already && (await bridge.windowShow(already.id, focus).catch(() => false))) {
+    ui.status.textContent = `${vaultNameOf(root)} is already open — brought that window forward`;
+    return;
+  }
+  if (state?.fullScreen) {
+    // In place: the vault this window is showing changes, the window does not move. There
+    // is no window to close to come back, so the status bar says what the way back is —
+    // ⌘O reaches any folder, this one included, and lands it in this same window.
+    const came = vault.name;
+    const next = new ShellVault(root);
+    localStorage.setItem(ROOT_KEY + next.name, root);
+    await openVault(next);
+    if (focus) graphView.focusNode(focus);
+    ui.status.textContent = `${next.name} — ⌘O to go back to ${came}`;
+    return;
+  }
+  const address = new URL(location.href);
+  address.searchParams.delete("vault");
+  address.searchParams.set("root", root);
+  if (focus) address.searchParams.set("focus", focus);
+  else address.searchParams.delete("focus");
+  if (!window.open(address.toString(), "_blank")) ui.status.textContent = "the browser would not open a second window";
+}
+
+/** What a folder's vault is called: its own name, the way `ShellVault` reads it. */
+const vaultNameOf = (root: string): string => root.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || root;
+
+/**
+ * The other half: opened with `?root=` in its address, the window skips the front door
+ * and opens that folder through the shell. The path is remembered under the vault's name
+ * as well, for everything else that asks where a vault is (git, sessions, the search).
+ */
+function adoptVaultFromPath(): void {
+  const address = new URL(location.href);
+  const root = address.searchParams.get("root");
+  if (!root || !window.bedrock) return;
+  const next = new ShellVault(root);
+  localStorage.setItem(ROOT_KEY + next.name, root);
+  const focus = address.searchParams.get("focus");
+  // The door closes at once: a big vault takes a moment to read, and a welcome screen
+  // standing there meanwhile reads as "nothing happened". If the open does fail, the
+  // door comes back with the reason on it.
+  ui.welcome.hidden = true;
+  ui.status.textContent = `opening ${next.name}…`;
+  openVault(next)
+    .then(() => {
+      if (focus) graphView.focusNode(focus);
+    })
+    .catch((err) => {
+      console.error(err);
+      ui.welcome.hidden = false;
+      ui.status.textContent = `${next.name} could not be opened — ${shellError(err)}`;
+    });
 }
 
 /**
@@ -5334,6 +5597,330 @@ async function saveClaudeSession(path: string, id: string, folder?: string): Pro
   ui.status.textContent = `${noteName(path)} now opens its own session`;
 }
 
+/* ------------------------------------------------------------- references --- */
+/*
+ * A note that lives somewhere else — a folder above this vault, a vault beside it, one
+ * inside a vault of its own — standing on this canvas. It is a pointer in the Notion
+ * note's mould: the target's path on disk, and the target's own type, so what is over
+ * there can be said without going. Never the note itself: that stays where it is, in its
+ * own vault, with its own connections.
+ *
+ * The finder is a search over the whole system of vaults this one is part of — up the
+ * folders for as long as each is a vault, then everything under the top one. Looking up
+ * is the one direction the browser's folder handle cannot, so the shell walks the disk
+ * from the vault's known place instead; see `vault-index`. A pick inside this vault is
+ * not a reference at all: the note is already on the canvas, and the gesture is a link.
+ */
+
+const refTemplate = (target: string, targetType: string | null): string =>
+  `type:: ref\n\nref:: ${target}\n${targetType ? `target:: ${targetType}\n` : ""}`;
+
+/**
+ * The same search as a dialog, for the one moment there is no menu to grow it from: a
+ * reference whose note has moved, clicked. The index is walked fresh off the disk — tens of
+ * milliseconds for tens of thousands of notes — and only the note picked is read. Rows
+ * answer by label, so twins — one name in two places — carry their place in the label.
+ */
+async function searchNote(message: string): Promise<{ target: string; peek: NotePeek } | null> {
+  const bridge = window.bedrock;
+  if (!bridge) {
+    ui.status.textContent = "Searching the vaults needs the desktop app — npm start";
+    return null;
+  }
+  const root = knownVaultRoot();
+  if (!root) {
+    ui.status.textContent = `where "${vault.name}" is on disk is not known — open it again (File → Open Vault…)`;
+    return null;
+  }
+  let index: VaultIndex;
+  try {
+    index = await bridge.vaultIndex(root);
+  } catch (err) {
+    ui.status.textContent = `could not read the folders — ${shellError(err)}`;
+    return null;
+  }
+  if (!index.notes.length) {
+    ui.status.textContent = `no notes under ${index.top}`;
+    return null;
+  }
+  const twins = new Map<string, number>();
+  for (const note of index.notes) twins.set(note.name, (twins.get(note.name) ?? 0) + 1);
+  const label = (note: IndexedNote): string =>
+    (twins.get(note.name) ?? 0) > 1 ? `${note.name} — ${note.place || "/"}` : note.name;
+  const rows = index.notes.map((note) => ({ label: label(note), hint: note.place }));
+  const picked = await askPick(message, rows, "Search notes…");
+  const note = picked === null ? null : index.notes.find((one) => label(one) === picked);
+  if (!note) return null;
+  const peek = await bridge.peekNote(note.path, root);
+  if (!peek) {
+    ui.status.textContent = `${note.path} could not be read`;
+    return null;
+  }
+  return { target: note.path, peek };
+}
+
+/** Where a reference says it is going: its vault when it has one, else its folder. */
+const refPlace = (target: string, peek: NotePeek): string =>
+  peek.vault ? `the vault at ${peek.vault}` : target.replace(/[\\/][^\\/]*$/, "");
+
+/**
+ * Makes the reference note, on the canvas at `at`, linked from `source` when there is one
+ * — and when there is, writes the other half of the link into the other vault too.
+ */
+async function placeRef(
+  target: string,
+  peek: NotePeek,
+  at: { x: number; y: number },
+  folder: string | null,
+  source: string | null,
+): Promise<void> {
+  await attachNodeAt(
+    {
+      kind: "ref",
+      title: peek.name,
+      text: refTemplate(target, peek.type),
+      handle: target,
+      done: `${peek.name} → ${refPlace(target, peek)}`,
+    },
+    at,
+    folder,
+    source,
+  );
+  if (source) await mirrorRef(source, target, peek);
+}
+
+/**
+ * The other half of a link across vaults. Drawing S → N from here puts a reference to N
+ * beside S; the same link, seen from N's vault, is a reference to S pointing at N — so
+ * that is written there too, in the same breath, and the arrow keeps its direction on
+ * both canvases. Each vault then shows the connection, and each reference's corner is the
+ * way across. A reference to S already standing beside N is linked rather than doubled.
+ */
+async function mirrorRef(source: string, target: string, peek: NotePeek): Promise<void> {
+  const root = knownVaultRoot();
+  if (!root || !peek.vault) return;
+  const other = new ShellVault(peek.vault);
+  const inside = target.slice(peek.vault.length).replace(/^[\\/]+/, "").split(/[\\/]/).join("/");
+  const back = `${root.replace(/[\\/]+$/, "")}/${source}`;
+  const link = `[[${inside.replace(/\.md$/i, "")}]]`;
+  try {
+    const files = (await other.entries()).filter((entry) => entry.kind === "file").map((entry) => entry.path);
+    const name = noteName(source);
+    // The reference to S that may already stand there: named after S, pointing back at it.
+    for (const file of files.filter((one) => noteName(one) === name || noteName(one).startsWith(`${name} `))) {
+      const text = await other.read(file);
+      if (parseType(text) !== "ref" || parseField(text, "ref") !== back) continue;
+      if (!text.includes(link)) await other.write(file, `${text.replace(/\n*$/, "")}\n\n${link}\n`);
+      ui.status.textContent += ` — and ${noteName(file)} → ${noteName(inside)} over there`;
+      return;
+    }
+    const type = parseType(await vault.read(source));
+    const path = uniquePath(files, dirname(inside), name, ".md");
+    await other.createFile(path, `${refTemplate(back, type)}\n${link}\n`);
+    await placeBeside(other, path, inside);
+    ui.status.textContent += ` — and ${noteName(path)} → ${noteName(inside)} over there`;
+  } catch (err) {
+    ui.status.textContent += ` — but the other vault could not be written: ${shellError(err)}`;
+  }
+}
+
+/**
+ * The rows of the Search panel: every note in the system of vaults, by name, its folder
+ * beside it, made when the row is opened — the walk is milliseconds — and narrowed by the
+ * type box as you type. `source` is the note the link comes from; null from the canvas
+ * menu, where `at` is where the pick lands. The note itself is left out: a note does not
+ * link to itself.
+ */
+async function existingNodeRows(
+  source: string | null,
+  at: { x: number; y: number } | null,
+  folder: string | null,
+): Promise<MenuItem[]> {
+  const bridge = window.bedrock;
+  if (!bridge) throw new Error("needs the desktop app");
+  // Known for every vault the desktop app opens (`pickFolder`), and for every window it
+  // opens onto one; only a vault opened in an older build has no place on record.
+  const root = knownVaultRoot();
+  if (!root) throw new Error(`where "${vault.name}" is on disk is not known — open it again (File → Open Vault…)`);
+  const index = await bridge.vaultIndex(root);
+  const rows: MenuItem[] = index.notes
+    .filter((note) => note.relative !== source)
+    .sort((a, b) => a.name.localeCompare(b.name) || a.place.localeCompare(b.place))
+    .map((note) => ({
+      label: note.name,
+      hint: note.place || "/",
+      run: () => void attachIndexed(note, root, source, at, folder),
+    }));
+  // The panel's own last line says how far the search reaches: the top of the system of
+  // vaults, which is this vault itself when nothing above it has ever been opened here.
+  const top = fsBasename(index.top);
+  rows.push({ label: top === vault.name ? `only this vault — no vault above it` : `everything under ${top}`, inert: true });
+  return rows;
+}
+
+/**
+ * A row of the Search panel picked. Either way the drop says where it goes to stand.
+ * Inside this vault the note is on the canvas already, wherever it happened to be: the
+ * drop brings it there and links it. Anywhere else, a reference has to stand for it here,
+ * and the drop places that. From the canvas menu the click already said where.
+ */
+async function attachIndexed(
+  note: IndexedNote,
+  root: string,
+  source: string | null,
+  at: { x: number; y: number } | null,
+  folder: string | null,
+): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  // Whatever goes wrong on the way says so on the status bar: a drop that quietly does
+  // nothing is the one outcome nobody can act on.
+  const failed = (what: string, err: unknown): void => {
+    console.error(what, err);
+    ui.status.textContent = `${what} — ${shellError(err)}`;
+  };
+  // The hint, a tick late: the click that picked the row is also a grab/free to cytoscape,
+  // and its free handler clears the status right after this — see `openFsNode`.
+  const hint = (text: string): void => {
+    window.setTimeout(() => {
+      ui.status.textContent = text;
+    }, 0);
+  };
+  // A note inside a vault nested in this one is in this vault's files, but not on this
+  // canvas — the nested vault stands here as one node. It is somewhere else, as far as
+  // the canvas is concerned, and gets a reference like any note in another vault.
+  if (note.relative !== null && !note.nested) {
+    const here = entries.find((entry) => entry.kind === "file" && entry.path === note.relative);
+    if (!here) {
+      hint(`${note.name} is in this vault, but the graph does not list it`);
+      return;
+    }
+    if (here.path === source) {
+      hint("a note does not link to itself");
+      return;
+    }
+    if (!graphView.hasNode(here.path)) {
+      hint(`${note.name} is in this vault, but not drawn on this canvas`);
+      return;
+    }
+    const bring = (to: { x: number; y: number }): void => {
+      try {
+        graphView.placeNode(here.path, to);
+        if (source) linkNotes(source, here.path);
+        else hint(`${note.name} brought here`);
+      } catch (err) {
+        failed(`${note.name} could not be brought here`, err);
+      }
+    };
+    if (source) {
+      graphView.startLink(source, "existing", (drop) => bring(drop));
+      hint(`${note.name} is on this canvas already — click empty space to bring it there and link it (Esc cancels)`);
+    } else if (at) bring(at);
+    return;
+  }
+  let peek: NotePeek | null;
+  try {
+    peek = await bridge.peekNote(note.path, root);
+  } catch (err) {
+    failed(`${note.path} could not be read`, err);
+    return;
+  }
+  if (!peek) {
+    hint(`${note.path} could not be read`);
+    return;
+  }
+  const place = (drop: { x: number; y: number }, from: string | null): void => {
+    placeRef(note.path, peek!, drop, folder, from).catch((err) => failed(`the reference to ${note.name} could not be made`, err));
+  };
+  if (source) {
+    graphView.startLink(source, "ref", (drop, from) => place(drop, from));
+    hint(`${note.name} lives in ${refPlace(note.path, peek)} — click empty space to put a reference to it there (Esc cancels)`);
+  } else if (at) place(at, null);
+}
+
+/**
+ * Puts a note the other vault has just been given NEXT TO the note it points at, in that
+ * vault's own arrangement — a mirror dropped anywhere else would be a stranger to find.
+ * Up and to the left, a node's width or two away, so its arrow reads into the note. Done
+ * in the arrangement file directly, since that window is not open here; a vault with no
+ * arrangement yet lays itself out when it opens, and needs nothing from us.
+ */
+async function placeBeside(other: Vault, path: string, beside: string): Promise<void> {
+  let raw: string;
+  try {
+    raw = await other.read(LAYOUT_FILE);
+  } catch {
+    return;
+  }
+  let layout: { version?: number; nodes?: Record<string, { x: number; y: number }> };
+  try {
+    layout = JSON.parse(raw) as typeof layout;
+  } catch {
+    return;
+  }
+  const anchor = layout.nodes?.[beside];
+  if (!anchor || !Number.isFinite(anchor.x) || !Number.isFinite(anchor.y)) return;
+  // Not on top of whatever else stands there: step further out until the spot is clear.
+  const taken = Object.values(layout.nodes ?? {});
+  let spot = { x: anchor.x - 90, y: anchor.y - 50 };
+  for (let step = 0; step < 8 && taken.some((p) => Math.hypot(p.x - spot.x, p.y - spot.y) < 45); step++) {
+    spot = { x: spot.x - 40, y: spot.y - 30 };
+  }
+  layout.nodes = { ...(layout.nodes ?? {}), [path]: spot };
+  await other.write(LAYOUT_FILE, JSON.stringify(layout));
+}
+
+/**
+ * Click on a reference. The CORNER — the arrow — is the doorway: it opens the vault the
+ * note lives in, in a window of its own, landed on that note. The body only says where
+ * the note is; a reference is a pointer, and the pointer is not the thing. A note that
+ * has moved is searched for again, and the new place written home: the node heals itself
+ * rather than just complaining, the way a file node does.
+ */
+async function openRefNode(path: string, target: string | null, corner: boolean): Promise<void> {
+  // One tick later, for the same reason `openFsNode` waits: the click's own free
+  // handler clears the hint right after this, and the message has to outlive that.
+  const say = (message: string): void => {
+    window.setTimeout(() => {
+      ui.status.textContent = message;
+    }, 0);
+  };
+  const bridge = window.bedrock;
+  if (!bridge) {
+    say("References need the desktop app — npm start");
+    return;
+  }
+  if (!corner) {
+    say(target ? `${noteName(path)} → ${target} — the arrow at its corner opens that vault` : "the note carries no ref:: line — the arrow at its corner finds the note");
+    return;
+  }
+  const root = knownVaultRoot() ?? "";
+  let where = target;
+  let peek = target ? await bridge.peekNote(target, root) : null;
+  if (!peek) {
+    say(`${target ? `${target} is gone` : "the note carries no ref:: line"} — find where the note lives now`);
+    const found = await searchNote(`Where is ${noteName(path)} now?`);
+    if (!found) return; // declined — the note keeps saying what it said
+    where = found.target;
+    peek = found.peek;
+    await flushAll(); // the note may be open and mid-edit; the rewrite must not clobber
+    let text = setField(await vault.read(path), "ref", where);
+    text = setField(text, "target", peek.type);
+    await vault.write(path, text);
+    graphView.setRefTarget(path, where);
+    graphStale = true;
+    for (let i = 0; i < panes.length; i++) if (pathOf(panes[i]) === path) await renderPage(i);
+  }
+  if (!peek.vault || !where) {
+    say(`${where} is not inside a vault — there is nothing to open`);
+    return;
+  }
+  // The note's place inside its vault, so the new window lands on it.
+  const focus = where.slice(peek.vault.length).replace(/^[\\/]+/, "").split(/[\\/]/).join("/");
+  say(`${noteName(path)} → the vault at ${peek.vault}`);
+  await openVaultAt(peek.vault, focus);
+}
+
 /* ------------------------------------------- attaching to what is already there --- */
 /*
  * Pointing a NEW note at something that already exists over there — an Apple note you
@@ -5911,9 +6498,10 @@ ui.settings.addEventListener("click", () => {
 ui.floatControls.hidden = !!window.bedrock;
 window.bedrock?.onMenu((what) => {
   if (what === "settings") ui.settings.click();
-  // The folder picker refuses to open without a real click, so the menu item opens the
-  // front door instead — its buttons are real clicks, and Esc backs out over a vault.
-  else ui.welcome.hidden = false;
+  // Straight to the OS's own folder sheet. It is the shell that opens it, so unlike the
+  // browser's `showDirectoryPicker` it needs no click of its own to be allowed; the front
+  // door stands behind it as the way out, and Esc backs out of that over an open vault.
+  else void pickFolder();
 });
 settings.onChange = applyFeatures;
 settings.onLook = applyLook;
@@ -6081,6 +6669,22 @@ let vaultOpen = false;
 el("welcome-open").addEventListener("click", () => void pickFolder());
 el("welcome-new").addEventListener("click", () => void pickFolder());
 adoptVaultFromOpener(); // a window opened from a vault node is handed its folder, no door
+adoptVaultFromPath(); // and one opened from a reference is told its path
+
+/*
+ * A window that was not opened FOR a vault asks which one straight away: the OS's folder
+ * sheet, not a door with an "Open a vault" button on it to press first. The shell opens
+ * that sheet, so it needs no click to be allowed one — which is the only reason the door
+ * ever came first (a browser tab's `showDirectoryPicker` does need one, and there the door
+ * stays the way in). Cancelling the sheet leaves the door standing behind it, so a window
+ * whose picker was dismissed is not a dead one.
+ */
+if (window.bedrock) {
+  const opened = new URL(location.href).searchParams;
+  if (!opened.get("root") && !opened.get("vault")) void pickFolder();
+}
+// A window that was raised instead of opened is told which note it was raised for.
+window.bedrock?.onGoto((focus) => graphView.focusNode(focus));
 document.addEventListener("keydown", (event) => {
   // The door can be closed over an open vault; before one is open there is nothing behind it.
   if (event.key === "Escape" && vaultOpen && !ui.welcome.hidden) ui.welcome.hidden = true;
