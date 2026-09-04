@@ -16,6 +16,11 @@ export interface Vault {
   /** Whether a file is actually there — `write` creates, so callers that must not. */
   exists(path: string): Promise<boolean>;
   read(path: string): Promise<string>;
+  /**
+   * Many notes at once, for a vault that can answer a list cheaper than a call per note.
+   * A note that cannot be read is simply absent from the answer.
+   */
+  readMany?(paths: string[]): Promise<Map<string, string>>;
   write(path: string, text: string): Promise<void>;
   createDir(path: string): Promise<void>;
   /** Creates the file (and any missing parent folders) if it does not exist. */
@@ -434,6 +439,82 @@ const canMove = <T extends FileSystemHandle>(handle: T): handle is T & Movable =
   typeof (handle as unknown as Partial<Movable>).move === "function";
 
 /** Every file and subfolder, attachments and dot-files included. */
+/**
+ * Vault backed by a folder the SHELL reaches by path — how a window opened from a
+ * reference gets a vault the folder picker never handed it: a parent, a sibling, any
+ * folder on the disk. The same operations as `FolderVault`, over IPC instead of a handle;
+ * the desktop app only, since a browser has no path to anything.
+ */
+export class ShellVault implements Vault {
+  constructor(readonly root: string) {}
+
+  get name(): string {
+    return this.root.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || this.root;
+  }
+
+  private call<T>(op: string, rel = "", arg?: unknown): Promise<T> {
+    const bridge = window.bedrock;
+    if (!bridge) throw new Error("a vault by path needs the desktop app");
+    return bridge.vaultFs(this.root, op, rel, arg) as Promise<T>;
+  }
+
+  async entries(): Promise<Entry[]> {
+    return (await this.call<{ entries: Entry[] }>("scan")).entries;
+  }
+
+  async assets(): Promise<string[]> {
+    return (await this.call<{ assets: string[] }>("scan")).assets;
+  }
+
+  listFiles(dir: string): Promise<string[]> {
+    return this.call<string[]>("list", dir);
+  }
+
+  exists(path: string): Promise<boolean> {
+    return this.call<boolean>("exists", path);
+  }
+
+  read(path: string): Promise<string> {
+    return this.call<string>("read", path);
+  }
+
+  async readMany(paths: string[]): Promise<Map<string, string>> {
+    const got = await this.call<Record<string, string | null>>("read-many", "", paths);
+    const out = new Map<string, string>();
+    for (const [path, text] of Object.entries(got)) if (text !== null) out.set(path, text);
+    return out;
+  }
+
+  async write(path: string, text: string): Promise<void> {
+    await this.call("write", path, text);
+  }
+
+  async createDir(path: string): Promise<void> {
+    await this.call("mkdir", path);
+  }
+
+  async createFile(path: string, text = ""): Promise<void> {
+    await this.call("create", path, text);
+  }
+
+  async remove(path: string, kind: "file" | "dir"): Promise<void> {
+    await this.call("remove", path, kind);
+  }
+
+  async rename(from: string, to: string): Promise<void> {
+    await this.call("rename", from, to);
+  }
+
+  async readBinary(path: string): Promise<Blob | null> {
+    const bytes = await this.call<Uint8Array | null>("read-bin", path);
+    return bytes ? new Blob([Uint8Array.from(bytes)]) : null;
+  }
+
+  async writeBinary(path: string, data: Blob): Promise<void> {
+    await this.call("write-bin", path, new Uint8Array(await data.arrayBuffer()));
+  }
+}
+
 async function copyTree(from: FileSystemDirectoryHandle, to: FileSystemDirectoryHandle): Promise<void> {
   for await (const handle of from.values()) {
     if (handle.kind === "directory") {

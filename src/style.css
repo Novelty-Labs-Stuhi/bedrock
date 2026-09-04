@@ -1242,6 +1242,42 @@ button.twisty:hover {
   margin-left: 12px;
 }
 
+/*
+ * A searched branch: the type box is the panel's first row, the matches follow, never more
+ * than a handful. Wide enough that a note's name and its folder both get to be read.
+ */
+.menu-search {
+  width: 260px;
+  margin: 2px 2px 4px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  outline: none;
+}
+
+.menu-search:focus {
+  border-color: var(--accent);
+}
+
+.menu-results {
+  display: flex;
+  flex-direction: column;
+}
+
+.menu-results .menu-item {
+  max-width: 276px;
+}
+
+.menu-results .menu-hint {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 130px;
+}
+
 /* -------------------------------------------------------------- node style --- */
 /* The panel a node opens for its own look. Same card as the menu it comes out of, wider,
    and laid out as rows of swatches: what a note can look like is a thing to look at, so

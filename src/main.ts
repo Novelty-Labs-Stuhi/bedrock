@@ -50,7 +50,7 @@ import {
 } from "./linear";
 import type { IssueChange } from "./graph";
 import {
-  FolderVault,
+  FolderVault, ShellVault,
   LocalVault,
   basename,
   canPickFolder,
@@ -221,6 +221,7 @@ const graphView = new GraphView(ui.cy, {
   onOpenFreeform: (path, board) => void openFreeformNode(path, board),
   onOpenVault: (path, folder) => void openVaultNode(path, folder),
   onOpenNotion: (path, url) => void openNotionNode(path, url),
+  onOpenRef: (path, target, corner) => void openRefNode(path, target, corner),
   onOpenSlack: (path, url) => void openSlackNode(path, url),
   onOpenGoogleTask: (path, task, url) => void openGoogleTaskNode(path, task, url),
   onOpenAppleNote: (path, note) => void openAppleNoteNode(path, note),
@@ -296,7 +297,19 @@ const graphView = new GraphView(ui.cy, {
     // to — picking the thing arms the draft, and dropping it decides where. See
     // `startLink`'s `release`.
     const attach: MenuItem[] = [
-      { label: "Existing node", icon: NOTE_DOT, run: () => graphView.startLink(path, "link") },
+      // One row, two ways in. A CLICK starts the arrow: the draft lands on a note already
+      // on this canvas. HOVERING opens the search beside it: every note in the system of
+      // vaults — this one, the folders above it, the vaults beside it — found by name in
+      // a panel with a type box first and the few notes that match under it. That pick
+      // decides what the draft is: a plain link when the note is here, a reference node
+      // when it is not.
+      {
+        label: "Existing node",
+        icon: NOTE_DOT,
+        run: () => graphView.startLink(path, "link"),
+        search: { placeholder: "Type a note's name…" },
+        children: () => existingNodeRows(path, null, null),
+      },
       ...attachMenu(
         (option, kind) => () =>
           graphView.startLink(path, kind, (at, source) => void option.place(at, null, source)),
@@ -402,8 +415,18 @@ const graphView = new GraphView(ui.cy, {
     }
     const items: MenuItem[] = [{ label: "Create", children: create }];
     // Nothing to drag here: the click already said where, so a picked option lands at once.
-    const attach = attachMenu((option) => () => void option.place(at, folder, null));
-    if (attach.length) items.push({ label: "Attach", children: attach });
+    // What already exists, starting with a note. One on this canvas is already here, so
+    // the row is for one elsewhere: a folder above this vault, or a vault beside it.
+    const attach: MenuItem[] = [
+      {
+        label: "Existing node",
+        icon: TYPE_ICONS.ref,
+        search: { placeholder: "Type a note's name…" },
+        children: () => existingNodeRows(null, at, folder),
+      },
+      ...attachMenu((option) => () => void option.place(at, folder, null)),
+    ];
+    items.push({ label: "Attach", children: attach });
 
     showMenu(client, items);
   },
@@ -424,7 +447,9 @@ const filePaths = (): string[] => entries.filter((e) => e.kind === "file").map((
  */
 async function readDocs(): Promise<Doc[]> {
   const drawn = filePaths().filter((path) => !isCardPath(path));
-  const all: Doc[] = await Promise.all(drawn.map(async (path) => ({ path, text: await vault.read(path) })));
+  const texts = await readTexts(drawn);
+  const all: Doc[] = drawn.flatMap((path) => (texts.has(path) ? [{ path, text: texts.get(path)! }] : []));
+  if (all.length < drawn.length) ui.status.textContent = `${drawn.length - all.length} note(s) could not be read and are not drawn`;
   // A vault inside this one is opaque from out here: its notes are its own graph, and
   // the one node standing for it is all this canvas shows of it.
   const vaults = all.filter((doc) => parseType(doc.text) === "vault");
@@ -437,6 +462,27 @@ async function readDocs(): Promise<Doc[]> {
   }
   waiting = waitedFor(docs); // the graph's own read is also the answer `freshPath` needs
   return docs;
+}
+
+/**
+ * Every note's text in one go. A vault reached by path answers a list in one round trip
+ * rather than one call per note; either way a note that cannot be read is left out rather
+ * than taking the whole graph down with it — one broken symlink in a folder of thousands
+ * is not a reason to see nothing.
+ */
+async function readTexts(paths: string[]): Promise<Map<string, string>> {
+  if (vault.readMany) return vault.readMany(paths);
+  const out = new Map<string, string>();
+  await Promise.all(
+    paths.map(async (path) => {
+      try {
+        out.set(path, await vault.read(path));
+      } catch {
+        /* left out */
+      }
+    }),
+  );
+  return out;
 }
 
 /**
@@ -1029,6 +1075,20 @@ async function deleteEntry(path: string, kind: "file" | "dir"): Promise<void> {
 }
 
 async function pickFolder(): Promise<void> {
+  const bridge = window.bedrock;
+  if (bridge) {
+    // The desktop app opens a vault by its PATH: the OS's own folder dialog says where, and
+    // the shell reaches the folder from there (`ShellVault`). So where a vault is on the
+    // disk is always known — git, sessions and the search across vaults all ask — and
+    // nobody is ever asked twice. The folder handle stays the browser's way in.
+    const chosen = await bridge.pickPath("folder").catch(() => null);
+    if (!chosen) return; // the dialog was dismissed
+    const root = chosen.replace(/[\\/]+$/, "");
+    const next = new ShellVault(root);
+    localStorage.setItem(ROOT_KEY + next.name, root);
+    await openVault(next);
+    return;
+  }
   if (!canPickFolder()) {
     ui.status.textContent = "folder opening needs the File System Access API (Chrome/Edge/Electron)";
     return;
@@ -1837,6 +1897,11 @@ type VaultOpenMessage = { type: typeof VAULT_OPEN; handle: FileSystemDirectoryHa
  */
 async function spawnVaultWindow(folder: string): Promise<void> {
   const here = vault;
+  // A vault reached by path opens its inner vaults by path too: no handle to hand over.
+  if (here instanceof ShellVault) {
+    await openVaultAt(`${here.root.replace(/[\\/]+$/, "")}/${folder}`);
+    return;
+  }
   if (!(here instanceof FolderVault)) {
     ui.status.textContent = "a vault inside a vault needs a real folder on disk";
     return;
@@ -1864,6 +1929,56 @@ async function spawnVaultWindow(folder: string): Promise<void> {
     opened.postMessage(message, location.origin === "null" ? "*" : location.origin);
   };
   window.addEventListener("message", onReady);
+}
+
+/**
+ * Opens ANY folder on the disk as a vault, in a window of its own — a parent of this
+ * vault, a sibling, the vault a reference points into. Nothing travels but the path: the
+ * new window's address carries it, and the shell reaches the folder from there (see
+ * `ShellVault`). `focus` is a note in it to land on, "/"-relative to the folder.
+ */
+async function openVaultAt(root: string, focus: string | null = null): Promise<void> {
+  if (!window.bedrock) {
+    ui.status.textContent = "opening a vault by its path needs the desktop app";
+    return;
+  }
+  await flushAll();
+  await spatial.flush();
+  await settings.flush();
+  const address = new URL(location.href);
+  address.searchParams.delete("vault");
+  address.searchParams.set("root", root);
+  if (focus) address.searchParams.set("focus", focus);
+  else address.searchParams.delete("focus");
+  if (!window.open(address.toString(), "_blank")) ui.status.textContent = "the browser would not open a second window";
+}
+
+/**
+ * The other half: opened with `?root=` in its address, the window skips the front door
+ * and opens that folder through the shell. The path is remembered under the vault's name
+ * as well, for everything else that asks where a vault is (git, sessions, the search).
+ */
+function adoptVaultFromPath(): void {
+  const address = new URL(location.href);
+  const root = address.searchParams.get("root");
+  if (!root || !window.bedrock) return;
+  const next = new ShellVault(root);
+  localStorage.setItem(ROOT_KEY + next.name, root);
+  const focus = address.searchParams.get("focus");
+  // The door closes at once: a big vault takes a moment to read, and a welcome screen
+  // standing there meanwhile reads as "nothing happened". If the open does fail, the
+  // door comes back with the reason on it.
+  ui.welcome.hidden = true;
+  ui.status.textContent = `opening ${next.name}…`;
+  openVault(next)
+    .then(() => {
+      if (focus) graphView.focusNode(focus);
+    })
+    .catch((err) => {
+      console.error(err);
+      ui.welcome.hidden = false;
+      ui.status.textContent = `${next.name} could not be opened — ${shellError(err)}`;
+    });
 }
 
 /**
@@ -5334,6 +5449,330 @@ async function saveClaudeSession(path: string, id: string, folder?: string): Pro
   ui.status.textContent = `${noteName(path)} now opens its own session`;
 }
 
+/* ------------------------------------------------------------- references --- */
+/*
+ * A note that lives somewhere else — a folder above this vault, a vault beside it, one
+ * inside a vault of its own — standing on this canvas. It is a pointer in the Notion
+ * note's mould: the target's path on disk, and the target's own type, so what is over
+ * there can be said without going. Never the note itself: that stays where it is, in its
+ * own vault, with its own connections.
+ *
+ * The finder is a search over the whole system of vaults this one is part of — up the
+ * folders for as long as each is a vault, then everything under the top one. Looking up
+ * is the one direction the browser's folder handle cannot, so the shell walks the disk
+ * from the vault's known place instead; see `vault-index`. A pick inside this vault is
+ * not a reference at all: the note is already on the canvas, and the gesture is a link.
+ */
+
+const refTemplate = (target: string, targetType: string | null): string =>
+  `type:: ref\n\nref:: ${target}\n${targetType ? `target:: ${targetType}\n` : ""}`;
+
+/**
+ * The same search as a dialog, for the one moment there is no menu to grow it from: a
+ * reference whose note has moved, clicked. The index is walked fresh off the disk — tens of
+ * milliseconds for tens of thousands of notes — and only the note picked is read. Rows
+ * answer by label, so twins — one name in two places — carry their place in the label.
+ */
+async function searchNote(message: string): Promise<{ target: string; peek: NotePeek } | null> {
+  const bridge = window.bedrock;
+  if (!bridge) {
+    ui.status.textContent = "Searching the vaults needs the desktop app — npm start";
+    return null;
+  }
+  const root = knownVaultRoot();
+  if (!root) {
+    ui.status.textContent = `where "${vault.name}" is on disk is not known — open it again (File → Open Vault…)`;
+    return null;
+  }
+  let index: VaultIndex;
+  try {
+    index = await bridge.vaultIndex(root);
+  } catch (err) {
+    ui.status.textContent = `could not read the folders — ${shellError(err)}`;
+    return null;
+  }
+  if (!index.notes.length) {
+    ui.status.textContent = `no notes under ${index.top}`;
+    return null;
+  }
+  const twins = new Map<string, number>();
+  for (const note of index.notes) twins.set(note.name, (twins.get(note.name) ?? 0) + 1);
+  const label = (note: IndexedNote): string =>
+    (twins.get(note.name) ?? 0) > 1 ? `${note.name} — ${note.place || "/"}` : note.name;
+  const rows = index.notes.map((note) => ({ label: label(note), hint: note.place }));
+  const picked = await askPick(message, rows, "Search notes…");
+  const note = picked === null ? null : index.notes.find((one) => label(one) === picked);
+  if (!note) return null;
+  const peek = await bridge.peekNote(note.path, root);
+  if (!peek) {
+    ui.status.textContent = `${note.path} could not be read`;
+    return null;
+  }
+  return { target: note.path, peek };
+}
+
+/** Where a reference says it is going: its vault when it has one, else its folder. */
+const refPlace = (target: string, peek: NotePeek): string =>
+  peek.vault ? `the vault at ${peek.vault}` : target.replace(/[\\/][^\\/]*$/, "");
+
+/**
+ * Makes the reference note, on the canvas at `at`, linked from `source` when there is one
+ * — and when there is, writes the other half of the link into the other vault too.
+ */
+async function placeRef(
+  target: string,
+  peek: NotePeek,
+  at: { x: number; y: number },
+  folder: string | null,
+  source: string | null,
+): Promise<void> {
+  await attachNodeAt(
+    {
+      kind: "ref",
+      title: peek.name,
+      text: refTemplate(target, peek.type),
+      handle: target,
+      done: `${peek.name} → ${refPlace(target, peek)}`,
+    },
+    at,
+    folder,
+    source,
+  );
+  if (source) await mirrorRef(source, target, peek);
+}
+
+/**
+ * The other half of a link across vaults. Drawing S → N from here puts a reference to N
+ * beside S; the same link, seen from N's vault, is a reference to S pointing at N — so
+ * that is written there too, in the same breath, and the arrow keeps its direction on
+ * both canvases. Each vault then shows the connection, and each reference's corner is the
+ * way across. A reference to S already standing beside N is linked rather than doubled.
+ */
+async function mirrorRef(source: string, target: string, peek: NotePeek): Promise<void> {
+  const root = knownVaultRoot();
+  if (!root || !peek.vault) return;
+  const other = new ShellVault(peek.vault);
+  const inside = target.slice(peek.vault.length).replace(/^[\\/]+/, "").split(/[\\/]/).join("/");
+  const back = `${root.replace(/[\\/]+$/, "")}/${source}`;
+  const link = `[[${inside.replace(/\.md$/i, "")}]]`;
+  try {
+    const files = (await other.entries()).filter((entry) => entry.kind === "file").map((entry) => entry.path);
+    const name = noteName(source);
+    // The reference to S that may already stand there: named after S, pointing back at it.
+    for (const file of files.filter((one) => noteName(one) === name || noteName(one).startsWith(`${name} `))) {
+      const text = await other.read(file);
+      if (parseType(text) !== "ref" || parseField(text, "ref") !== back) continue;
+      if (!text.includes(link)) await other.write(file, `${text.replace(/\n*$/, "")}\n\n${link}\n`);
+      ui.status.textContent += ` — and ${noteName(file)} → ${noteName(inside)} over there`;
+      return;
+    }
+    const type = parseType(await vault.read(source));
+    const path = uniquePath(files, dirname(inside), name, ".md");
+    await other.createFile(path, `${refTemplate(back, type)}\n${link}\n`);
+    await placeBeside(other, path, inside);
+    ui.status.textContent += ` — and ${noteName(path)} → ${noteName(inside)} over there`;
+  } catch (err) {
+    ui.status.textContent += ` — but the other vault could not be written: ${shellError(err)}`;
+  }
+}
+
+/**
+ * The rows of the Search panel: every note in the system of vaults, by name, its folder
+ * beside it, made when the row is opened — the walk is milliseconds — and narrowed by the
+ * type box as you type. `source` is the note the link comes from; null from the canvas
+ * menu, where `at` is where the pick lands. The note itself is left out: a note does not
+ * link to itself.
+ */
+async function existingNodeRows(
+  source: string | null,
+  at: { x: number; y: number } | null,
+  folder: string | null,
+): Promise<MenuItem[]> {
+  const bridge = window.bedrock;
+  if (!bridge) throw new Error("needs the desktop app");
+  // Known for every vault the desktop app opens (`pickFolder`), and for every window it
+  // opens onto one; only a vault opened in an older build has no place on record.
+  const root = knownVaultRoot();
+  if (!root) throw new Error(`where "${vault.name}" is on disk is not known — open it again (File → Open Vault…)`);
+  const index = await bridge.vaultIndex(root);
+  const rows: MenuItem[] = index.notes
+    .filter((note) => note.relative !== source)
+    .sort((a, b) => a.name.localeCompare(b.name) || a.place.localeCompare(b.place))
+    .map((note) => ({
+      label: note.name,
+      hint: note.place || "/",
+      run: () => void attachIndexed(note, root, source, at, folder),
+    }));
+  // The panel's own last line says how far the search reaches: the top of the system of
+  // vaults, which is this vault itself when nothing above it has ever been opened here.
+  const top = fsBasename(index.top);
+  rows.push({ label: top === vault.name ? `only this vault — no vault above it` : `everything under ${top}`, inert: true });
+  return rows;
+}
+
+/**
+ * A row of the Search panel picked. Either way the drop says where it goes to stand.
+ * Inside this vault the note is on the canvas already, wherever it happened to be: the
+ * drop brings it there and links it. Anywhere else, a reference has to stand for it here,
+ * and the drop places that. From the canvas menu the click already said where.
+ */
+async function attachIndexed(
+  note: IndexedNote,
+  root: string,
+  source: string | null,
+  at: { x: number; y: number } | null,
+  folder: string | null,
+): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  // Whatever goes wrong on the way says so on the status bar: a drop that quietly does
+  // nothing is the one outcome nobody can act on.
+  const failed = (what: string, err: unknown): void => {
+    console.error(what, err);
+    ui.status.textContent = `${what} — ${shellError(err)}`;
+  };
+  // The hint, a tick late: the click that picked the row is also a grab/free to cytoscape,
+  // and its free handler clears the status right after this — see `openFsNode`.
+  const hint = (text: string): void => {
+    window.setTimeout(() => {
+      ui.status.textContent = text;
+    }, 0);
+  };
+  // A note inside a vault nested in this one is in this vault's files, but not on this
+  // canvas — the nested vault stands here as one node. It is somewhere else, as far as
+  // the canvas is concerned, and gets a reference like any note in another vault.
+  if (note.relative !== null && !note.nested) {
+    const here = entries.find((entry) => entry.kind === "file" && entry.path === note.relative);
+    if (!here) {
+      hint(`${note.name} is in this vault, but the graph does not list it`);
+      return;
+    }
+    if (here.path === source) {
+      hint("a note does not link to itself");
+      return;
+    }
+    if (!graphView.hasNode(here.path)) {
+      hint(`${note.name} is in this vault, but not drawn on this canvas`);
+      return;
+    }
+    const bring = (to: { x: number; y: number }): void => {
+      try {
+        graphView.placeNode(here.path, to);
+        if (source) linkNotes(source, here.path);
+        else hint(`${note.name} brought here`);
+      } catch (err) {
+        failed(`${note.name} could not be brought here`, err);
+      }
+    };
+    if (source) {
+      graphView.startLink(source, "existing", (drop) => bring(drop));
+      hint(`${note.name} is on this canvas already — click empty space to bring it there and link it (Esc cancels)`);
+    } else if (at) bring(at);
+    return;
+  }
+  let peek: NotePeek | null;
+  try {
+    peek = await bridge.peekNote(note.path, root);
+  } catch (err) {
+    failed(`${note.path} could not be read`, err);
+    return;
+  }
+  if (!peek) {
+    hint(`${note.path} could not be read`);
+    return;
+  }
+  const place = (drop: { x: number; y: number }, from: string | null): void => {
+    placeRef(note.path, peek!, drop, folder, from).catch((err) => failed(`the reference to ${note.name} could not be made`, err));
+  };
+  if (source) {
+    graphView.startLink(source, "ref", (drop, from) => place(drop, from));
+    hint(`${note.name} lives in ${refPlace(note.path, peek)} — click empty space to put a reference to it there (Esc cancels)`);
+  } else if (at) place(at, null);
+}
+
+/**
+ * Puts a note the other vault has just been given NEXT TO the note it points at, in that
+ * vault's own arrangement — a mirror dropped anywhere else would be a stranger to find.
+ * Up and to the left, a node's width or two away, so its arrow reads into the note. Done
+ * in the arrangement file directly, since that window is not open here; a vault with no
+ * arrangement yet lays itself out when it opens, and needs nothing from us.
+ */
+async function placeBeside(other: Vault, path: string, beside: string): Promise<void> {
+  let raw: string;
+  try {
+    raw = await other.read(LAYOUT_FILE);
+  } catch {
+    return;
+  }
+  let layout: { version?: number; nodes?: Record<string, { x: number; y: number }> };
+  try {
+    layout = JSON.parse(raw) as typeof layout;
+  } catch {
+    return;
+  }
+  const anchor = layout.nodes?.[beside];
+  if (!anchor || !Number.isFinite(anchor.x) || !Number.isFinite(anchor.y)) return;
+  // Not on top of whatever else stands there: step further out until the spot is clear.
+  const taken = Object.values(layout.nodes ?? {});
+  let spot = { x: anchor.x - 90, y: anchor.y - 50 };
+  for (let step = 0; step < 8 && taken.some((p) => Math.hypot(p.x - spot.x, p.y - spot.y) < 45); step++) {
+    spot = { x: spot.x - 40, y: spot.y - 30 };
+  }
+  layout.nodes = { ...(layout.nodes ?? {}), [path]: spot };
+  await other.write(LAYOUT_FILE, JSON.stringify(layout));
+}
+
+/**
+ * Click on a reference. The CORNER — the arrow — is the doorway: it opens the vault the
+ * note lives in, in a window of its own, landed on that note. The body only says where
+ * the note is; a reference is a pointer, and the pointer is not the thing. A note that
+ * has moved is searched for again, and the new place written home: the node heals itself
+ * rather than just complaining, the way a file node does.
+ */
+async function openRefNode(path: string, target: string | null, corner: boolean): Promise<void> {
+  // One tick later, for the same reason `openFsNode` waits: the click's own free
+  // handler clears the hint right after this, and the message has to outlive that.
+  const say = (message: string): void => {
+    window.setTimeout(() => {
+      ui.status.textContent = message;
+    }, 0);
+  };
+  const bridge = window.bedrock;
+  if (!bridge) {
+    say("References need the desktop app — npm start");
+    return;
+  }
+  if (!corner) {
+    say(target ? `${noteName(path)} → ${target} — the arrow at its corner opens that vault` : "the note carries no ref:: line — the arrow at its corner finds the note");
+    return;
+  }
+  const root = knownVaultRoot() ?? "";
+  let where = target;
+  let peek = target ? await bridge.peekNote(target, root) : null;
+  if (!peek) {
+    say(`${target ? `${target} is gone` : "the note carries no ref:: line"} — find where the note lives now`);
+    const found = await searchNote(`Where is ${noteName(path)} now?`);
+    if (!found) return; // declined — the note keeps saying what it said
+    where = found.target;
+    peek = found.peek;
+    await flushAll(); // the note may be open and mid-edit; the rewrite must not clobber
+    let text = setField(await vault.read(path), "ref", where);
+    text = setField(text, "target", peek.type);
+    await vault.write(path, text);
+    graphView.setRefTarget(path, where);
+    graphStale = true;
+    for (let i = 0; i < panes.length; i++) if (pathOf(panes[i]) === path) await renderPage(i);
+  }
+  if (!peek.vault || !where) {
+    say(`${where} is not inside a vault — there is nothing to open`);
+    return;
+  }
+  // The note's place inside its vault, so the new window lands on it.
+  const focus = where.slice(peek.vault.length).replace(/^[\\/]+/, "").split(/[\\/]/).join("/");
+  say(`${noteName(path)} → the vault at ${peek.vault}`);
+  await openVaultAt(peek.vault, focus);
+}
+
 /* ------------------------------------------- attaching to what is already there --- */
 /*
  * Pointing a NEW note at something that already exists over there — an Apple note you
@@ -6081,6 +6520,7 @@ let vaultOpen = false;
 el("welcome-open").addEventListener("click", () => void pickFolder());
 el("welcome-new").addEventListener("click", () => void pickFolder());
 adoptVaultFromOpener(); // a window opened from a vault node is handed its folder, no door
+adoptVaultFromPath(); // and one opened from a reference is told its path
 document.addEventListener("keydown", (event) => {
   // The door can be closed over an open vault; before one is open there is nothing behind it.
   if (event.key === "Escape" && vaultOpen && !ui.welcome.hidden) ui.welcome.hidden = true;

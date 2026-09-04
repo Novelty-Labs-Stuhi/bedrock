@@ -13,7 +13,9 @@ export type MenuItem = {
   /** A data-URI image drawn at 16px before the label. */
   icon?: string;
   /**
-   * A submenu: this row grows a › and opens these beside it. `run` is ignored.
+   * A submenu: this row grows a › and opens these beside it. With a `run` as well, the
+   * row does two things: hovering opens the branch, clicking runs — "Existing node" opens
+   * its search on hover and starts the arrow on a click.
    *
    * A function instead of an array is a submenu nobody knows the contents of yet — the
    * pages in a workspace, the sessions on this machine. It is called when the row is
@@ -21,6 +23,13 @@ export type MenuItem = {
    * and a list nobody looked at is never fetched.
    */
   children?: MenuItem[] | (() => Promise<MenuItem[]>);
+  /**
+   * A branch that is SEARCHED rather than scrolled: its panel opens with a type box as the
+   * first row and shows at most `limit` (8) of the children that match what is typed, by
+   * label or hint. The children are still loaded once, when the row opens — typing only
+   * narrows them. Enter takes the highlighted row; ↑↓ move it.
+   */
+  search?: { placeholder?: string; limit?: number };
   /** Drawn dimmer and to the right — a date, a folder, whatever tells two rows apart. */
   hint?: string;
   /** Unselectable: a heading, a "nothing here" line, or a list still loading. */
@@ -108,7 +117,7 @@ function fill(box: HTMLElement, items: MenuItem[], depth: number, token: object)
   box.innerHTML = "";
   for (const item of items) {
     const button = row(item, () => {
-      if (item.children) {
+      if (item.children && !item.run) {
         // A click on a branch toggles it, for anyone who does not hover.
         if (button.classList.contains("branch-open")) collapseTo(depth);
         else void openBranch(item, button, depth, token);
@@ -125,6 +134,96 @@ function fill(box: HTMLElement, items: MenuItem[], depth: number, token: object)
     }
     box.appendChild(button);
   }
+}
+
+/**
+ * A searched panel: the type box, then the few rows that match it. The box keeps the
+ * keyboard — its keys must not reach the graph, where a letter is a shortcut — and paints
+ * the rows again on every keystroke, so the panel is never longer than `limit` rows.
+ */
+function fillSearch(
+  box: HTMLElement,
+  items: MenuItem[],
+  search: NonNullable<MenuItem["search"]>,
+  onPainted: () => void,
+): void {
+  const limit = search.limit ?? 8;
+  // Inert rows are the panel's own words — where it is searching, say — and stay under the
+  // matches whatever is typed; only the real rows are searched.
+  const fixed = items.filter((one) => one.inert);
+  const searchable = items.filter((one) => !one.inert);
+  box.innerHTML = "";
+  const input = document.createElement("input");
+  input.className = "menu-search";
+  input.type = "text";
+  input.spellcheck = false;
+  input.placeholder = search.placeholder ?? "Type to search…";
+  const list = document.createElement("div");
+  list.className = "menu-results";
+  box.append(input, list);
+
+  let shown: MenuItem[] = [];
+  let active = 0;
+  // The highlight moves without rebuilding the rows: a rebuilt row under the pointer fires
+  // mouseenter again, and that was a loop that ate every click and keystroke.
+  const highlight = (): void => {
+    [...list.children].forEach((el, index) => el.classList.toggle("branch-open", index === active && index < shown.length));
+  };
+  const paint = (): void => {
+    const query = input.value.trim().toLowerCase();
+    // Names first; a folder only counts once the names have run out, so typing a word
+    // that happens to be in every folder does not leave the list standing still.
+    const byName = query ? searchable.filter((one) => one.label.toLowerCase().includes(query)) : searchable;
+    const byHint = query ? searchable.filter((one) => !byName.includes(one) && (one.hint ?? "").toLowerCase().includes(query)) : [];
+    const matches = byName.concat(byHint);
+    shown = matches.slice(0, limit);
+    active = Math.min(active, Math.max(0, shown.length - 1));
+    list.innerHTML = "";
+    if (!shown.length) {
+      list.appendChild(row({ label: query ? "nothing matches" : "nothing here", inert: true }, () => {}));
+    }
+    shown.forEach((item, index) => {
+      const button = row(item, () => {
+        closeMenu();
+        item.run?.();
+      });
+      if (index === active) button.classList.add("branch-open");
+      button.addEventListener("mouseenter", () => {
+        active = index;
+        highlight();
+      });
+      list.appendChild(button);
+    });
+    // How much is not being shown — the panel never grows, so it says so and asks for more.
+    if (matches.length > shown.length) {
+      list.appendChild(row({ label: `${shown.length} of ${matches.length} — keep typing`, inert: true }, () => {}));
+    }
+    for (const one of fixed) list.appendChild(row(one, () => {}));
+    onPainted();
+  };
+  input.oninput = () => {
+    active = 0;
+    paint();
+  };
+  input.onkeydown = (event) => {
+    event.stopPropagation(); // the graph's own shortcuts stay out of this
+    if (event.key === "ArrowDown" && shown.length) {
+      event.preventDefault();
+      active = (active + 1) % shown.length;
+      highlight();
+    } else if (event.key === "ArrowUp" && shown.length) {
+      event.preventDefault();
+      active = (active - 1 + shown.length) % shown.length;
+      highlight();
+    } else if (event.key === "Enter" && shown[active]) {
+      event.preventDefault();
+      const picked = shown[active];
+      closeMenu();
+      picked.run?.();
+    }
+  };
+  paint();
+  input.focus();
 }
 
 /** The submenu, opened beside its row — its own top-left at the row's top-right. */
@@ -144,9 +243,15 @@ async function openBranch(
     place(box, { x: rect.right + 2, y: rect.top - 4 });
   };
 
-  if (typeof item.children !== "function") {
-    fill(box, item.children ?? [], depth + 1, token);
+  // Rows either way, searched when the branch says so — and a search box is focused as it
+  // opens, which is the whole point of it: hover, type, Enter.
+  const show = (rows: MenuItem[]): void => {
+    if (item.search) fillSearch(box, rows, item.search, anchor);
+    else fill(box, rows, depth + 1, token);
     anchor();
+  };
+  if (typeof item.children !== "function") {
+    show(item.children ?? []);
     return;
   }
   // A list from somewhere else: say so, then replace it in place. Sized and positioned
@@ -161,8 +266,7 @@ async function openBranch(
   }
   // Dismissed, reopened, or collapsed past while the answer was in flight.
   if (token !== openToken || !panels.includes(box)) return;
-  fill(box, loaded.length ? loaded : [{ label: "nothing to attach to", inert: true }], depth + 1, token);
-  anchor();
+  show(loaded.length || item.search ? loaded : [{ label: "nothing to attach to", inert: true }]);
 }
 
 /** Identity of the currently open menu — see `fill`. */
@@ -185,6 +289,7 @@ export function showMenu(at: { x: number; y: number }, items: MenuItem[], onClos
     if (!panels.some((p) => p.contains(event.target as Node))) closeMenu();
   };
   const onKeyDown = (event: KeyboardEvent) => {
+    // Typing into a search box is the menu's own business; only Esc is everyone's.
     if (event.key !== "Escape") return;
     event.stopPropagation(); // don't also cancel a graph draft
     closeMenu();
