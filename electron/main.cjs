@@ -54,10 +54,11 @@ const windowOptions = () => ({
 /**
  * What a `window.open` from the renderer is allowed to do. http(s) links in notes belong
  * in the real browser, not in this window. The app's own address is the one thing it may
- * open a window of: a vault node opens its vault in a second Bedrock window, and hands it
- * the folder over `postMessage` — which is why the renderer has to open it itself rather
- * than ask the shell to (the handle can only travel between two windows that know each
- * other).
+ * open a window of — the browser build's way of handing a folder handle to a second
+ * window over `postMessage`. The desktop app does NOT open its vault windows this way any
+ * more: a window opened by its opener is the opener's child in Chromium's eyes and closes
+ * with it, and two vaults side by side are not parent and child. It asks the shell
+ * instead (see `window-open`).
  */
 function openHandler({ url }) {
   if (/^https?:/.test(url)) {
@@ -70,13 +71,29 @@ function openHandler({ url }) {
   return { action: "deny" };
 }
 
-function createWindow() {
+function createWindow(url = "app://-/") {
   const win = new BrowserWindow(windowOptions());
   win.webContents.setWindowOpenHandler(openHandler);
   // A window the renderer opened is a Bedrock window too, and gets the same rules.
   win.webContents.on("did-create-window", (child) => child.webContents.setWindowOpenHandler(openHandler));
-  void win.loadURL("app://-/");
+  void win.loadURL(url);
 }
+
+/**
+ * A window of its own onto a vault, opened by the SHELL: a top-level window like the first
+ * one, with no opener and no parent, so it stays when the window it was opened from goes.
+ * `root` is the folder, `focus` a note in it to land on — the same `?root=` / `?focus=`
+ * address `adoptVaultFromPath` reads in the renderer.
+ */
+ipcMain.handle("window-open", (_event, root, focus) => {
+  const at = normalRoot(root);
+  if (!at) return false;
+  const address = new URL("app://-/");
+  address.searchParams.set("root", at);
+  if (focus) address.searchParams.set("focus", String(focus));
+  createWindow(address.toString());
+  return true;
+});
 
 /*
  * WHICH VAULT IS IN WHICH WINDOW.
@@ -483,7 +500,76 @@ ipcMain.handle("git-pull", async (_event, root, remote) => {
 /** Paths are typed by hand and remembered, so `~` is a real thing that arrives here. */
 const expandHome = (p) => String(p).replace(/^~(?=$|\/)/, os.homedir());
 
+/*
+ * THE BEDROCK FOLDER — the horizon every vault lives under. Not a vault itself (no
+ * `.notes/`): the folder new vaults are made in, where the folder sheet opens, and the top
+ * the search across vaults walks down from — so a vault about work and a vault about life,
+ * side by side in it, can reference each other. A reference's `ref::` path is written
+ * relative to it, so the whole folder can move, or be cloned onto another machine, and
+ * every pointer still points. `~/Bedrock` unless told otherwise, and made on first use.
+ *
+ * Kept in the app's own userData, not in any vault: it describes this machine, and it sits
+ * above every vault's config.
+ */
+const DEFAULT_BASE = path.join(os.homedir(), "Bedrock");
+const baseFile = () => path.join(app.getPath("userData"), "base.json");
+
+/** The configured base, made if it is missing, so the answer is always a folder that exists. */
+function baseDir() {
+  let base = DEFAULT_BASE;
+  try {
+    const stored = JSON.parse(fs.readFileSync(baseFile(), "utf8"));
+    if (stored && typeof stored.base === "string" && stored.base) base = path.resolve(expandHome(stored.base));
+  } catch {
+    /* never set: the default */
+  }
+  try {
+    fs.mkdirSync(base, { recursive: true });
+  } catch {
+    /* an unmakeable base is still the answer; the picker will say what is wrong */
+  }
+  return base;
+}
+
+/** Whether `full` sits under the base (or is it), through real paths, symlinks and all. */
+function underBase(full) {
+  const base = realDir(baseDir());
+  const rel = path.relative(base, realDir(full));
+  return !rel || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+/** A path as a `ref::` line writes it: relative to the base when under it, absolute otherwise. */
+function refForm(full) {
+  if (!underBase(full)) return full;
+  return path.relative(realDir(baseDir()), realDir(full)).split(path.sep).join("/");
+}
+
+/** The other way: a `ref::` line back to a path on the disk. */
+const refResolve = (ref) => (path.isAbsolute(ref) || /^~(?=$|\/)/.test(ref) ? path.resolve(expandHome(ref)) : path.resolve(baseDir(), ...ref.split("/")));
+
+/** A folder's real path (symlinks followed), or the path as given when it does not exist yet. */
+function realDir(p) {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
+
+ipcMain.handle("base-get", () => baseDir());
+ipcMain.handle("base-set", (_event, chosen) => {
+  const base = path.resolve(expandHome(String(chosen)));
+  fs.mkdirSync(path.dirname(baseFile()), { recursive: true });
+  fs.writeFileSync(baseFile(), JSON.stringify({ version: 1, base }));
+  return baseDir();
+});
+ipcMain.handle("base-ref", (_event, full) => refForm(path.resolve(expandHome(String(full)))));
+
 ipcMain.handle("fs-pick", async (event, kind, options = {}) => {
+  // A test hook: with BEDROCK_PICK_FOLDER set, every folder sheet answers with that folder
+  // and never opens. The OS's dialog cannot be driven over the debugging port, and the
+  // flows behind it (Move into…, Open Vault…) can.
+  if (kind === "folder" && process.env.BEDROCK_PICK_FOLDER) return process.env.BEDROCK_PICK_FOLDER;
   const win = BrowserWindow.fromWebContents(event.sender);
   const result = await dialog.showOpenDialog(win, {
     properties:
@@ -492,9 +578,14 @@ ipcMain.handle("fs-pick", async (event, kind, options = {}) => {
           // folder picker has one of its own without being asked.
           ["openDirectory", "createDirectory"]
         : ["openFile"],
-    // Where the sheet opens: a vault's own folder, so the folders above it are one step
-    // up — which is the one direction the renderer's folder handle can never look.
-    ...(options.defaultPath ? { defaultPath: expandHome(options.defaultPath) } : {}),
+    // Where the sheet opens: where the caller says — and for a folder with no say, the
+    // Bedrock folder, so a fresh install's first sheet already stands where vaults go and
+    // its New Folder button makes one.
+    ...(options.defaultPath
+      ? { defaultPath: expandHome(options.defaultPath) }
+      : kind === "folder"
+        ? { defaultPath: baseDir() }
+        : {}),
     ...(options.filters ? { filters: options.filters } : {}),
     ...(options.title ? { title: options.title } : {}),
     ...(options.message ? { message: options.message } : {}),
@@ -632,23 +723,42 @@ const isVaultDir = (dir) => {
  * file is not there or cannot be read.
  */
 ipcMain.handle("note-peek", async (_event, target, root) => {
-  const file = path.resolve(expandHome(target)); // a `..` written into a note is not carried any further
-  let text;
+  // A `ref::` line, as written: relative to the Bedrock folder, or absolute. A `..` written
+  // into a note is resolved here and not carried any further.
+  const file = refResolve(String(target));
+  // A vault's folder is a target too: a reference can point at a whole vault, not only
+  // at a note in one. It peeks as a vault-typed thing whose vault is itself, so the
+  // corner opens it with nothing to land on. Any other folder is nothing to point at.
+  let isDir = false;
   try {
-    text = fs.readFileSync(file, "utf8");
+    isDir = fs.statSync(file).isDirectory();
   } catch {
     return null;
   }
-  const type = /^type::[ \t]*([\w-]+)[ \t]*$/im.exec(text)?.[1].toLowerCase() ?? null;
+  let text = "";
+  if (!isDir) {
+    try {
+      text = fs.readFileSync(file, "utf8");
+    } catch {
+      return null;
+    }
+  } else if (!isVaultDir(file)) return null;
+  let type = isDir ? "vault" : (/^type::[ \t]*([\w-]+)[ \t]*$/im.exec(text)?.[1].toLowerCase() ?? null);
+  // A reference peeks as what it points at: the reference to a reference to a Notion page
+  // wears the Notion tile too, not a picture of a picture.
+  if (type === "ref") type = /^target::[ \t]*([\w-]+)[ \t]*$/im.exec(text)?.[1].toLowerCase() ?? null;
   // Up, folder by folder, to the nearest one that is a vault; the disk's own root ends it.
   let vault = null;
-  for (let dir = path.dirname(file); ; dir = path.dirname(dir)) {
+  for (let dir = isDir ? file : path.dirname(file); ; dir = path.dirname(dir)) {
     if (isVaultDir(dir)) {
       vault = dir;
       break;
     }
     if (path.dirname(dir) === dir) break;
   }
+  // Where it sits inside that vault, "/"-relative — what a window opened onto the vault
+  // lands on. Empty for the vault's own folder: there is nothing to land on but the whole.
+  const inside = vault && !isDir ? path.relative(vault, file).split(path.sep).join("/") : "";
   // Inside the root asked about, or not — through real paths, so a symlinked folder and
   // the folder it stands for count as the same place ("/tmp" is one, see `sameDir`).
   let relative = null;
@@ -663,7 +773,101 @@ ipcMain.handle("note-peek", async (_event, target, root) => {
     const rel = path.relative(real(expandHome(root)), real(file));
     if (rel && !rel.startsWith("..") && !path.isAbsolute(rel)) relative = rel.split(path.sep).join("/");
   }
-  return { name: path.basename(file).replace(/\.md$/i, ""), type, vault, relative };
+  return { name: path.basename(file).replace(/\.md$/i, ""), type, vault, inside, relative };
+});
+
+/**
+ * The top of the system of vaults `start` belongs to. Under the Bedrock folder the horizon
+ * is that folder: everything in it, and nothing above it. A vault kept elsewhere climbs its
+ * own parents while they are vaults — the last one that is, is the top.
+ */
+function systemTop(start) {
+  if (underBase(start)) return realDir(baseDir());
+  let top = start;
+  for (let dir = path.dirname(start); isVaultDir(dir) && path.dirname(dir) !== dir; dir = path.dirname(dir)) top = dir;
+  return top;
+}
+
+/** Every markdown file under `top`, the app's own dot-folders and node_modules skipped. */
+function markdownUnder(top) {
+  const out = [];
+  const walk = (dir) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (/\.md$/i.test(entry.name)) out.push(full);
+    }
+  };
+  walk(top);
+  return out;
+}
+
+/** The nearest vault folder above `file`, or null. */
+function vaultOf(file) {
+  for (let dir = path.dirname(file); ; dir = path.dirname(dir)) {
+    if (isVaultDir(dir)) return dir;
+    if (path.dirname(dir) === dir) return null;
+  }
+}
+
+/*
+ * Something moved: `from` is where a note (or a folder — a vault's, a plain one) used to be,
+ * `to` where it is now, both absolute. Every reference in the system of vaults that pointed
+ * at it, or at anything inside it, is repointed — a rename in one vault must not leave a
+ * dozen pointers in other vaults aimed at a name that is gone. Lines are compared by what
+ * they resolve to, so a relative and an absolute spelling of the same place both count,
+ * and rewritten in the form a `ref::` line takes (see `refForm`). Files are touched only
+ * when a line actually changed. The windows showing the vaults whose files changed are
+ * told, so their canvases re-read (see `refs-changed` in the renderer).
+ */
+ipcMain.handle("refs-retarget", (event, from, to, scopeRoot) => {
+  const was = path.resolve(expandHome(String(from)));
+  const now = path.resolve(expandHome(String(to)));
+  if (was === now) return { count: 0, files: [] };
+  const top = systemTop(realDir(expandHome(String(scopeRoot || path.dirname(was)))));
+  const changedFiles = [];
+  let count = 0;
+  for (const file of markdownUnder(top)) {
+    let text;
+    try {
+      text = fs.readFileSync(file, "utf8");
+    } catch {
+      continue;
+    }
+    if (!/^ref::/m.test(text)) continue;
+    let touched = 0;
+    const next = text.replace(/^(ref::[ \t]*)(.+?)[ \t]*$/gm, (line, head, target) => {
+      const at = refResolve(target);
+      let moved = null;
+      if (at === was) moved = now;
+      else if (at.startsWith(was + path.sep)) moved = path.join(now, at.slice(was.length + 1));
+      if (!moved) return line;
+      touched++;
+      return `${head}${refForm(moved)}`;
+    });
+    if (!touched) continue;
+    try {
+      fs.writeFileSync(file, next);
+      count += touched;
+      changedFiles.push(file);
+    } catch {
+      /* a file that cannot be written keeps its old pointer; the corner's search will heal it */
+    }
+  }
+  if (changedFiles.length) {
+    const roots = [...new Set(changedFiles.map(vaultOf).filter(Boolean))];
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (win.webContents.id !== event.sender.id) win.webContents.send("refs-changed", roots);
+    }
+  }
+  return { count, files: changedFiles };
 });
 
 /**
@@ -684,10 +888,19 @@ ipcMain.handle("vault-index", async (_event, root) => {
     }
   };
   const start = real(expandHome(root));
-  let top = start;
-  for (let dir = path.dirname(start); isVaultDir(dir) && path.dirname(dir) !== dir; dir = path.dirname(dir)) top = dir;
+  const top = systemTop(start);
   const posix = (p) => p.split(path.sep).join("/");
+  // Where something sits inside the asker's own folder, or null when it is not in there.
+  const relativeTo = (full) => {
+    const inside = path.relative(start, full);
+    return inside && !inside.startsWith("..") && !path.isAbsolute(inside) ? posix(inside) : null;
+  };
   const notes = [];
+  // The vaults themselves are targets as much as the notes in them: a whole vault can be
+  // linked, and the node standing for it is only a holder pointing at it. Every vault in
+  // the system but the asker's own — the ones above it included, the top first.
+  const vaults = [];
+  if (top !== start && isVaultDir(top)) vaults.push({ path: top, ref: refForm(top), name: path.basename(top), place: "", relative: null, nested: false });
   // `nested`: the folder is a vault of its own INSIDE the asker's — its notes are in the
   // asker's files, but not on the asker's canvas, which shows one node for the whole vault.
   const walk = (dir, vault, nested) => {
@@ -698,26 +911,29 @@ ipcMain.handle("vault-index", async (_event, root) => {
       return; // a folder that cannot be read has no notes to offer
     }
     for (const entry of entries) {
-      if (entry.name.startsWith(".")) continue;
+      if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) {
         const own = isVaultDir(full);
+        // For a vault, `nested` is the folder's own flag: a vault inside a vault inside the
+        // asker's is behind that one's node, and stands here as a reference, not a vault node.
+        if (own && full !== start) vaults.push({ path: full, ref: refForm(full), name: entry.name, place: posix(path.relative(top, dir)), relative: relativeTo(full), nested });
         walk(full, own ? full : vault, nested || (own && full.startsWith(start + path.sep)));
       } else if (/\.md$/i.test(entry.name)) {
-        const inside = path.relative(start, full);
         notes.push({
           path: full,
+          ref: refForm(full),
           name: entry.name.replace(/\.md$/i, ""),
           vault,
           place: posix(path.relative(top, dir)),
-          relative: inside && !inside.startsWith("..") && !path.isAbsolute(inside) ? posix(inside) : null,
+          relative: relativeTo(full),
           nested,
         });
       }
     }
   };
   walk(top, isVaultDir(top) ? top : null, false);
-  return { top, notes };
+  return { top, notes, vaults };
 });
 
 /**

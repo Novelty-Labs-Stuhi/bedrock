@@ -316,9 +316,18 @@ const REF_GLYPH =
 const REF_ICON =
   "data:image/png;base64,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";
 
-/** The bite a reference wears: its size across, as a fraction of the node's width, and where its centre sits — on the rim, at 45°. */
-const REF_MARK_SIZE = 0.5;
-const REF_MARK_AT = Math.SQRT1_2 / 2;
+/** The notch a reference wears: its size across, as a fraction of the node's width. */
+const REF_MARK_SIZE = 0.44;
+/**
+ * Where its centre sits, from the node's centre, along the bottom-right diagonal — as a
+ * fraction of the node's width, the same on a circle and on a tile. Past the rim of a
+ * circle (which is at 0.354 on the diagonal) and short of a tile's corner (0.5), so on
+ * both it bites the edge and hangs a little way out over the ground: the mark is not
+ * fitted inside the node, it is cut into its corner.
+ */
+const REF_MARK_AT = 0.4;
+/** Cytoscape puts an image's edge at the node's edge; this offset carries the mark's centre on out past it. */
+const REF_RIM_OFFSET = `${(REF_MARK_AT - (1 - REF_MARK_SIZE) / 2) * 100}%`;
 
 /**
  * Styles by note TYPE — the `type:: …` line a file ends with. Untyped notes are
@@ -439,52 +448,101 @@ const TYPE_STYLES: Record<string, Record<string, unknown>> = {
     "background-opacity": 0,
     "pie-size": "0%",
   },
-  // A reference: a note that lives in another vault, standing here. It stays the circle a
-  // note is — it IS a note, only somewhere else — with the arrow CUT OUT of its top-right:
-  // a disc of the canvas's own colour bitten out of the rim, the white arrow in it. It is
-  // the doorway to that vault, so it is big enough to click (see `isRefCorner`). The image
-  // itself is the ground's to make (see `refMark`), so it is set with the colours.
+  // A reference: something that lives in another vault, standing here. It looks like what
+  // it points at — a note's circle, a Notion page's tile, a vault's square (see
+  // `refLookStyles`) — with the "open elsewhere" arrow CUT OUT of its bottom-right: a
+  // square of the canvas's own colour, the white arrow in it. It is the doorway to that
+  // vault, so it is big enough to click (see `isRefCorner`). This is the plain-note look;
+  // the image itself is the ground's to make (see `refMark`), so it is set with the colours.
   ref: {
     "background-width": `${REF_MARK_SIZE * 100}%`,
     "background-height": `${REF_MARK_SIZE * 100}%`,
-    // Cytoscape puts the image's edge at the node's edge; the offset carries its centre on
-    // out to the rim, at the top-right diagonal.
     "background-position-x": "100%",
-    "background-position-y": "0%",
-    "background-offset-x": `${(REF_MARK_AT - (1 - REF_MARK_SIZE) / 2) * 100}%`,
-    "background-offset-y": `${-(REF_MARK_AT - (1 - REF_MARK_SIZE) / 2) * 100}%`,
+    "background-position-y": "100%",
+    "background-offset-x": REF_RIM_OFFSET,
+    "background-offset-y": REF_RIM_OFFSET,
     "background-clip": "none",
     "background-image-opacity": 1,
   },
 };
 
 /**
- * Whether a click on a reference node landed on its corner — the bite with the arrow in
- * it — rather than on the body. The bite's centre sits on the rim at the top-right
- * diagonal, half in and half out; cytoscape only hears clicks inside the shape, so it is
- * the inner half that answers, with a little slack round it.
+ * Whether a click on a reference node landed on its corner — the notch with the arrow in
+ * it — rather than on the body. The notch's centre sits past the edge at the bottom-right
+ * diagonal, part in and part out; cytoscape only hears clicks inside the shape, so it is
+ * the inner part that answers, with a little slack round it. Square, as the notch is.
  */
 function isRefCorner(node: NodeSingular, at: cytoscape.Position): boolean {
   const centre = node.position();
   const width = node.width();
   const c = REF_MARK_AT * width;
-  const r = (REF_MARK_SIZE / 2) * width;
-  return Math.hypot(at.x - centre.x - c, centre.y - at.y - c) <= r * 1.2;
+  const half = (REF_MARK_SIZE / 2) * width;
+  return Math.max(Math.abs(at.x - centre.x - c), Math.abs(at.y - centre.y - c)) <= half * 1.2;
 }
 
 /**
- * The bite a reference wears: a disc in the ground colour — so it reads as cut out of the
- * node, whatever colours the tags gave it — with the white arrow inside, and a rim of
- * ground round the arrow for the gap. Drawn after the pie (an unclipped image is), so the
- * pie never covers it.
+ * The notch a reference wears: a rounded square in the ground colour — so it reads as cut
+ * out of the node, whatever colours the tags gave it — with the white arrow inside, a
+ * little smaller than the square, so a hairline of ground shows round it. Drawn after the
+ * pie (an unclipped image is), so the pie never covers it.
  */
 const refMark = (ground: string): string =>
   "data:image/svg+xml;utf8," +
   encodeURIComponent(
     `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="128" height="128" viewBox="0 0 128 128">` +
-      `<circle cx="64" cy="64" r="64" fill="${ground}"/>` +
-      `<image href="${REF_GLYPH}" xlink:href="${REF_GLYPH}" x="30" y="30" width="68" height="68"/></svg>`,
+      `<rect width="128" height="128" rx="26" fill="${ground}"/>` +
+      `<image href="${REF_GLYPH}" xlink:href="${REF_GLYPH}" x="14" y="14" width="100" height="100"/></svg>`,
   );
+
+/**
+ * A reference dressed as what it points at. The `target::` line rides the node as `rtype`,
+ * and each type in `TYPE_STYLES` gets a rule: the type's own look — its tile, its icon —
+ * with the notch laid over it as a second background image, cut into the bottom-right
+ * corner. A type with no picture (a vault) is its shape with the notch; the plain note
+ * keeps the circle-and-bite the `ref` type style gives it. A webpage reference wears the globe: the
+ * site's own icon is the note's cache, not the reference's.
+ */
+const refLookStyles = (ground: string): cytoscape.StylesheetJson => {
+  const mark = refMark(ground);
+  const size = `${REF_MARK_SIZE * 100}%`;
+  const rules: Array<{ selector: string; style: Record<string, unknown> }> = [
+    // The bite is the ground's colour, so it is made here, with the ground.
+    { selector: 'node[ntype = "ref"]', style: { "background-image": mark } },
+  ];
+  for (const [type, style] of Object.entries(TYPE_STYLES)) {
+    if (type === "ref") continue;
+    const { "background-image": picture, "background-fit": fit, ...rest } = style;
+    const icon = type === "web" ? GLOBE_ICON : (picture as string | undefined);
+    // The same geometry the `ref` type style gives a plain note: past the edge, at the diagonal.
+    const corner = {
+      "background-position-x": "100%",
+      "background-position-y": "100%",
+      "background-offset-x": REF_RIM_OFFSET,
+      "background-offset-y": REF_RIM_OFFSET,
+      "background-clip": "none",
+      "background-image-opacity": 1,
+    };
+    rules.push({
+      selector: `node[ntype = "ref"][rtype = "${type}"]`,
+      style: icon
+        ? {
+            ...rest,
+            "background-image": [icon, mark],
+            "background-fit": [(fit as string | undefined) ?? "none", "none"],
+            "background-width": ["auto", size],
+            "background-height": ["auto", size],
+            "background-position-x": ["50%", corner["background-position-x"]],
+            "background-position-y": ["50%", corner["background-position-y"]],
+            "background-offset-x": ["0%", corner["background-offset-x"]],
+            "background-offset-y": ["0%", corner["background-offset-y"]],
+            "background-clip": ["node", corner["background-clip"]],
+            "background-image-opacity": [1, 1],
+          }
+        : { ...rest, "background-image": mark, "background-width": size, "background-height": size, ...corner },
+    });
+  }
+  return rules as unknown as cytoscape.StylesheetJson;
+};
 
 /*
  * An issue's progress used to be a coloured ring round its icon, and it made the icon
@@ -587,8 +645,8 @@ function styleSheet(look: Look): cytoscape.StylesheetJson {
     },
     // Typed notes wear their type — an Antigravity session is the Antigravity mark.
     ...typeShapeStyles(),
-    // A reference's bite is the ground's colour, so it is made here, with the ground.
-    { selector: 'node[ntype = "ref"]', style: { "background-image": refMark(ground) } },
+    // A reference wears what it points at, with the notch cut from its corner.
+    ...refLookStyles(ground),
     /*
      * A note's own look, chosen on the canvas (right-click → "Style…") and kept in its
      * markdown. After the type styles, so a chosen colour or sign beats the one a type
@@ -1039,7 +1097,7 @@ export function buildElements(docs: Doc[], described: ReadonlySet<string> = new 
         // document has not been made yet — a click makes it (see main.ts).
         ...(type === "word" ? { wdoc: parseField(doc.text, "doc") ?? "" } : {}),
         // A reference node reveals the note it stands for, off the path riding here.
-        ...(type === "ref" ? { rpath: parseField(doc.text, "ref") ?? "" } : {}),
+        ...(type === "ref" ? { rpath: parseField(doc.text, "ref") ?? "", rtype: parseField(doc.text, "target") ?? "" } : {}),
         // Same bargain for a session note: its id rides the node, so a click can go
         // straight to `claude://resume` without a read first. Empty until the Claude app
         // has minted one — that is a note that has never been run.
@@ -3257,10 +3315,22 @@ export class GraphView {
     node.addClass("highlight");
   }
 
-  /** And for a reference whose note moved — the node points at where it is now. */
-  setRefTarget(path: string, target: string): void {
+  /** And for a reference made or healed — the node points at where its target is now, and wears what is there. */
+  setRefTarget(path: string, target: string, type: string | null = null): void {
     const node = this.cy?.getElementById(path);
-    if (node && node.nonempty()) node.data("rpath", target);
+    if (!node || node.empty()) return;
+    node.data("rpath", target);
+    node.data("rtype", type ?? "");
+  }
+
+  /** The vault node standing for `folder` (this vault's own, root-relative) on this canvas, or null when none does. */
+  vaultNode(folder: string): string | null {
+    const cy = this.cy;
+    if (!cy) return null;
+    const hit = cy
+      .nodes()
+      .filter((node) => node.data("ntype") === "vault" && ((node.data("vfolder") as string) || noteName(node.id())) === folder);
+    return hit.nonempty() ? hit[0].id() : null;
   }
 
   /** And for a thread started after its note. */

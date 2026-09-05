@@ -83,6 +83,20 @@ contextBridge.exposeInMainWorld("bedrock", {
   windowRoot: (root) => ipcRenderer.invoke("window-root", root),
   windowState: () => ipcRenderer.invoke("window-state"),
   windowShow: (id, focus) => ipcRenderer.invoke("window-show", id, focus),
+  // `windowOpen` is a window of its own onto a vault — a top-level one, not a child of
+  // this window, so closing this one leaves it standing.
+  windowOpen: (root, focus) => ipcRenderer.invoke("window-open", root, focus),
+
+  // The Bedrock folder: where vaults live, where the sheet opens, the top of the search.
+  // `baseRef` is a path the way a `ref::` line writes it — relative to that folder when
+  // under it, absolute otherwise.
+  baseGet: () => ipcRenderer.invoke("base-get"),
+  baseSet: (folder) => ipcRenderer.invoke("base-set", folder),
+  baseRef: (full) => ipcRenderer.invoke("base-ref", full),
+  // Something moved: repoint every `ref::` in the system of vaults that aimed at `from` (or
+  // inside it) to `to`. `onRefsChanged` is the other end, in the windows whose files changed.
+  refsRetarget: (from, to, scopeRoot) => ipcRenderer.invoke("refs-retarget", from, to, scopeRoot),
+  onRefsChanged: (fn) => ipcRenderer.on("refs-changed", (_e, roots) => fn(roots)),
   onGoto: (fn) => ipcRenderer.on("goto", (_e, focus) => fn(focus)),
 
   // Sessions run by the CLI, in the person's own terminal. `claudeCliStatus` is what the
