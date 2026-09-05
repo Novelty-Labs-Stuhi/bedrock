@@ -207,6 +207,22 @@ interface Window {
     /** Raises a window, landing it on `focus` (a vault-relative note path) if one is
         given. False when that window has gone since it was listed. */
     windowShow(id: number, focus?: string | null): Promise<boolean>;
+    /** Opens `root` as a vault in a window of its own — top-level, no opener, so it
+        outlives this window — landed on `focus` if one is given. False for no path. */
+    windowOpen(root: string, focus?: string | null): Promise<boolean>;
+
+    /** The Bedrock folder — the horizon every vault lives under (see main.cjs). Made if missing. */
+    baseGet(): Promise<string>;
+    /** Makes `folder` the Bedrock folder; resolves with it, made. */
+    baseSet(folder: string): Promise<string>;
+    /** A path the way a `ref::` line writes it: relative to the Bedrock folder when under it, absolute otherwise. */
+    baseRef(full: string): Promise<string>;
+    /** Something moved from `from` to `to` (absolute): every `ref::` in the system of vaults
+        that pointed at it, or inside it, is repointed. `scopeRoot` is the vault it happened in
+        (the system is found from there). Resolves with how many lines, in which files. */
+    refsRetarget(from: string, to: string, scopeRoot: string): Promise<{ count: number; files: string[] }>;
+    /** References in the vaults at `roots` were rewritten by another window: re-read if one is this one's. */
+    onRefsChanged(fn: (roots: string[]) => void): void;
     /** A window being raised, told where to land — the live twin of `?focus=`. */
     onGoto(fn: (focus: string) => void): void;
 
@@ -284,14 +300,16 @@ type PickOptions = {
   message?: string;
 };
 
-/** What the shell can say about a note on the disk, wherever it is, before anything is made of it. */
+/** What the shell can say about a note on the disk — or a vault's folder — wherever it is, before anything is made of it. */
 type NotePeek = {
-  /** The file name with the extension shed — what a reference to it is named after. */
+  /** The file name with the extension shed — what a reference to it is named after. A vault's is its folder's name. */
   name: string;
-  /** Its `type::` line, or null for a plain note. */
+  /** What it looks like: its `type::` line (a reference answers with its target's), "vault" for a vault's folder, null for a plain note. */
   type: string | null;
-  /** The nearest folder above it that is a Bedrock vault (has `.notes/config.json`), or null. */
+  /** The nearest folder above it that is a Bedrock vault (has a `.notes/` folder), or null. A vault's folder is its own. */
   vault: string | null;
+  /** Where it sits inside its vault, "/"-separated — what a window onto that vault lands on. "" for a vault's own folder. */
+  inside: string;
   /** Its path inside the root asked about, "/"-separated — null when it is outside that root. */
   relative: string | null;
 };
@@ -300,6 +318,8 @@ type NotePeek = {
 type IndexedNote = {
   /** Absolute path on this disk. */
   path: string;
+  /** The path as a `ref::` line writes it: relative to the Bedrock folder when under it, else absolute. */
+  ref: string;
   /** The file name with the extension shed. */
   name: string;
   /** The nearest vault folder above it, or null for a note under no vault. */
@@ -312,8 +332,24 @@ type IndexedNote = {
   nested: boolean;
 };
 
-/** The system of vaults a folder is part of: the top of it, and every note under that. */
-type VaultIndex = { top: string; notes: IndexedNote[] };
+/** One vault as the search index knows it — a whole world that can be linked, not only a note in it. */
+type IndexedVault = {
+  /** Absolute path of its folder on this disk. */
+  path: string;
+  /** The folder as a `ref::` line writes it: relative to the Bedrock folder when under it, else absolute. */
+  ref: string;
+  /** The folder's name — what the vault is called. */
+  name: string;
+  /** The folder it sits in, relative to the top of the system, "/"-separated; "" for the top itself. */
+  place: string;
+  /** Its folder inside the root asked about, or null when it is outside that root. */
+  relative: string | null;
+  /** Inside the root asked about, but behind another vault's node there — so a reference, not a vault node. */
+  nested: boolean;
+};
+
+/** The system of vaults a folder is part of: the top of it, every note under that, and every vault but the asker's own. */
+type VaultIndex = { top: string; notes: IndexedNote[]; vaults: IndexedVault[] };
 
 /** A Notion page as the pointer Bedrock keeps: never the page itself. */
 type NotionPage = {

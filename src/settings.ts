@@ -597,6 +597,10 @@ export type SetupPage = { status: string; ready?: boolean; lines: SetupLine[] };
 export type PanelHooks = {
   page?: (feature: Feature) => SetupPage | null;
   onAction?: (feature: Feature, action: string) => void;
+  /** The Bedrock folder as the shell knows it — null in a browser tab, which has none. */
+  base?: () => string | null;
+  /** The General tab's "Choose…" beside it: pick another folder. */
+  onBasePick?: () => void;
   /** The Layout tab's one button: relax the whole graph from where it is. */
   onLayoutAll?: () => void;
 };
@@ -680,7 +684,16 @@ export function mountSettings(
 
   const general = (): string => {
     const look = store.look();
+    const base = hooks.base?.() ?? null;
     return (
+      (base
+        ? lookRow(
+            "Bedrock folder",
+            "where vaults live: new vaults are made in it, the folder sheet opens in it, and a search across vaults reaches everything under it — references between vaults are written relative to it, so the whole folder can move",
+            `<div class="setup-line"><span class="setup-value">${escapeHtml(base)}</span>` +
+              `<button type="button" data-base-pick>Choose…</button></div>`,
+          )
+        : "") +
       lookRow(
         "Canvas",
         "the ground the graph is drawn on",
@@ -840,6 +853,10 @@ export function mountSettings(
     if (hit.dataset.layoutRun !== undefined) {
       show(false); // the run is the thing to watch, and the window is over it
       hooks.onLayoutAll?.();
+      return;
+    }
+    if (hit.dataset.basePick !== undefined) {
+      hooks.onBasePick?.(); // redraws the window itself once the folder is chosen
       return;
     }
     const picked = hit.dataset.tab as Tab | undefined;
