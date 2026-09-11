@@ -1,5 +1,6 @@
 import "./style.css";
 import { GraphView, TYPE_ICONS, type Client, type Doc, type DraftKind, type SessionState } from "./graph";
+import { deleteSection, keepSections, leafOf, linkSection, parseSections, sectionKey, unlinkSection } from "./granola";
 import {
   LinkResolver,
   parseLinks,
@@ -222,6 +223,8 @@ const graphView = new GraphView(ui.cy, {
   onOpenFreeform: (path, board) => void openFreeformNode(path, board),
   onOpenVault: (path, folder) => void openVaultNode(path, folder),
   onOpenNotion: (path, url) => void openNotionNode(path, url),
+  onOpenGranola: (path, meeting) => void openGranolaNode(path, meeting),
+  onLeafMenu: (leaf, client) => showLeafMenu(leaf, client),
   onOpenRef: (path, target, corner) => void openRefNode(path, target, corner),
   onOpenSlack: (path, url) => void openSlackNode(path, url),
   onOpenGoogleTask: (path, task, url) => void openGoogleTaskNode(path, task, url),
@@ -275,51 +278,7 @@ const graphView = new GraphView(ui.cy, {
      * The same two branches, in the same order, as the canvas menu. A right-click should
      * not be a different vocabulary depending on what happened to be under it.
      */
-    const create: MenuItem[] = [
-      { label: "Holder", icon: NOTE_DOT, run: () => graphView.startLink(path) },
-
-    ];
-    const draft = (kind: DraftKind, label: string): void => {
-      create.push({ label, icon: TYPE_ICONS[kind], run: () => graphView.startLink(path, kind) });
-    };
-    if (settings.enabled("antigravity")) draft("antigravity", "Antigravity session");
-    if (settings.enabled("claude")) draft("claude", "Claude session");
-    if (settings.enabled("files")) {
-      draft("file", "File");
-    }
-    if (settings.enabled("web")) draft("web", "Webpage");
-    if (settings.enabled("freeform")) draft("freeform", "Freeform board");
-    if (settings.enabled("notion")) draft("notion", "Notion page");
-    if (settings.enabled("slack")) draft("slack", "Slack thread");
-    if (settings.enabled("google")) draft("gtask", "Google task");
-    if (settings.enabled("applenotes")) draft("applenote", "Apple note");
-    if (settings.enabled("word")) draft("word", "Word document");
-
-    const items: MenuItem[] = [{ label: "Link + Create", children: create }];
-    // What already exists, starting with what is already on the canvas: a node. That draft
-    // lands only on a note. The rest are drafts that already know what they are attaching
-    // to — picking the thing arms the draft, and dropping it decides where. See
-    // `startLink`'s `release`.
-    const attach: MenuItem[] = [
-      // One row, two ways in. A CLICK starts the arrow: the draft lands on a note already
-      // on this canvas. HOVERING opens the search beside it: every note in the system of
-      // vaults — this one, the folders above it, the vaults beside it — found by name in
-      // a panel with a type box first and the few notes that match under it. That pick
-      // decides what the draft is: a plain link when the note is here, a reference node
-      // when it is not.
-      {
-        label: "Existing node",
-        icon: NOTE_DOT,
-        run: () => graphView.startLink(path, "link"),
-        search: { placeholder: "Type a note's name…" },
-        children: () => existingNodeRows(path, null, null),
-      },
-      ...attachMenu(
-        (option, kind) => () =>
-          graphView.startLink(path, kind, (at, source) => void option.place(at, null, source)),
-      ),
-    ];
-    items.push({ label: "Link + Attach", children: attach });
+    const items: MenuItem[] = linkBranches(path);
 
     // A holder is a node waiting to be something: this is where it becomes one, keeping
     // its name, its place and its look. Only a note with no type yet is offered it — a
@@ -357,9 +316,11 @@ const graphView = new GraphView(ui.cy, {
   onEdgeMenu: (source, target, _label, client) => {
     // The pulse a note can wear, on the line between two of them. Naming the line stays
     // a click on it; the menu offers the same, so the right button is never a dead end.
-    const items: MenuItem[] = [
-      { label: "Name this connection…", run: () => relabelEdge(source, target) },
-    ];
+    const items: MenuItem[] = [];
+    // A leaf's arrow lives on a heading line, where a relation name has no place.
+    if (!leafOf(source) && graphView.nodeType(source) !== "granola") {
+      items.push({ label: "Name this connection…", run: () => relabelEdge(source, target) });
+    }
     if (settings.enabled("active")) {
       const mark = graphView.edgeMark(source, target);
       items.push({
@@ -371,7 +332,7 @@ const graphView = new GraphView(ui.cy, {
     // nothing else holding the connection up. Last, and it asks first.
     items.push({
       label: "Delete connection",
-      hint: `${noteName(source)}${ARROW}${noteName(target)}`,
+      hint: `${linkSourceName(source)}${ARROW}${noteName(target)}`,
       run: () => void deleteEdge(source, target),
     });
     showMenu(client, items);
@@ -1578,6 +1539,20 @@ async function save(index: number): Promise<void> {
  */
 async function insertCitation(source: string, target: string, label: string | null = null): Promise<void> {
   if (source === target) return;
+  const leaf = leafOf(source);
+  if (leaf) {
+    // A section's link goes at the end of its heading line in the meeting's note — the
+    // relation name has no place there, so a leaf's arrow is always a bare link.
+    if (leaf.path === target) return;
+    await flushAll(); // the meeting's note may be open, with the heading in its buffer
+    const before = await vault.read(leaf.path);
+    const after = linkSection(before, leaf.index, target.replace(/\.md$/i, ""));
+    if (after !== before) {
+      await vault.write(leaf.path, after);
+      syncOpenPanes(leaf.path, after);
+    }
+    return;
+  }
   const text = await vault.read(source);
   const resolver = new LinkResolver(filePaths());
   const spelling = target.replace(/\.md$/i, "");
@@ -1639,6 +1614,25 @@ async function applyEdgeLabel(source: string, target: string, fresh: string | nu
  * exists is a file nothing on the canvas can ever reach again.
  */
 async function deleteEdge(source: string, target: string): Promise<void> {
+  const leaf = leafOf(source);
+  if (leaf) {
+    const title = `${linkSourceName(source)}${ARROW}${noteName(target)}`;
+    if (!(await askConfirm(`Cut the section's arrow ${title}?`, "Delete"))) return;
+    await flushAll();
+    const resolver = new LinkResolver(filePaths());
+    const spelling = target.replace(/\.md$/i, "");
+    const cut = (t: string): boolean => resolver.resolve(t) === target || t.trim() === spelling.trim();
+    const before = await vault.read(leaf.path);
+    const after = unlinkSection(before, leaf.index, cut);
+    if (after !== before) {
+      await vault.write(leaf.path, after);
+      syncOpenPanes(leaf.path, after);
+    }
+    await refresh();
+    await showAll();
+    ui.status.textContent = after === before ? `nothing to cut: ${title}` : `cut ${title}`;
+    return;
+  }
   const title = `${noteName(source)}${ARROW}${noteName(target)}`;
   const note = edgeNotePath(source, target);
   const described = await vault.exists(note);
@@ -1651,8 +1645,14 @@ async function deleteEdge(source: string, target: string): Promise<void> {
   const spelling = target.replace(/\.md$/i, "");
   const cut = (t: string): boolean => resolver.resolve(t) === target || t.trim() === spelling.trim();
   const text = await vault.read(source);
-  const next = unlinkText(text, cut);
-  if (next !== text) await vault.write(source, next);
+  // A meeting's headings link on behalf of their sections: the link comes off the heading
+  // whole. A link in the body of the note is cut the way any note's is.
+  const trimmed = graphView.nodeType(source) === "granola" ? unlinkSection(text, null, cut) : text;
+  const next = trimmed !== text ? trimmed : unlinkText(text, cut);
+  if (next !== text) {
+    await vault.write(source, next);
+    syncOpenPanes(source, next);
+  }
   if (described) {
     dropTabs(note);
     await vault.remove(note, "file");
@@ -2317,6 +2317,94 @@ async function moveSelectionTo(picked: string[]): Promise<void> {
   }
 }
 
+/**
+ * The two branches every link starts from — "Link + Create" makes something new on the
+ * other end, "Link + Attach" puts something that already exists there — for a note, or
+ * for a leaf of a meeting (see `granola.ts`): the draft's source is whichever asked.
+ */
+function linkBranches(source: string): MenuItem[] {
+    const create: MenuItem[] = [
+      { label: "Holder", icon: NOTE_DOT, run: () => graphView.startLink(source) },
+
+    ];
+    const draft = (kind: DraftKind, label: string): void => {
+      create.push({ label, icon: TYPE_ICONS[kind], run: () => graphView.startLink(source, kind) });
+    };
+    if (settings.enabled("antigravity")) draft("antigravity", "Antigravity session");
+    if (settings.enabled("claude")) draft("claude", "Claude session");
+    if (settings.enabled("files")) {
+      draft("file", "File");
+    }
+    if (settings.enabled("web")) draft("web", "Webpage");
+    if (settings.enabled("freeform")) draft("freeform", "Freeform board");
+    if (settings.enabled("notion")) draft("notion", "Notion page");
+    if (settings.enabled("slack")) draft("slack", "Slack thread");
+    if (settings.enabled("google")) draft("gtask", "Google task");
+    if (settings.enabled("applenotes")) draft("applenote", "Apple note");
+    if (settings.enabled("word")) draft("word", "Word document");
+
+    const items: MenuItem[] = [{ label: "Link + Create", children: create }];
+    // What already exists, starting with what is already on the canvas: a node. That draft
+    // lands only on a note. The rest are drafts that already know what they are attaching
+    // to — picking the thing arms the draft, and dropping it decides where. See
+    // `startLink`'s `release`.
+    const attach: MenuItem[] = [
+      // One row, two ways in. A CLICK starts the arrow: the draft lands on a note already
+      // on this canvas. HOVERING opens the search beside it: every note in the system of
+      // vaults — this one, the folders above it, the vaults beside it — found by name in
+      // a panel with a type box first and the few notes that match under it. That pick
+      // decides what the draft is: a plain link when the note is here, a reference node
+      // when it is not.
+      {
+        label: "Existing node",
+        icon: NOTE_DOT,
+        run: () => graphView.startLink(source, "link"),
+        search: { placeholder: "Type a note's name…" },
+        children: () => existingNodeRows(source, null, null),
+      },
+      ...attachMenu(
+        (option, kind) => () =>
+          graphView.startLink(source, kind, (at, source) => void option.place(at, null, source)),
+      ),
+    ];
+    items.push({ label: "Link + Attach", children: attach });
+    return items;
+}
+
+/**
+ * Click on a leaf: where should this section point? The same two branches a note's
+ * menu opens with, and nothing else — a leaf has no file of its own to rename or delete.
+ */
+function showLeafMenu(leaf: string, client: { x: number; y: number }): void {
+  const found = leafOf(leaf);
+  if (!found) return;
+  const items = linkBranches(leaf);
+  // The section can go from the copy here — Granola keeps the meeting itself.
+  items.push({ label: "Delete section", run: () => void deleteLeaf(found.path, found.index) });
+  showMenu(client, items);
+}
+
+/** Takes a section — heading and text — out of the meeting's note, after asking. */
+async function deleteLeaf(path: string, index: number): Promise<void> {
+  const title = graphView.leafTitle(path, index) || `section ${index + 1}`;
+  if (!(await askConfirm(`Delete “${title}” from ${noteName(path)}? Granola keeps the meeting itself.`, "Delete"))) return;
+  await flushAll();
+  const before = await vault.read(path);
+  const after = deleteSection(before, index);
+  if (after === before) return;
+  await vault.write(path, after);
+  syncOpenPanes(path, after);
+  await refresh();
+  await showAll();
+  ui.status.textContent = `deleted “${title}” from ${noteName(path)}`;
+}
+
+/** A link's source as a status line names it: the note, or "meeting § n" for a leaf. */
+function linkSourceName(source: string): string {
+  const leaf = leafOf(source);
+  return leaf ? `${noteName(leaf.path)} § ${leaf.index + 1}` : noteName(source);
+}
+
 /* ---------------------------------------------------------------- linear --- */
 
 /**
@@ -2924,6 +3012,45 @@ function integrationPage(feature: Feature): SetupPage | null {
       return { status, ready: linked, lines };
     }
 
+    case "granola": {
+      if (!bridge) {
+        return {
+          status: "desktop app only",
+          lines: [
+            {
+              label: "Why",
+              value: "the OAuth window and the keychain the token lives in are the shell's — npm start",
+            },
+          ],
+        };
+      }
+      const linked = granolaState?.linked ?? false;
+      const account = granolaState?.workspace ?? "";
+      const lines: SetupLine[] = [
+        {
+          label: "What this is",
+          value:
+            "meeting notes — notes that point at meetings Granola took notes of. Attaching one copies its summarised notes into the note here, so the words are on the canvas; a click opens the meeting in Granola. Nothing is made in Granola from here.",
+        },
+        {
+          label: "Account",
+          value: granolaWord
+            ? granolaWord
+            : linked
+              ? `linked${account ? ` — ${account}` : ""}. Unlinking forgets the token; notes keep their copies.`
+              : "not linked yet. Linking opens Granola in your browser to ask you — the token lands in the OS keychain, never the vault.",
+          action: linked ? { id: "unlink", label: "Unlink" } : { id: "connect", label: "Link…" },
+        },
+        {
+          label: "How it talks",
+          value:
+            "over Granola's own MCP server (mcp.granola.ai) — the same door Notion opened, with nothing installed here and no API key to paste.",
+        },
+      ];
+      const status = !granolaState ? "not read yet" : linked ? account || "linked" : "not linked";
+      return { status, ready: linked, lines };
+    }
+
     case "applenotes": {
       if (!bridge) {
         return {
@@ -3063,6 +3190,8 @@ function runIntegrationAction(feature: Feature, action: string): void {
   else if (feature === "google" && action === "client") void setUpGoogleClient();
   else if (feature === "notion" && action === "connect") void connectNotion();
   else if (feature === "notion" && action === "unlink") void unlinkNotion();
+  else if (feature === "granola" && action === "connect") void connectGranola();
+  else if (feature === "granola" && action === "unlink") void unlinkGranola();
   else if (feature === "applenotes" && action === "test") void testAppleNotes();
   else if (feature === "applenotes" && action === "folder") void setUpNotesFolder();
   else if (feature === "applenotes" && action === "reset") forgetNotesFolder();
@@ -4199,6 +4328,163 @@ async function createFreeformAt(
   });
 }
 
+
+/* --------------------------------------------------------------- granola --- */
+
+/** What the shell last said about the Granola link; null until asked. */
+let granolaState: { linked: boolean; workspace: string } | null = null;
+/** A word in progress or a refusal, shown on the settings page in place of the state. */
+let granolaWord = "";
+
+async function refreshGranola(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  granolaState = await bridge.granolaStatus().catch(() => null);
+  redrawSettings();
+}
+
+async function connectGranola(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  granolaWord = "waiting on the browser — allow Bedrock there…";
+  ui.status.textContent = "Granola: finish linking in the browser tab that opened";
+  redrawSettings();
+  try {
+    const { workspace } = await bridge.granolaConnect();
+    settings.set("granola", true);
+    granolaWord = "";
+    ui.status.textContent = `Granola: linked${workspace ? ` as ${workspace}` : ""}`;
+  } catch (err) {
+    granolaWord = (err as Error).message;
+    ui.status.textContent = `Granola: ${granolaWord}`;
+  }
+  await refreshGranola();
+}
+
+async function unlinkGranola(): Promise<void> {
+  if (!(await askConfirm("Unlink the Granola account? Notes keep their copies of the meetings.", "Unlink"))) return;
+  await window.bedrock?.granolaForget().catch(() => false);
+  granolaWord = "";
+  ui.status.textContent = "Granola: unlinked — the token is forgotten";
+  await refreshGranola();
+}
+
+/** Whether a Granola action may go ahead — asked of the shell, as Notion's is. */
+async function granolaReady(): Promise<boolean> {
+  const bridge = window.bedrock;
+  if (!bridge) {
+    ui.status.textContent = "Granola meetings need the desktop app — npm start";
+    return false;
+  }
+  const status = await bridge.granolaStatus().catch(() => null);
+  granolaState = status;
+  if (!status?.linked) {
+    ui.status.textContent = "Granola: link the account first — Settings → Integrations → Granola";
+    return false;
+  }
+  return true;
+}
+
+/**
+ * A meeting note: the pointer (the id Granola minted, and the meeting's own address),
+ * the date, who was there — and then the notes themselves, as Granola wrote them. The
+ * copy is the point: the graph can show what was said without asking the server, and
+ * a section of it can be linked to a note of your own.
+ */
+const granolaTemplate = (note: GranolaNote): string => {
+  const day = note.at ? new Date(note.at).toISOString().slice(0, 10) : "";
+  const head = [
+    "type:: granola",
+    "",
+    `meeting:: ${note.id}`,
+    `url:: ${note.url}`,
+    ...(day ? [`date:: ${day}`] : []),
+    ...(note.attendees.length ? [`attendees:: ${note.attendees.join(", ")}`] : []),
+  ];
+  return `${head.join("\n")}\n\n${note.notes.trim()}\n`;
+};
+
+/** Click on a meeting node: open the meeting in Granola. There is no making one. */
+async function openGranolaNode(path: string, meeting: string | null): Promise<void> {
+  const say = (message: string): void => {
+    window.setTimeout(() => {
+      ui.status.textContent = message;
+    }, 0);
+  };
+  const bridge = window.bedrock;
+  if (!bridge) {
+    say("Granola meetings need the desktop app — npm start");
+    return;
+  }
+  if (!meeting) {
+    say(`${noteName(path)} names no meeting — its meeting:: line is missing`);
+    return;
+  }
+  const opened = await bridge.granolaOpen(meeting).catch(() => false);
+  say(opened ? `${noteName(path)} → Granola` : `the note's meeting:: line is not a Granola meeting id`);
+}
+
+/** Fetches the meeting whole and puts it on the canvas as a note — notes copied in. */
+async function attachGranolaMeeting(
+  meeting: GranolaMeeting,
+  at: { x: number; y: number },
+  folder: string | null,
+  source: string | null,
+): Promise<void> {
+  if (!(await granolaReady())) return;
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  ui.status.textContent = `Granola: reading “${meeting.title || "Untitled"}”…`;
+  let note: GranolaNote;
+  try {
+    note = await bridge.granolaGet(meeting.id);
+  } catch (err) {
+    ui.status.textContent = `Granola: ${shellError(err)}`;
+    return;
+  }
+  const title = meeting.title || note.title || "Untitled";
+  // The same meeting may already stand in another vault under the base folder. Its copy
+  // there says which sections are spoken for: one that has been pointed at a note, and
+  // one that was deleted from the copy, do not come along a second time — this copy is
+  // made of what is still free, across every vault.
+  const total = parseSections(note.notes).length;
+  let free = total;
+  const copies = await bridge.granolaCopies(note.id).catch(() => []);
+  if (copies.length) {
+    const assigned = new Set<string>();
+    const present: Array<Set<string>> = [];
+    for (const copy of copies) {
+      const sections = parseSections(copy.text);
+      present.push(new Set(sections.map((section) => sectionKey(section.title))));
+      for (const section of sections) if (section.targets.length) assigned.add(sectionKey(section.title));
+    }
+    note.notes = keepSections(note.notes, (section) => {
+      const key = sectionKey(section.title);
+      const spoken = assigned.has(key) || present.some((had) => !had.has(key));
+      if (spoken) free--;
+      return !spoken;
+    });
+  }
+  const spare =
+    free === total
+      ? "notes copied in"
+      : free
+        ? `${free} of ${total} sections still free — the rest are assigned or deleted in another vault`
+        : "every section is already assigned or deleted in another vault";
+  await attachNodeAt(
+    {
+      kind: "granola",
+      title,
+      text: granolaTemplate({ ...note, title, at: note.at || meeting.at, url: note.url || meeting.url }),
+      handle: note.id,
+      done: `${title} → its meeting in Granola, ${spare}`,
+    },
+    at,
+    folder,
+    source,
+  );
+  await showAll(); // the ring of sections is read off the file: draw it now, not at the next change
+}
 
 /* ---------------------------------------------------------------- notion --- */
 
@@ -6255,6 +6541,25 @@ const ATTACHABLES: Attachable[] = [
     },
   },
   {
+    kind: "granola",
+    feature: "granola",
+    label: "Granola meeting",
+    options: async () => {
+      // The last 30 days of meetings, latest first — the widest window Granola's list offers.
+      const meetings = await shellOrThrow()
+        .granolaList()
+        .catch((err: unknown) => {
+          throw new Error(shellError(err));
+        });
+      const rows: AttachOption[] = meetings.map((meeting) => ({
+        label: meeting.title || "Untitled",
+        hint: when(meeting.at),
+        place: (at, folder, source) => attachGranolaMeeting(meeting, at, folder, source),
+      }));
+      return rows;
+    },
+  },
+  {
     kind: "gtask",
     feature: "google",
     label: "Google task",
@@ -6641,13 +6946,16 @@ async function finishLink(source: string, target: string, label: string | null):
   await insertCitation(source, target, label);
   // Re-commit before labelling: if the note was renamed between drawing and naming, the rename's
   // sync dropped the provisional edge (the file did not carry the link yet at that moment).
-  graphView.commitLink(source, target);
-  graphView.setEdgeLabel(source, target, label);
+  // Not for a leaf: its arrow comes out of the meeting on the rebuild, named by the heading.
+  if (!leafOf(source)) {
+    graphView.commitLink(source, target);
+    graphView.setEdgeLabel(source, target, label);
+  }
   graphStale = true;
   await showAll();
   ui.status.textContent = label
-    ? `${noteName(source)} —${label}→ ${noteName(target)}`
-    : `linked ${noteName(source)} → ${noteName(target)}`;
+    ? `${linkSourceName(source)} —${label}→ ${noteName(target)}`
+    : `linked ${linkSourceName(source)} → ${noteName(target)}`;
 }
 
 /** [[link]] click: open the target, creating the note if it does not exist yet. */
@@ -6686,6 +6994,7 @@ ui.settings.addEventListener("click", () => {
   void refreshGit();
   void refreshFreeform();
   void refreshNotion();
+  void refreshGranola();
   void refreshSlack();
   void refreshGoogle();
   void refreshAppleNotes();

@@ -2830,18 +2830,17 @@ ipcMain.handle("notes-open", async (_event, rawId) => {
 });
 
 /*
- * Notion. Reached over Notion's own MCP server (mcp.notion.com) rather than a REST key:
- * linking is OAuth in the real browser — this shell registers itself as a client, opens
- * the consent page, and catches the code on a loopback port — and every call after that
- * is a JSON-RPC tool call with the Bearer token added here. The renderer never sees a
- * token; like Linear's key it is sealed with the OS keychain (safeStorage) into the
- * app's own userData folder, deliberately NOT the vault the commit button snapshots.
+ * Remote MCP servers. Notion and Granola are both reached over the MCP server each of
+ * them runs (mcp.notion.com, mcp.granola.ai) rather than a REST key: linking is OAuth
+ * in the real browser — this shell registers itself as a client, opens the consent page,
+ * and catches the code on a loopback port — and every call after that is a JSON-RPC
+ * tool call with the Bearer token added here. The renderer never sees a token; like
+ * Linear's key it is sealed with the OS keychain (safeStorage) into the app's own
+ * userData folder, deliberately NOT the vault the commit button snapshots.
+ *
+ * `remoteMcp` is the whole of that once; each server is an instance of it with its own
+ * addresses and its own token file, and knows nothing of the other.
  */
-const NOTION_MCP = "https://mcp.notion.com/mcp";
-const NOTION_META = "https://mcp.notion.com/.well-known/oauth-authorization-server";
-const NOTION_RESOURCE = "https://mcp.notion.com";
-const notionFile = () => path.join(app.getPath("userData"), "notion.json");
-
 const seal = (text) =>
   safeStorage.isEncryptionAvailable()
     ? safeStorage.encryptString(text).toString("base64")
@@ -2851,173 +2850,348 @@ const unseal = (stored) =>
     ? safeStorage.decryptString(Buffer.from(stored, "base64"))
     : Buffer.from(stored, "base64").toString("utf8");
 
-function readNotion() {
-  try {
-    const stored = JSON.parse(fs.readFileSync(notionFile(), "utf8"));
-    if (typeof stored.access !== "string") return null;
-    return {
-      access: unseal(stored.access),
-      refresh: typeof stored.refresh === "string" && stored.refresh ? unseal(stored.refresh) : "",
-      clientId: typeof stored.clientId === "string" ? stored.clientId : "",
-      workspace: typeof stored.workspace === "string" ? stored.workspace : "",
-    };
-  } catch {
-    return null; // never linked, or the keychain refused — both mean "not linked"
-  }
-}
-
-function writeNotion(account) {
-  fs.mkdirSync(path.dirname(notionFile()), { recursive: true });
-  fs.writeFileSync(
-    notionFile(),
-    JSON.stringify({
-      version: 1,
-      access: seal(account.access),
-      refresh: account.refresh ? seal(account.refresh) : "",
-      clientId: account.clientId,
-      workspace: account.workspace,
-    }),
-    { mode: 0o600 },
-  );
-}
-
 const b64url = (buf) => buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 
-/** The MCP conversation this run has open: its session id, and a counter for call ids. */
-let notionSession = null;
-let notionTools = null;
-let notionSeq = 1;
-
-/** One JSON-RPC message over. 401 comes back as a coded error, so a refresh can catch it. */
-async function mcpPost(access, message, sessionId) {
-  const headers = {
-    "content-type": "application/json",
-    accept: "application/json, text/event-stream",
-    authorization: `Bearer ${access}`,
-    "mcp-protocol-version": "2025-06-18",
-  };
-  if (sessionId) headers["mcp-session-id"] = sessionId;
-  return net.fetch(NOTION_MCP, { method: "POST", headers, body: JSON.stringify(message) });
-}
-
-/** The reply, whichever coat it wears — plain JSON, or an SSE stream holding one. */
-async function mcpReply(response, id) {
-  const text = await response.text();
-  let message = null;
-  if ((response.headers.get("content-type") || "").includes("text/event-stream")) {
-    for (const chunk of text.split("\n\n")) {
-      const data = chunk
-        .split("\n")
-        .filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice(5).trim())
-        .join("");
-      if (!data) continue;
-      try {
-        const parsed = JSON.parse(data);
-        if (parsed.id === id) message = parsed;
-      } catch {
-        /* a keep-alive, or a notification mid-stream */
-      }
-    }
-  } else if (text) {
-    message = JSON.parse(text);
-  }
-  if (!message) throw new Error("Notion's MCP server sent nothing back");
-  if (message.error) throw new Error(String(message.error.message || "Notion refused the request"));
-  return message.result;
-}
-
-const authRefused = () => Object.assign(new Error("Notion refused the token"), { code: 401 });
-
-async function mcpInitialize(access) {
-  const id = notionSeq++;
-  const response = await mcpPost(access, {
-    jsonrpc: "2.0",
-    id,
-    method: "initialize",
-    params: {
-      protocolVersion: "2025-06-18",
-      capabilities: {},
-      clientInfo: { name: "Bedrock", version: app.getVersion() },
-    },
-  });
-  if (response.status === 401) throw authRefused();
-  if (!response.ok) throw new Error(`Notion said ${response.status}`);
-  const session = response.headers.get("mcp-session-id");
-  await mcpReply(response, id);
-  await mcpPost(access, { jsonrpc: "2.0", method: "notifications/initialized" }, session).catch(() => {});
-  return session;
-}
-
-/** A dead token is refreshed once; a dead session is reopened once. Then it throws. */
-async function notionCall(method, params) {
-  let account = readNotion();
-  if (!account) throw new Error("Notion is not linked — Settings → Integrations → Notion");
-  for (let attempt = 0; ; attempt++) {
-    try {
-      if (!notionSession) notionSession = { id: await mcpInitialize(account.access) };
-      const id = notionSeq++;
-      const response = await mcpPost(account.access, { jsonrpc: "2.0", id, method, params }, notionSession.id);
-      if (response.status === 401) throw authRefused();
-      if (response.status === 404) {
-        // The server let the session go; the next round opens a fresh one.
-        notionSession = null;
-        if (attempt < 2) continue;
-        throw new Error("Notion kept dropping the connection");
-      }
-      if (!response.ok) throw new Error(`Notion said ${response.status}`);
-      return await mcpReply(response, id);
-    } catch (err) {
-      if (err && err.code === 401 && attempt < 1 && account.refresh) {
-        account = await notionRefresh(account);
-        notionSession = null;
-        continue;
-      }
-      if (err && err.code === 401) {
-        throw new Error("Notion signed this app out — link the workspace again");
-      }
-      throw err;
-    }
-  }
-}
-
-async function notionRefresh(account) {
-  const meta = await (await net.fetch(NOTION_META)).json();
-  const response = await net.fetch(meta.token_endpoint, {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "refresh_token",
-      refresh_token: account.refresh,
-      client_id: account.clientId,
-      resource: NOTION_RESOURCE,
-    }).toString(),
-  });
-  if (!response.ok) throw new Error("Notion signed this app out — link the workspace again");
-  const tokens = await response.json();
-  const next = {
-    ...account,
-    access: String(tokens.access_token || ""),
-    refresh: String(tokens.refresh_token || account.refresh),
-  };
-  writeNotion(next);
-  return next;
-}
-
 /**
- * Which name a tool answers to today. The server's own list is the authority — Notion
- * has renamed its tools once already, and a hardcoded name would break on the next.
+ * One MCP server, linked and spoken to. `spec`: `name` (how it is called in messages),
+ * `mcp` (the endpoint), `meta` (its OAuth discovery document), `resource` (what the token
+ * is minted for), `file` (the token file under userData), an optional `scope` to ask for,
+ * and an optional `describe(call, tool)` that names the account once linked — for a
+ * server whose token response does not say whose it is.
  */
-async function notionTool(candidates) {
-  if (!notionTools) {
-    const listed = await notionCall("tools/list", {});
-    notionTools = (listed && listed.tools ? listed.tools : []).map((tool) => String(tool.name));
-  }
-  for (const name of candidates) if (notionTools.includes(name)) return name;
-  const loose = notionTools.find((name) => candidates.some((want) => name.includes(want)));
-  if (loose) return loose;
-  throw new Error(`Notion's MCP server offers no ${candidates[0]} tool any more`);
+function remoteMcp(spec) {
+  const file = () => path.join(app.getPath("userData"), spec.file);
+
+  const read = () => {
+    try {
+      const stored = JSON.parse(fs.readFileSync(file(), "utf8"));
+      if (typeof stored.access !== "string") return null;
+      return {
+        access: unseal(stored.access),
+        refresh: typeof stored.refresh === "string" && stored.refresh ? unseal(stored.refresh) : "",
+        clientId: typeof stored.clientId === "string" ? stored.clientId : "",
+        workspace: typeof stored.workspace === "string" ? stored.workspace : "",
+      };
+    } catch {
+      return null; // never linked, or the keychain refused — both mean "not linked"
+    }
+  };
+
+  const write = (account) => {
+    fs.mkdirSync(path.dirname(file()), { recursive: true });
+    fs.writeFileSync(
+      file(),
+      JSON.stringify({
+        version: 1,
+        access: seal(account.access),
+        refresh: account.refresh ? seal(account.refresh) : "",
+        clientId: account.clientId,
+        workspace: account.workspace,
+      }),
+      { mode: 0o600 },
+    );
+  };
+
+  /** The MCP conversation this run has open: its session id, the tool list, a call counter. */
+  let session = null;
+  let tools = null;
+  let seq = 1;
+  let connecting = null;
+
+  const drop = () => {
+    session = null;
+    tools = null;
+  };
+
+  /** One JSON-RPC message over. 401 comes back as a coded error, so a refresh can catch it. */
+  const post = (access, message, sessionId) => {
+    const headers = {
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+      authorization: `Bearer ${access}`,
+      "mcp-protocol-version": "2025-06-18",
+    };
+    if (sessionId) headers["mcp-session-id"] = sessionId;
+    return net.fetch(spec.mcp, { method: "POST", headers, body: JSON.stringify(message) });
+  };
+
+  /** The reply, whichever coat it wears — plain JSON, or an SSE stream holding one. */
+  const reply = async (response, id) => {
+    const text = await response.text();
+    let message = null;
+    if ((response.headers.get("content-type") || "").includes("text/event-stream")) {
+      for (const chunk of text.split("\n\n")) {
+        const data = chunk
+          .split("\n")
+          .filter((line) => line.startsWith("data:"))
+          .map((line) => line.slice(5).trim())
+          .join("");
+        if (!data) continue;
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.id === id) message = parsed;
+        } catch {
+          /* a keep-alive, or a notification mid-stream */
+        }
+      }
+    } else if (text) {
+      message = JSON.parse(text);
+    }
+    if (!message) throw new Error(`${spec.name}'s MCP server sent nothing back`);
+    if (message.error) throw new Error(String(message.error.message || `${spec.name} refused the request`));
+    return message.result;
+  };
+
+  const refused = () => Object.assign(new Error(`${spec.name} refused the token`), { code: 401 });
+
+  const initialize = async (access) => {
+    const id = seq++;
+    const response = await post(access, {
+      jsonrpc: "2.0",
+      id,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-06-18",
+        capabilities: {},
+        clientInfo: { name: "Bedrock", version: app.getVersion() },
+      },
+    });
+    if (response.status === 401) throw refused();
+    if (!response.ok) throw new Error(`${spec.name} said ${response.status}`);
+    const opened = response.headers.get("mcp-session-id");
+    await reply(response, id);
+    await post(access, { jsonrpc: "2.0", method: "notifications/initialized" }, opened).catch(() => {});
+    return opened;
+  };
+
+  const refresh = async (account) => {
+    const meta = await (await net.fetch(spec.meta)).json();
+    const response = await net.fetch(meta.token_endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: account.refresh,
+        client_id: account.clientId,
+        resource: spec.resource,
+      }).toString(),
+    });
+    if (!response.ok) throw new Error(`${spec.name} signed this app out — link it again`);
+    const tokens = await response.json();
+    const next = {
+      ...account,
+      access: String(tokens.access_token || ""),
+      refresh: String(tokens.refresh_token || account.refresh),
+    };
+    write(next);
+    return next;
+  };
+
+  /** A dead token is refreshed once; a dead session is reopened once. Then it throws. */
+  const call = async (method, params) => {
+    let account = read();
+    if (!account) throw new Error(`${spec.name} is not linked — Settings → Integrations → ${spec.name}`);
+    for (let attempt = 0; ; attempt++) {
+      try {
+        if (!session) session = { id: await initialize(account.access) };
+        const id = seq++;
+        const response = await post(account.access, { jsonrpc: "2.0", id, method, params }, session.id);
+        if (response.status === 401) throw refused();
+        if (response.status === 404) {
+          // The server let the session go; the next round opens a fresh one.
+          session = null;
+          if (attempt < 2) continue;
+          throw new Error(`${spec.name} kept dropping the connection`);
+        }
+        if (!response.ok) throw new Error(`${spec.name} said ${response.status}`);
+        return await reply(response, id);
+      } catch (err) {
+        if (err && err.code === 401 && attempt < 1 && account.refresh) {
+          account = await refresh(account);
+          session = null;
+          continue;
+        }
+        if (err && err.code === 401) {
+          throw new Error(`${spec.name} signed this app out — link it again`);
+        }
+        throw err;
+      }
+    }
+  };
+
+  /**
+   * Which name a tool answers to today. The server's own list is the authority — Notion
+   * has renamed its tools once already, and a hardcoded name would break on the next.
+   */
+  const tool = async (candidates) => {
+    if (!tools) {
+      const listed = await call("tools/list", {});
+      tools = (listed && listed.tools ? listed.tools : []).map((entry) => String(entry.name));
+    }
+    for (const name of candidates) if (tools.includes(name)) return name;
+    const loose = tools.find((name) => candidates.some((want) => name.includes(want)));
+    if (loose) return loose;
+    throw new Error(`${spec.name}'s MCP server offers no ${candidates[0]} tool any more`);
+  };
+
+  const connect = async () => {
+    const meta = await (await net.fetch(spec.meta)).json();
+
+    // The loopback catcher first, so registration can promise the exact redirect URI.
+    const server = http.createServer();
+    await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const port = server.address().port;
+    const redirect = `http://127.0.0.1:${port}/callback`;
+
+    try {
+      const registered = await net.fetch(meta.registration_endpoint, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          client_name: "Bedrock",
+          redirect_uris: [redirect],
+          grant_types: ["authorization_code", "refresh_token"],
+          response_types: ["code"],
+          token_endpoint_auth_method: "none",
+        }),
+      });
+      if (!registered.ok) throw new Error(`${spec.name} would not register this app (${registered.status})`);
+      const clientId = String((await registered.json()).client_id || "");
+
+      const verifier = b64url(crypto.randomBytes(32));
+      const state = b64url(crypto.randomBytes(16));
+      const authUrl = new URL(meta.authorization_endpoint);
+      authUrl.search = new URLSearchParams({
+        response_type: "code",
+        client_id: clientId,
+        redirect_uri: redirect,
+        state,
+        code_challenge: b64url(crypto.createHash("sha256").update(verifier).digest()),
+        code_challenge_method: "S256",
+        resource: spec.resource,
+        ...(spec.scope ? { scope: spec.scope } : {}),
+      }).toString();
+
+      const code = await new Promise((resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error("the browser never came back — try linking again")),
+          5 * 60 * 1000,
+        );
+        server.on("request", (request, response) => {
+          const url = new URL(request.url, `http://127.0.0.1:${port}`);
+          if (url.pathname !== "/callback") {
+            response.writeHead(404).end();
+            return;
+          }
+          response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+          response.end(
+            `<body style='font:15px system-ui;padding:3em;color:#333'>Bedrock is connected to ${spec.name} — this tab can close.</body>`,
+          );
+          clearTimeout(timer);
+          if (url.searchParams.get("error")) {
+            reject(new Error(url.searchParams.get("error_description") || "you said no in the browser"));
+          } else if (url.searchParams.get("state") !== state) {
+            reject(new Error("the browser came back with somebody else's answer"));
+          } else {
+            resolve(String(url.searchParams.get("code") || ""));
+          }
+        });
+        void shell.openExternal(authUrl.toString());
+      });
+
+      const exchanged = await net.fetch(meta.token_endpoint, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          redirect_uri: redirect,
+          client_id: clientId,
+          code_verifier: verifier,
+          resource: spec.resource,
+        }).toString(),
+      });
+      if (!exchanged.ok) throw new Error(`${spec.name} would not trade the code for a token (${exchanged.status})`);
+      const tokens = await exchanged.json();
+      const account = {
+        access: String(tokens.access_token || ""),
+        refresh: String(tokens.refresh_token || ""),
+        clientId,
+        // Notion's token responses have always named the workspace they are for; if this
+        // one does not, the page says "linked" and no more — decoration, never a failure.
+        workspace: String(tokens.workspace_name || ""),
+      };
+      if (!account.access) throw new Error(`${spec.name} sent no token back`);
+      write(account);
+      drop();
+      if (!account.workspace && spec.describe) {
+        // Asked of the server itself, once linked — and a server that will not say is
+        // still linked. The name is decoration on the settings page, nothing more.
+        account.workspace = await spec.describe(call, tool).catch(() => "");
+        if (account.workspace) write(account);
+      }
+      return { workspace: account.workspace };
+    } finally {
+      server.close();
+    }
+  };
+
+  return {
+    read,
+    call,
+    tool,
+    /** One connect at a time: a second click while the browser is open joins the first. */
+    connect: () => {
+      if (!connecting) {
+        connecting = connect().finally(() => {
+          connecting = null;
+        });
+      }
+      return connecting;
+    },
+    status: () => {
+      const account = read();
+      return account ? { linked: true, workspace: account.workspace } : { linked: false, workspace: "" };
+    },
+    forget: () => {
+      try {
+        fs.rmSync(file());
+      } catch {
+        /* nothing stored */
+      }
+      drop();
+      return true;
+    },
+  };
 }
+
+/** What a failed tool run said, or null — MCP wraps tool errors in an ordinary result. */
+function toolTrouble(result, name = "The server") {
+  if (!result || !result.isError) return null;
+  const text = ((result.content || []).find((part) => part.type === "text") || {}).text;
+  return new Error(String(text || `${name} refused the request`).slice(0, 300));
+}
+
+/** The text parts of a tool result, in order — what a server that answers in prose said. */
+const toolTexts = (result) =>
+  ((result && result.content) || [])
+    .filter((part) => part.type === "text" && typeof part.text === "string")
+    .map((part) => part.text);
+
+/*
+ * Notion. Page notes point at pages in a workspace; the server's own tools search, list
+ * and make them, and the address a page answers to is what the note keeps.
+ */
+const notion = remoteMcp({
+  name: "Notion",
+  mcp: "https://mcp.notion.com/mcp",
+  meta: "https://mcp.notion.com/.well-known/oauth-authorization-server",
+  resource: "https://mcp.notion.com",
+  file: "notion.json",
+});
 
 /**
  * Every page a tool result mentions, however the server chose to say it — structured
@@ -3053,12 +3227,8 @@ function notionPages(result) {
     }
     for (const value of Object.values(node)) if (value && typeof value === "object") walk(value);
   };
-  const texts = [];
   if (result && result.structuredContent) walk(result.structuredContent);
-  for (const part of (result && result.content) || []) {
-    if (part.type === "text" && typeof part.text === "string") texts.push(part.text);
-  }
-  for (const text of texts) {
+  for (const text of toolTexts(result)) {
     try {
       walk(JSON.parse(text));
       continue;
@@ -3076,275 +3246,35 @@ function notionPages(result) {
   return [...found.values()];
 }
 
-/** What a failed tool run said, or null — MCP wraps tool errors in an ordinary result. */
-function toolTrouble(result) {
-  if (!result || !result.isError) return null;
-  const text = ((result.content || []).find((part) => part.type === "text") || {}).text;
-  return new Error(String(text || "Notion refused the request").slice(0, 300));
-}
-
-/** One connect at a time: a second click while the browser is open joins the first. */
-let notionConnecting = null;
-
-async function notionConnect() {
-  const meta = await (await net.fetch(NOTION_META)).json();
-
-  // The loopback catcher first, so registration can promise the exact redirect URI.
-  const server = http.createServer();
-  await new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  const port = server.address().port;
-  const redirect = `http://127.0.0.1:${port}/callback`;
-
-  try {
-    const registered = await net.fetch(meta.registration_endpoint, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        client_name: "Bedrock",
-        redirect_uris: [redirect],
-        grant_types: ["authorization_code", "refresh_token"],
-        response_types: ["code"],
-        token_endpoint_auth_method: "none",
-      }),
-    });
-    if (!registered.ok) throw new Error(`Notion would not register this app (${registered.status})`);
-    const clientId = String((await registered.json()).client_id || "");
-
-    const verifier = b64url(crypto.randomBytes(32));
-    const state = b64url(crypto.randomBytes(16));
-    const authUrl = new URL(meta.authorization_endpoint);
-    authUrl.search = new URLSearchParams({
-      response_type: "code",
-      client_id: clientId,
-      redirect_uri: redirect,
-      state,
-      code_challenge: b64url(crypto.createHash("sha256").update(verifier).digest()),
-      code_challenge_method: "S256",
-      resource: NOTION_RESOURCE,
-    }).toString();
-
-    const code = await new Promise((resolve, reject) => {
-      const timer = setTimeout(
-        () => reject(new Error("the browser never came back — try linking again")),
-        5 * 60 * 1000,
-      );
-      server.on("request", (request, response) => {
-        const url = new URL(request.url, `http://127.0.0.1:${port}`);
-        if (url.pathname !== "/callback") {
-          response.writeHead(404).end();
-          return;
-        }
-        response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-        response.end(
-          "<body style='font:15px system-ui;padding:3em;color:#333'>Bedrock is connected to Notion — this tab can close.</body>",
-        );
-        clearTimeout(timer);
-        if (url.searchParams.get("error")) {
-          reject(new Error(url.searchParams.get("error_description") || "you said no in the browser"));
-        } else if (url.searchParams.get("state") !== state) {
-          reject(new Error("the browser came back with somebody else's answer"));
-        } else {
-          resolve(String(url.searchParams.get("code") || ""));
-        }
-      });
-      void shell.openExternal(authUrl.toString());
-    });
-
-    const exchanged = await net.fetch(meta.token_endpoint, {
-      method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        grant_type: "authorization_code",
-        code,
-        redirect_uri: redirect,
-        client_id: clientId,
-        code_verifier: verifier,
-        resource: NOTION_RESOURCE,
-      }).toString(),
-    });
-    if (!exchanged.ok) throw new Error(`Notion would not trade the code for a token (${exchanged.status})`);
-    const tokens = await exchanged.json();
-    const account = {
-      access: String(tokens.access_token || ""),
-      refresh: String(tokens.refresh_token || ""),
-      clientId,
-      // Notion's token responses have always named the workspace they are for; if this
-      // one does not, the page says "linked" and no more — decoration, never a failure.
-      workspace: String(tokens.workspace_name || ""),
-    };
-    if (!account.access) throw new Error("Notion sent no token back");
-    writeNotion(account);
-    notionSession = null;
-    notionTools = null;
-    return { workspace: account.workspace };
-  } finally {
-    server.close();
-  }
-}
-
-ipcMain.handle("notion-connect", () => {
-  if (!notionConnecting) {
-    notionConnecting = notionConnect().finally(() => {
-      notionConnecting = null;
-    });
-  }
-  return notionConnecting;
-});
-
-ipcMain.handle("notion-status", () => {
-  const account = readNotion();
-  return account ? { linked: true, workspace: account.workspace } : { linked: false, workspace: "" };
-});
-
-ipcMain.handle("notion-forget", () => {
-  try {
-    fs.rmSync(notionFile());
-  } catch {
-    /* nothing stored */
-  }
-  notionSession = null;
-  notionTools = null;
-  return true;
-});
+ipcMain.handle("notion-connect", () => notion.connect());
+ipcMain.handle("notion-status", () => notion.status());
+ipcMain.handle("notion-forget", () => notion.forget());
 
 ipcMain.handle("notion-search", async (_event, rawQuery) => {
   const query = String(rawQuery ?? "").trim();
   // An empty query means "what have I been in lately", and the server has a tool that
   // answers exactly that — searching for nothing answers with nothing.
   const request = query
-    ? { tool: await notionTool(["notion-search", "search"]), args: { query } }
-    : { tool: await notionTool(["notion-list-recent-pages", "list-recent"]), args: { limit: 40 } };
-  const result = await notionCall("tools/call", { name: request.tool, arguments: request.args });
-  const trouble = toolTrouble(result);
+    ? { tool: await notion.tool(["notion-search", "search"]), args: { query } }
+    : { tool: await notion.tool(["notion-list-recent-pages", "list-recent"]), args: { limit: 40 } };
+  const result = await notion.call("tools/call", { name: request.tool, arguments: request.args });
+  const trouble = toolTrouble(result, "Notion");
   if (trouble) throw trouble;
   return notionPages(result).slice(0, 40);
 });
 
 ipcMain.handle("notion-create", async (_event, rawTitle) => {
   const title = String(rawTitle ?? "").trim() || "Untitled";
-  const tool = await notionTool(["notion-create-pages", "create-pages", "create-page"]);
-  const result = await notionCall("tools/call", {
+  const tool = await notion.tool(["notion-create-pages", "create-pages", "create-page"]);
+  const result = await notion.call("tools/call", {
     name: tool,
     arguments: { pages: [{ properties: { title } }] },
   });
-  const trouble = toolTrouble(result);
+  const trouble = toolTrouble(result, "Notion");
   if (trouble) throw trouble;
   const page = notionPages(result)[0];
   if (!page) throw new Error("Notion answered, but named no page it made");
   return { ...page, title: page.title || title };
-});
-
-/*
- * Microsoft Word. A document is a FILE — unlike a board or an Apple note, it lives on
- * the disk, not inside the app — so the pointer a note keeps is a path, and opening is
- * just handing that path to Word. What the app itself is asked for, over the AppleScript
- * dictionary it has carried for decades: making a document and saving it (one Automation
- * Allow click, macOS's, the first time). The recent list costs no launch at all: Word
- * writes it beside its own preferences, in a plist this shell can read directly.
- */
-const WORD_APP = "/Applications/Microsoft Word.app";
-const WORD_RECENTS = path.join(
-  os.homedir(),
-  "Library/Containers/com.microsoft.Word/Data/Library/Preferences/com.microsoft.Word.securebookmarks.plist",
-);
-
-/** Where new documents land when the vault has not said: made on first use, not before. */
-const wordDefaultFolder = () => path.join(os.homedir(), "Documents", "word-bedrock");
-
-/** The same reader Freeform's index gets: osascript's JavaScript, which alone among the
-    always-there tools reads a binary plist whole, dates included. */
-const WORD_RECENT_LIST = `
-ObjC.import("Foundation");
-const dict = ObjC.deepUnwrap($.NSDictionary.dictionaryWithContentsOfFile(${JSON.stringify(WORD_RECENTS)})) || {};
-const out = [];
-for (const key in dict) {
-  if (!key.startsWith("file://")) continue;
-  const file = decodeURIComponent(key.replace(/^file:\\/\\//, ""));
-  if (!/\\.(docx?|docm|rtf)$/i.test(file)) continue;
-  const at = dict[key] && dict[key].kLastUsedDateKey instanceof Date ? dict[key].kLastUsedDateKey.getTime() : 0;
-  out.push({ path: file, at });
-}
-out.sort((a, b) => b.at - a.at);
-JSON.stringify(out);`;
-
-/** The path arrives as argv, never spliced into the script — a path is not code. No
-    file format named on the save: modern Word's default IS .docx. */
-const WORD_CREATE = `
-on run argv
-  set docPath to item 1 of argv
-  tell application "Microsoft Word"
-    set newDoc to make new document
-    save as newDoc file name docPath
-    activate
-  end tell
-end run`;
-
-/** What a refusal actually means, said in directions rather than a code. */
-function wordError(err) {
-  const said = String((err && err.message) || err);
-  if (said.includes("-1743") || /not authori[sz]ed/i.test(said)) {
-    return new Error(
-      "macOS is keeping Bedrock away from Word — System Settings → Privacy & Security → Automation → Bedrock → Microsoft Word",
-    );
-  }
-  return new Error(said.trim() || "Word did not answer");
-}
-
-/** A document's name off its path: the basename, extension shed. */
-const docTitle = (file) => path.basename(file).replace(/\.[^.]+$/, "");
-
-ipcMain.handle("word-status", () => ({
-  app: process.platform === "darwin" && fs.existsSync(WORD_APP),
-}));
-
-ipcMain.handle("word-recent", async (_event, limit = 30) => {
-  try {
-    const raw = await command("osascript", ["-l", "JavaScript", "-e", WORD_RECENT_LIST]);
-    return JSON.parse(raw || "[]")
-      .filter((doc) => fs.existsSync(doc.path)) // a recent that moved is not a thing to link
-      .slice(0, Math.max(1, Number(limit) || 30))
-      .map((doc) => ({ ...doc, title: docTitle(doc.path) }));
-  } catch {
-    return []; // no Word yet, or an empty container — both mean "nothing to offer"
-  }
-});
-
-ipcMain.handle("word-create", async (_event, rawFolder, rawTitle) => {
-  const folder = String(rawFolder || "").trim() || wordDefaultFolder();
-  const title = (String(rawTitle ?? "").trim() || "Untitled").replace(/[/:]/g, "-");
-  try {
-    fs.mkdirSync(folder, { recursive: true });
-  } catch (err) {
-    throw new Error(`that folder cannot be made — ${String(err.message || err)}`);
-  }
-  let target = path.join(folder, `${title}.docx`);
-  for (let n = 2; fs.existsSync(target); n++) target = path.join(folder, `${title} ${n}.docx`);
-  try {
-    await command("osascript", ["-e", WORD_CREATE, target]);
-  } catch (err) {
-    throw wordError(err);
-  }
-  // Word resolving the save is the promise; the file is the proof. Its sandbox can
-  // refuse a folder without saying so out loud, and a note must not point at nothing.
-  if (!fs.existsSync(target)) {
-    throw new Error(
-      "Word ran, but no document appeared — its own file-access dialog may be waiting behind a window",
-    );
-  }
-  return { path: target, title: docTitle(target), at: Date.now() };
-});
-
-ipcMain.handle("word-open", async (_event, rawPath) => {
-  const target = String(rawPath || "");
-  if (!path.isAbsolute(target)) return "missing";
-  if (!fs.existsSync(target)) return "missing";
-  // `open -a` rather than the default-app route: a .docx whose double-click belongs to
-  // Pages must still open in Word from a Word node.
-  await command("open", ["-a", WORD_APP, target]);
-  return "opened";
 });
 
 ipcMain.handle("notion-open", (_event, rawUrl) => {
@@ -3362,6 +3292,172 @@ ipcMain.handle("notion-open", (_event, rawUrl) => {
       ? `notion://www.notion.so/${id}`
       : `https://www.notion.so/${id}`
     : url;
+  void shell.openExternal(target);
+  return true;
+});
+
+/*
+ * Granola. A meeting note is a pointer at a meeting Granola took notes of — and, unlike
+ * every other pointer here, a COPY of the words: the summarised notes come down with the
+ * pointer and go into the note's body, so the graph can show what was said without
+ * asking the server every time. Nothing is ever made in Granola from here — there is no
+ * making a meeting — so the flow is read-only: list, fetch, open.
+ *
+ * Granola's own MCP server, the same door Notion opened: OAuth with dynamic client
+ * registration, and the server's own tools (list_meetings, get_meetings).
+ */
+const granola = remoteMcp({
+  name: "Granola",
+  mcp: "https://mcp.granola.ai/mcp",
+  meta: "https://mcp.granola.ai/.well-known/oauth-authorization-server",
+  // What the protected-resource document names as the resource, and the one scope it lists.
+  resource: "https://mcp.granola.ai/mcp",
+  scope: "mcp",
+  file: "granola.json",
+  describe: async (call, tool) => {
+    const result = await call("tools/call", { name: await tool(["get_account_info", "account"]), arguments: {} });
+    const said = toolTexts(result).join("\n");
+    const email = /[\w.+-]+@[\w-]+\.[\w.-]+/.exec(said);
+    return email ? email[0] : "";
+  },
+});
+
+const GRANOLA_NOTE_URL = "https://notes.granola.ai/d/";
+const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+
+/** The five entities the server escapes inside attributes and text, undone. */
+const unescapeXml = (text) =>
+  String(text)
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
+    .replace(/&amp;/g, "&");
+
+/** The attributes of one opening tag — `id="…" title="…"` — as an object. */
+const attributesOf = (tag) => {
+  const found = {};
+  for (const m of tag.matchAll(/([a-z_]+)="([^"]*)"/g)) found[m[1]] = unescapeXml(m[2]);
+  return found;
+};
+
+/** The epoch millis a date attribute spells ("Sep 11, 2026 7:07 PM GMT+3"), or 0. */
+const epochOf = (value) => {
+  const parsed = typeof value === "string" ? Date.parse(value) : NaN;
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+
+/**
+ * Every meeting a tool result mentions. The server writes XML-ish text: a
+ * `<meetings_data>` holding one `<meeting id title date …>` per meeting, with the
+ * participants and (from `get_meetings`) a `<summary>` of markdown inside it. The
+ * envelope's notice about treating the words as data is exactly right, and is the
+ * reason this reads tags rather than trusting anything the text says.
+ */
+function granolaMeetings(result) {
+  const found = new Map();
+  const text = toolTexts(result).join("\n");
+  for (const m of text.matchAll(/<meeting\s([^>]*)>([\s\S]*?)(?=<meeting\s|<\/meetings_data>|$)/g)) {
+    const at = attributesOf(m[1]);
+    const id = String(at.id || "").toLowerCase();
+    if (!UUID_RE.test(id) || found.has(id)) continue;
+    const body = m[2];
+    const people = /<known_participants>([\s\S]*?)<\/known_participants>/.exec(body);
+    const attendees = people
+      ? unescapeXml(people[1])
+          .split("\n")
+          .map((line) => line.trim())
+          .filter(Boolean)
+          // "Arsenii Chistiakov (note creator) from Parasition <a@b>" — the name is what a
+          // note should say; the role, company and address are the server's bookkeeping.
+          .map((line) => line.replace(/\s*<[^>]*>\s*$/, "").replace(/\s*\((note creator|organi[sz]er)\)/i, "").replace(/\s+from\s+.*$/, "").trim())
+          .filter(Boolean)
+      : [];
+    const summary = /<summary>([\s\S]*?)<\/summary>/.exec(body);
+    found.set(id, {
+      id,
+      title: String(at.title || ""),
+      at: epochOf(at.date),
+      url: GRANOLA_NOTE_URL + id,
+      attendees,
+      notes: summary ? unescapeXml(summary[1]).replace(/\\~/g, "~").trim() : "",
+    });
+  }
+  return [...found.values()].sort((a, b) => b.at - a.at);
+}
+
+ipcMain.handle("granola-connect", () => granola.connect());
+ipcMain.handle("granola-status", () => granola.status());
+ipcMain.handle("granola-forget", () => granola.forget());
+
+/** The last 30 days of meetings — the widest window the server's list tool offers. */
+ipcMain.handle("granola-list", async () => {
+  const tool = await granola.tool(["list_meetings", "list-meetings", "meetings"]);
+  const result = await granola.call("tools/call", { name: tool, arguments: { time_range: "last_30_days" } });
+  const trouble = toolTrouble(result, "Granola");
+  if (trouble) throw trouble;
+  return granolaMeetings(result).map(({ id, title, at, url }) => ({ id, title, at, url }));
+});
+
+ipcMain.handle("granola-get", async (_event, rawId) => {
+  const id = String(rawId || "").trim().toLowerCase();
+  if (!UUID_RE.test(id)) throw new Error("that is not a Granola meeting id");
+  const tool = await granola.tool(["get_meetings", "get-meetings", "get_meeting"]);
+  const result = await granola.call("tools/call", { name: tool, arguments: { meeting_ids: [id] } });
+  const trouble = toolTrouble(result, "Granola");
+  if (trouble) throw trouble;
+  const note = granolaMeetings(result).find((meeting) => meeting.id === id);
+  if (!note) throw new Error("Granola answered, but said nothing about that meeting");
+  return note;
+});
+
+/**
+ * Every note standing for meeting `id` in any vault under the base folder — the whole
+ * system of vaults, not just the one asking. A meeting attached into a second vault
+ * brings only the sections nobody has assigned or deleted in the copies that already
+ * exist, and this is how the renderer learns what those copies say. Files are read
+ * whole (they are small), hidden folders and node_modules skipped, as the index does.
+ */
+ipcMain.handle("granola-copies", (_event, rawId) => {
+  const id = String(rawId || "").trim().toLowerCase();
+  if (!UUID_RE.test(id)) return [];
+  const mark = new RegExp(`^meeting::\\s*${id}\\s*$`, "im");
+  const copies = [];
+  const walk = (dir, depth) => {
+    if (depth > 12) return;
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full, depth + 1);
+      } else if (/\.md$/i.test(entry.name)) {
+        try {
+          if (fs.statSync(full).size > 512 * 1024) continue;
+          const text = fs.readFileSync(full, "utf8");
+          if (/^type::\s*granola\s*$/im.test(text) && mark.test(text)) copies.push({ path: full, text });
+        } catch {
+          /* unreadable: not a copy anybody can use */
+        }
+      }
+    }
+  };
+  walk(baseDir(), 0);
+  return copies;
+});
+
+ipcMain.handle("granola-open", (_event, rawUrl) => {
+  const url = String(rawUrl || "");
+  // The note's own address, or a bare id — both open the note on Granola's site, which
+  // hands it to the desktop app when there is one.
+  const target = UUID_RE.test(url) && !/^https?:/.test(url) ? GRANOLA_NOTE_URL + url : url;
+  if (!/^https:\/\/([a-z0-9-]+\.)?granola\.ai\//.test(target)) return false;
   void shell.openExternal(target);
   return true;
 });

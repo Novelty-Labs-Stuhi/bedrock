@@ -1398,6 +1398,36 @@ button.twisty:hover {
   display: none;
 }
 
+/* A hovered leaf's section, beside the ring on the side away from its meeting. */
+.leaf-tip {
+  position: absolute;
+  z-index: 6;
+  width: max-content;
+  max-width: 300px;
+  transform: translateY(-50%);
+  padding: 0.5em 0.7em 0.6em;
+  border: 1px solid #33353b;
+  border-radius: 0.45em;
+  background: #191a1f;
+  box-shadow: 0 0.5em 1.5em rgba(0, 0, 0, 0.5);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.4;
+  pointer-events: none;
+}
+
+.leaf-tip-title {
+  margin-bottom: 0.35em;
+  font-weight: 600;
+}
+
+.leaf-tip-body {
+  max-height: 16em;
+  overflow: hidden;
+  white-space: pre-wrap;
+  opacity: 0.82;
+}
+
 /* The selection rectangle a drag on empty canvas draws. */
 .lasso-rect {
   position: absolute;
