@@ -22,6 +22,7 @@ export type Feature =
   | "active"
   | "freeform"
   | "notion"
+  | "granola"
   | "slack"
   | "google"
   | "applenotes"
@@ -48,6 +49,7 @@ const DEFAULTS: Record<Feature, boolean> = {
   active: false,
   freeform: false,
   notion: false,
+  granola: false,
   slack: false,
   google: false,
   applenotes: false,
@@ -551,6 +553,11 @@ const INTEGRATIONS: Row[] = [
     feature: "notion",
     name: "Notion",
     what: "page notes — link Notion pages and make new ones from here (desktop app)",
+  },
+  {
+    feature: "granola",
+    name: "Granola",
+    what: "meeting notes — attach a meeting Granola took notes of; the notes come along, and a click opens it in Granola (desktop app)",
   },
   {
     feature: "slack",

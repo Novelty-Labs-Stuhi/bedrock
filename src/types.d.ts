@@ -181,6 +181,21 @@ interface Window {
         False for an address that is not Notion's. */
     notionOpen(url: string): Promise<boolean>;
 
+    /** Links a Granola account the way Notion is linked: OAuth in the real browser, the
+        token into the OS keychain. `account` is the email the server names, or "". */
+    granolaConnect(): Promise<{ workspace: string }>;
+    granolaStatus(): Promise<{ linked: boolean; workspace: string }>;
+    granolaForget(): Promise<boolean>;
+    /** The last 30 days of meetings Granola has notes of, latest first. */
+    granolaList(): Promise<GranolaMeeting[]>;
+    /** One meeting, notes and all — the words go into the note here. */
+    granolaGet(id: string): Promise<GranolaNote>;
+    /** Every note standing for the meeting in any vault under the base folder, text and all. */
+    granolaCopies(id: string): Promise<Array<{ path: string; text: string }>>;
+    /** Opens THE meeting on Granola's site, which hands it to the app. False for an
+        address that is not Granola's. */
+    granolaOpen(url: string): Promise<boolean>;
+
     /** Whether Microsoft Word is on this Mac — not a system app, so a real question. */
     wordStatus(): Promise<{ app: boolean }>;
     /** Word's own recent documents, latest first, read off the list it keeps beside its
@@ -350,6 +365,23 @@ type IndexedVault = {
 
 /** The system of vaults a folder is part of: the top of it, every note under that, and every vault but the asker's own. */
 type VaultIndex = { top: string; notes: IndexedNote[]; vaults: IndexedVault[] };
+
+/** A meeting Granola took notes of, as its list names it. */
+type GranolaMeeting = {
+  /** The uuid Granola minted — what `get` is asked for and what the note keeps. */
+  id: string;
+  title: string;
+  /** When it happened, epoch milliseconds; 0 when the server did not say. */
+  at: number;
+  /** The note's own address on Granola's site. */
+  url: string;
+};
+
+/** The same meeting, fetched whole: the summarised notes as markdown, and who was there. */
+type GranolaNote = GranolaMeeting & {
+  notes: string;
+  attendees: string[];
+};
 
 /** A Notion page as the pointer Bedrock keeps: never the page itself. */
 type NotionPage = {
