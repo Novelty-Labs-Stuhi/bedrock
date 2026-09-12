@@ -1489,7 +1489,6 @@ button.twisty:hover {
   display: none;
 }
 
-/* A hovered leaf's section, beside the ring on the side away from its meeting. */
 /* The selection rectangle a drag on empty canvas draws. */
 .lasso-rect {
   position: absolute;

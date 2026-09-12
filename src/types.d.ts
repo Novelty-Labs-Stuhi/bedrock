@@ -192,9 +192,7 @@ interface Window {
     /** The last 30 days of meetings Granola has notes of, latest first. */
     granolaList(): Promise<GranolaMeeting[]>;
     /** One meeting, notes and all — the words go into the note here. */
-    granolaGet(id: string): Promise<GranolaNote>;
     /** Every note standing for the meeting in any vault under the base folder, text and all. */
-    granolaCopies(id: string): Promise<Array<{ path: string; text: string }>>;
     /** Opens THE meeting on Granola's site, which hands it to the app. False for an
         address that is not Granola's. */
     granolaOpen(url: string): Promise<boolean>;
@@ -389,12 +387,6 @@ type GranolaMeeting = {
   at: number;
   /** The note's own address on Granola's site. */
   url: string;
-};
-
-/** The same meeting, fetched whole: the summarised notes as markdown, and who was there. */
-type GranolaNote = GranolaMeeting & {
-  notes: string;
-  attendees: string[];
 };
 
 /** A Notion page as the pointer Bedrock keeps: never the page itself. */
