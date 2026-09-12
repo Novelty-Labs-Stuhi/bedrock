@@ -118,9 +118,13 @@ jobs:
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
         # Not `npm run package:mac` — that sources .env, which is gitignored and
         # absent here. The Apple vars above are what notarize-dmg.cjs reads.
+        #
+        # `--mac` with no target named: a target on the command line REPLACES the list in
+        # package.json, and `--mac dmg` built the dmg alone — no zip, so a manifest the
+        # updater could not act on. The dmg and the zip both come from package.json.
         run: |
           npm run build
-          npx electron-builder --mac dmg --publish never
+          npx electron-builder --mac --publish never
 
       - name: Verify the dmg Gatekeeper will actually see
         run: |

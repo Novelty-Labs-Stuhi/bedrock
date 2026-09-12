@@ -20,8 +20,8 @@
     "preview": "vite preview",
     "start": "npm run build && electron .",
     "app": "electron .",
-    "package": "npm run build && electron-builder --mac dmg",
-    "package:mac": "npm run build && set -a && . ./.env && set +a && electron-builder --mac dmg",
+    "package": "npm run build && electron-builder --mac",
+    "package:mac": "npm run build && set -a && . ./.env && set +a && electron-builder --mac",
     "prepare": "npm run build"
   },
   "build": {
