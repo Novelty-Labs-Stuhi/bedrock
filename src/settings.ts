@@ -3,9 +3,11 @@
 //
 // All of it is kept in `.notes/config.json`, beside the layout cache and the stickies:
 // a preference is a property of the vault, so it travels with the folder rather than
-// living in the app. The one thing NOT kept here is a credential — Linear's API key is
-// the shell's business (the OS keychain), deliberately not the vault's, because the
-// commit button snapshots the vault wholesale.
+// living in the app. Since the Bedrock folder came, the folder has a config of its own
+// too, and a vault's holds only what it answers differently — see the layers below. The
+// one thing NOT kept here is a credential — Linear's API key is the shell's business
+// (the OS keychain), deliberately not the vault's, because the commit button snapshots
+// the vault wholesale.
 
 import { swatchRow } from "./node-style";
 import { SIZINGS, type Sizing } from "./scoring";
@@ -316,14 +318,97 @@ const clampDial = (key: "edgeLength" | "nodeSpacing", value: number): number => 
   return Math.round(Math.min(range.max, Math.max(range.min, value)));
 };
 
+/* ------------------------------------------------------------------- layers --- */
+
+/**
+ * The preferences that are answered in two places. The Bedrock folder's own
+ * `.notes/config.json` is what every vault starts from; a vault's config holds only the
+ * answers it gave differently, and falls through to the folder's for the rest. So a look
+ * chosen for all vaults reaches every vault that never said otherwise, and a vault that
+ * did keeps its answer whatever the folder says later. A config written before there
+ * were layers answers every key, which pins the vault to exactly how it was — as it must.
+ *
+ * Setup is not layered: which Slack channel, which git remote, which Linear team are a
+ * vault's connections, not a preference it could inherit.
+ */
+type Prefs = {
+  features: Partial<Record<Feature, boolean>>;
+  look: Partial<Look>;
+  layout: Partial<LayoutPrefs>;
+};
+
+/** Which layer the settings window is writing to: every vault's answers, or this one's. */
+export type Scope = "root" | "vault";
+
+const emptyPrefs = (): Prefs => ({ features: {}, look: {}, layout: {} });
+
+/** The keys a config file actually answers, and nothing for the ones it leaves out. */
+function parsePrefs(parsed: {
+  features?: Record<string, unknown>;
+  look?: Record<string, unknown>;
+  layout?: Record<string, unknown>;
+}): Prefs {
+  const prefs = emptyPrefs();
+  for (const key of Object.keys(DEFAULTS) as Feature[]) {
+    const value = parsed.features?.[key];
+    if (typeof value === "boolean") prefs.features[key] = value;
+  }
+  for (const [was, now] of Object.entries(RENAMED)) {
+    const value = parsed.features?.[was];
+    if (typeof value === "boolean" && prefs.features[now] === undefined) prefs.features[now] = value;
+  }
+  for (const key of ["bg", "node", "edge"] as const) {
+    const value = parsed.look?.[key];
+    if (typeof value === "string") prefs.look[key] = value;
+  }
+  if (typeof parsed.look?.captions === "boolean") prefs.look.captions = parsed.look.captions;
+  const sizing = parsed.layout?.sizing;
+  if (SIZINGS.some((row) => row.key === sizing)) prefs.layout.sizing = sizing as Sizing;
+  for (const key of ["sizeMin", "sizeMax"] as const) {
+    const value = parsed.layout?.[key];
+    if (typeof value === "number" && Number.isFinite(value)) prefs.layout[key] = clampSize(value);
+  }
+  for (const key of ["edgeLength", "nodeSpacing"] as const) {
+    const value = parsed.layout?.[key];
+    if (typeof value === "number" && Number.isFinite(value)) prefs.layout[key] = clampDial(key, value);
+  }
+  const scroll = parsed.layout?.scroll;
+  if (scroll === "zoom" || scroll === "pan") prefs.layout.scroll = scroll;
+  return prefs;
+}
+
+/** A config file's text, parsed if it can be; null for none, empty or broken. */
+async function readConfig(vault: Vault): Promise<Record<string, unknown> | null> {
+  let raw = "";
+  try {
+    raw = await vault.read(CONFIG_FILE);
+  } catch {
+    return null; // no config yet — the defaults are the config
+  }
+  if (!raw.trim()) return null;
+  try {
+    return JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return null; // a corrupt config is a cosmetic loss; the defaults keep the vault usable
+  }
+}
+
+type Resolved = { features: Record<Feature, boolean>; look: Look; layout: LayoutPrefs };
+
 export class SettingsStore {
   private vault: Vault | null = null;
-  private features: Record<Feature, boolean> = { ...DEFAULTS };
-  private looks: Look = { ...LOOK_DEFAULT };
+  /** The Bedrock folder, when the shell knows it and this vault is not it. */
+  private rootVault: Vault | null = null;
+  /** What the Bedrock folder's config answers. Empty in a browser tab, which has no folder. */
+  private root: Prefs = emptyPrefs();
+  /** What this vault answers differently. Every key, for a vault configured before layers. */
+  private over: Prefs = emptyPrefs();
+  /** This vault's connections — never inherited. */
   private setups: Setup = { ...SETUP_DEFAULT };
-  private layouts: LayoutPrefs = { ...LAYOUT_DEFAULT };
+  private writeScope: Scope = "vault";
   private timer: number | undefined;
-  private dirty = false;
+  private dirtyRoot = false;
+  private dirtyVault = false;
   /** Fired after any toggle, so the menu and the canvas follow at once. */
   onChange: (() => void) | null = null;
   /** Fired after any appearance change — only the canvas cares. */
@@ -331,100 +416,144 @@ export class SettingsStore {
   /** Fired after a sizing or scrolling change — again the canvas's business alone. */
   onLayout: (() => void) | null = null;
 
-  /** Reads this vault's config, after flushing any owed to the previous one. */
-  async attach(vault: Vault): Promise<void> {
+  /**
+   * Reads this vault's config over the Bedrock folder's, after flushing any owed to the
+   * previous pair. `root` is the folder as a vault, or null when there is none to read
+   * (a browser tab) or this vault IS the folder.
+   */
+  async attach(vault: Vault, root: Vault | null = null): Promise<void> {
     await this.flush();
     this.vault = vault;
-    this.features = { ...DEFAULTS };
-    this.looks = { ...LOOK_DEFAULT };
+    this.rootVault = root;
+    this.root = emptyPrefs();
+    this.over = emptyPrefs();
     this.setups = { ...SETUP_DEFAULT };
-    this.layouts = { ...LAYOUT_DEFAULT };
-    let raw = "";
-    try {
-      raw = await vault.read(CONFIG_FILE);
-    } catch {
-      return; // no config yet — the defaults are the config
+    this.writeScope = "vault";
+    if (root) {
+      const parsed = await readConfig(root);
+      if (parsed) this.root = parsePrefs(parsed as never);
     }
-    if (!raw.trim()) return;
-    try {
-      const parsed = JSON.parse(raw) as {
-        features?: Record<string, unknown>;
-        look?: Record<string, unknown>;
-        setup?: Record<string, unknown>;
-        layout?: Record<string, unknown>;
-        claude?: { folder?: unknown };
-      };
-      for (const key of Object.keys(DEFAULTS) as Feature[]) {
-        const value = parsed.features?.[key];
-        if (typeof value === "boolean") this.features[key] = value;
-      }
-      for (const [was, now] of Object.entries(RENAMED)) {
-        const value = parsed.features?.[was];
-        if (typeof value === "boolean" && parsed.features?.[now] === undefined) this.features[now] = value;
-      }
-      for (const key of ["bg", "node", "edge"] as const) {
-        const value = parsed.look?.[key];
-        if (typeof value === "string") this.looks[key] = value;
-      }
-      if (typeof parsed.look?.captions === "boolean") this.looks.captions = parsed.look.captions;
-      for (const key of Object.keys(SETUP_DEFAULT) as Array<keyof Setup>) {
-        const value = parsed.setup?.[key];
-        if (typeof value === "string") this.setups[key] = value as never;
-      }
-      if (this.setups.claudeWindow !== "terminal") this.setups.claudeWindow = "app";
-      const sizing = parsed.layout?.sizing;
-      if (SIZINGS.some((row) => row.key === sizing)) this.layouts.sizing = sizing as Sizing;
-      for (const key of ["sizeMin", "sizeMax"] as const) {
-        const value = parsed.layout?.[key];
-        if (typeof value === "number" && Number.isFinite(value)) this.layouts[key] = clampSize(value);
-      }
-      for (const key of ["edgeLength", "nodeSpacing"] as const) {
-        const value = parsed.layout?.[key];
-        if (typeof value === "number" && Number.isFinite(value)) this.layouts[key] = clampDial(key, value);
-      }
-      if (parsed.layout?.scroll === "zoom") this.layouts.scroll = "zoom";
-      // Version 2 kept the Claude folder on its own; it is a setup like any other now.
-      if (!this.setups.claudeFolder && typeof parsed.claude?.folder === "string") {
-        this.setups.claudeFolder = parsed.claude.folder;
-      }
-    } catch {
-      // A corrupt config is a cosmetic loss; the defaults keep the vault usable.
+    const parsed = await readConfig(vault);
+    if (!parsed) return;
+    this.over = parsePrefs(parsed as never);
+    const setup = (parsed.setup ?? {}) as Record<string, unknown>;
+    for (const key of Object.keys(SETUP_DEFAULT) as Array<keyof Setup>) {
+      const value = setup[key];
+      if (typeof value === "string") this.setups[key] = value as never;
     }
+    if (this.setups.claudeWindow !== "terminal") this.setups.claudeWindow = "app";
+    // Version 2 kept the Claude folder on its own; it is a setup like any other now.
+    const claude = parsed.claude as { folder?: unknown } | undefined;
+    if (!this.setups.claudeFolder && typeof claude?.folder === "string") this.setups.claudeFolder = claude.folder;
+    // An answer the same as the folder's is not a different answer. Dropped, so the list of
+    // what this vault does its own way says something, and the folder's later changes reach
+    // it here — the vault looks exactly the same either way today.
+    if (root) this.trimOverrides();
+  }
+
+  private trimOverrides(): void {
+    const base = this.resolve("root");
+    for (const key of Object.keys(this.over.features) as Feature[]) {
+      if (this.over.features[key] === base.features[key]) delete this.over.features[key];
+    }
+    for (const key of Object.keys(this.over.look) as Array<keyof Look>) {
+      if (this.over.look[key] === base.look[key]) delete this.over.look[key];
+    }
+    for (const key of Object.keys(this.over.layout) as Array<keyof LayoutPrefs>) {
+      if (this.over.layout[key] === base.layout[key]) delete this.over.layout[key];
+    }
+  }
+
+  /** The answers as they stand at a layer: the defaults, the folder's, then (for the vault) this vault's. */
+  private resolve(scope: Scope): Resolved {
+    const layers = scope === "root" ? [this.root] : [this.root, this.over];
+    const out: Resolved = { features: { ...DEFAULTS }, look: { ...LOOK_DEFAULT }, layout: { ...LAYOUT_DEFAULT } };
+    for (const layer of layers) {
+      Object.assign(out.features, layer.features);
+      Object.assign(out.look, layer.look);
+      Object.assign(out.layout, layer.layout);
+    }
+    return out;
+  }
+
+  /** Whether there is a Bedrock folder under this vault to answer for it. */
+  layered(): boolean {
+    return this.rootVault !== null;
+  }
+
+  scope(): Scope {
+    return this.layered() ? this.writeScope : "vault";
+  }
+
+  setScope(scope: Scope): void {
+    this.writeScope = scope;
+  }
+
+  /** The answers the settings window should show: the layer it is writing to, resolved. */
+  shown(): Resolved {
+    return this.resolve(this.scope());
+  }
+
+  /** The keys this vault answers its own way — feature ids, look keys, layout keys. */
+  overrides(): string[] {
+    return [...Object.keys(this.over.features), ...Object.keys(this.over.look), ...Object.keys(this.over.layout)];
+  }
+
+  /** This vault goes back to the folder's answers for everything. Its connections stay. */
+  dropOverrides(): void {
+    if (this.overrides().length === 0) return;
+    this.over = emptyPrefs();
+    this.schedule("vault");
+    this.onChange?.();
+    this.onLook?.();
+    this.onLayout?.();
   }
 
   enabled(feature: Feature): boolean {
-    return this.features[feature];
-  }
-
-  set(feature: Feature, on: boolean): void {
-    if (this.features[feature] === on) return;
-    this.features[feature] = on;
-    this.schedule();
-    this.onChange?.();
+    return this.resolve("vault").features[feature];
   }
 
   look(): Look {
-    return { ...this.looks };
+    return this.resolve("vault").look;
   }
 
-  setLook(patch: Partial<Look>): void {
-    let changed = false;
-    for (const [key, value] of Object.entries(patch) as Array<[keyof Look, never]>) {
-      if (this.looks[key] === value) continue;
-      this.looks[key] = value;
-      changed = true;
-    }
-    if (!changed) return;
-    this.schedule();
-    this.onLook?.();
+  layout(): LayoutPrefs {
+    return this.resolve("vault").layout;
   }
 
   setup(): Setup {
     return { ...this.setups };
   }
 
-  layout(): LayoutPrefs {
-    return { ...this.layouts };
+  /**
+   * Writes one answer into the layer the window is on. Written to the vault, an answer
+   * that matches the folder's is no override at all, and is dropped rather than pinned:
+   * flipping a switch back leaves the vault following the folder again.
+   */
+  private write<K extends keyof Prefs>(kind: K, key: keyof Prefs[K], value: Prefs[K][keyof Prefs[K]]): boolean {
+    const scope = this.scope();
+    const layer = (scope === "root" ? this.root : this.over)[kind] as Record<string, unknown>;
+    const before = this.resolve(scope)[kind] as Record<string, unknown>;
+    if (before[key as string] === value) return false;
+    if (scope === "vault" && (this.resolve("root")[kind] as Record<string, unknown>)[key as string] === value) {
+      delete layer[key as string];
+    } else {
+      layer[key as string] = value;
+    }
+    this.schedule(scope);
+    return true;
+  }
+
+  set(feature: Feature, on: boolean): void {
+    if (this.write("features", feature, on)) this.onChange?.();
+  }
+
+  setLook(patch: Partial<Look>): void {
+    let changed = false;
+    for (const [key, value] of Object.entries(patch) as Array<[keyof Look, never]>) {
+      if (this.write("look", key, value)) changed = true;
+    }
+    if (changed) this.onLook?.();
   }
 
   setLayout(patch: Partial<LayoutPrefs>): void {
@@ -436,13 +565,9 @@ export class SettingsStore {
           : key === "edgeLength" || key === "nodeSpacing"
             ? (clampDial(key, value) as never)
             : value;
-      if (this.layouts[key] === next) continue;
-      this.layouts[key] = next;
-      changed = true;
+      if (this.write("layout", key, next)) changed = true;
     }
-    if (!changed) return;
-    this.schedule();
-    this.onLayout?.();
+    if (changed) this.onLayout?.();
   }
 
   setSetup(patch: Partial<Setup>): void {
@@ -452,7 +577,7 @@ export class SettingsStore {
       this.setups[key] = value;
       changed = true;
     }
-    if (changed) this.schedule();
+    if (changed) this.schedule("vault");
   }
 
   /** The vault's default folder for new Antigravity sessions, or null when it has none. */
@@ -465,33 +590,58 @@ export class SettingsStore {
     return this.setups.claudeFolder || null;
   }
 
-  private schedule(): void {
-    this.dirty = true;
+  private schedule(scope: Scope): void {
+    if (scope === "root") this.dirtyRoot = true;
+    else this.dirtyVault = true;
     clearTimeout(this.timer);
     this.timer = window.setTimeout(() => void this.flush(), WRITE_DELAY);
   }
 
   /**
-   * The config file as it would be written now — defaults included, whether or not this
-   * vault has ever saved one. What a vault made inside this one starts from.
+   * This vault's config file as it would be written now: what it answers its own way, and
+   * its connections. What a vault made inside this one starts from — it inherits the
+   * folder's answers the same way, so only the differences need copying.
    */
   snapshot(): string {
     return (
       JSON.stringify(
-        { version: 3, features: this.features, look: this.looks, setup: this.setups, layout: this.layouts },
+        { version: 4, features: this.over.features, look: this.over.look, layout: this.over.layout, setup: this.setups },
         null,
         1,
       ) + "\n"
     );
   }
 
+  /** The Bedrock folder's config file as it would be written now. */
+  private rootSnapshot(): string {
+    return (
+      JSON.stringify({ version: 4, features: this.root.features, look: this.root.look, layout: this.root.layout }, null, 1) +
+      "\n"
+    );
+  }
+
   async flush(): Promise<void> {
     clearTimeout(this.timer);
     this.timer = undefined;
-    if (!this.dirty || !this.vault) return;
-    this.dirty = false;
+    if (this.dirtyVault && this.vault) {
+      this.dirtyVault = false;
+      await writeConfig(this.vault, this.snapshot());
+    }
+    if (this.dirtyRoot && this.rootVault) {
+      this.dirtyRoot = false;
+      await writeConfig(this.rootVault, this.rootSnapshot());
+    }
+  }
+}
+
+/** Writes the config, making `.notes` first if it is missing — the Bedrock folder may have none yet. */
+async function writeConfig(vault: Vault, text: string): Promise<void> {
+  try {
+    await vault.write(CONFIG_FILE, text);
+  } catch {
     try {
-      await this.vault.write(CONFIG_FILE, this.snapshot());
+      await vault.createDir(CONFIG_FILE.slice(0, CONFIG_FILE.lastIndexOf("/")));
+      await vault.write(CONFIG_FILE, text);
     } catch {
       /* read-only vault */
     }
@@ -610,6 +760,10 @@ export type PanelHooks = {
   onBasePick?: () => void;
   /** The Layout tab's one button: relax the whole graph from where it is. */
   onLayoutAll?: () => void;
+  /** What this build calls itself — null in a browser tab, which has no build. */
+  version?: () => string | null;
+  /** The General tab's "Check for updates…": ask the bucket now, answer in a dialog. */
+  onUpdateCheck?: () => void;
 };
 
 type Tab = "general" | "layout" | "features" | "integrations";
@@ -690,9 +844,18 @@ export function mountSettings(
   const unfolded = new Set<Feature>();
 
   const general = (): string => {
-    const look = store.look();
+    const look = store.shown().look;
     const base = hooks.base?.() ?? null;
+    const version = hooks.version?.() ?? null;
     return (
+      (version
+        ? lookRow(
+            "Version",
+            "newer builds download on their own and install when Bedrock restarts; a plaque in the corner says when one is waiting",
+            `<div class="setup-line"><span class="setup-value">Bedrock ${escapeHtml(version)}</span>` +
+              `<button type="button" data-update-check>Check for updates…</button></div>`,
+          )
+        : "") +
       (base
         ? lookRow(
             "Bedrock folder",
@@ -733,7 +896,7 @@ export function mountSettings(
       .join("");
 
   const layout = (): string => {
-    const prefs = store.layout();
+    const prefs = store.shown().layout;
     /** A slider with its value beside it; the next run reads it, nothing moves on its own. */
     const dial = (field: "edgeLength" | "nodeSpacing", label: string, what: string, range: { min: number; max: number }): string =>
       `<label class="settings-dial"><span class="settings-dial-head"><b>${label}</b>` +
@@ -765,18 +928,62 @@ export function mountSettings(
     );
   };
 
-  const features = (): string =>
-    FEATURES.map((row) => switchRow(row, store.enabled(row.feature))).join("");
+  const features = (): string => {
+    const on = store.shown().features;
+    return FEATURES.map((row) => switchRow(row, on[row.feature])).join("");
+  };
 
-  const integrations = (): string =>
-    INTEGRATIONS.map((row) =>
-      integrationRow(
-        row,
-        store.enabled(row.feature),
-        hooks.page?.(row.feature) ?? null,
-        unfolded.has(row.feature),
-      ),
+  const integrations = (): string => {
+    const on = store.shown().features;
+    // An integration's page is this vault's connection to it. Every vault's answers can
+    // say the integration is on; which channel, which team, is not theirs to say.
+    const atRoot = store.scope() === "root";
+    return INTEGRATIONS.map((row) =>
+      integrationRow(row, on[row.feature], atRoot ? null : (hooks.page?.(row.feature) ?? null), unfolded.has(row.feature)),
     ).join("");
+  };
+
+  /** What an override key is called on screen, so the list of them reads as the rows do. */
+  const overrideName = (key: string): string =>
+    [...FEATURES, ...INTEGRATIONS].find((row) => row.feature === key)?.name ??
+    ({
+      bg: "Canvas",
+      node: "Notes",
+      edge: "Connections",
+      captions: "Names on the canvas",
+      sizing: "Note sizes",
+      sizeMin: "smallest",
+      sizeMax: "biggest",
+      edgeLength: "Pull",
+      nodeSpacing: "Spread",
+      scroll: "Scrolling",
+    }[key] ?? key);
+
+  /**
+   * Which layer the window writes to, and what that means here. Only when there is a
+   * Bedrock folder to answer for every vault — a browser tab has one vault and one file.
+   */
+  const scopeStrip = (): string => {
+    if (!store.layered()) return "";
+    const scope = store.scope();
+    const pill = (key: Scope, name: string): string =>
+      `<button type="button" class="settings-scope-pill${scope === key ? " on" : ""}" data-scope="${key}">${name}</button>`;
+    const overrides = store.overrides();
+    const word =
+      scope === "root"
+        ? "what every vault starts from — a vault that answered differently keeps its answer"
+        : overrides.length === 0
+          ? "this vault follows the answers for every vault; change one here and only this vault changes"
+          : `this vault answers its own way for ${overrides.map(overrideName).map(escapeHtml).join(", ")}`;
+    return (
+      `<div class="settings-scope"><span class="settings-scope-pills">${pill("root", "All vaults")}${pill("vault", "This vault")}</span>` +
+      `<small>${word}</small>` +
+      (scope === "vault" && overrides.length > 0
+        ? `<button type="button" class="settings-scope-drop" data-drop-overrides title="Back to the answers for every vault">Drop</button>`
+        : "") +
+      `</div>`
+    );
+  };
 
   const draw = (): void => {
     const body =
@@ -791,6 +998,7 @@ export function mountSettings(
           `<button type="button" class="settings-tab${t.key === tab ? " on" : ""}" data-tab="${t.key}">${t.name}</button>`,
       ).join("") +
       `</div>` +
+      scopeStrip() +
       `<div class="settings-body">${body}</div>` +
       `</div>`;
   };
@@ -827,7 +1035,7 @@ export function mountSettings(
     if (field === "sizeMin" || field === "sizeMax" || field === "edgeLength" || field === "nodeSpacing") {
       const value = Number(box.value);
       if (Number.isFinite(value)) store.setLayout({ [field]: value });
-      box.value = String(store.layout()[field]); // say what was kept, if it had to be clamped
+      box.value = String(store.shown().layout[field]); // say what was kept, if it had to be clamped
       return;
     }
     const feature = box.dataset.feature as Feature | undefined;
@@ -864,6 +1072,21 @@ export function mountSettings(
     }
     if (hit.dataset.basePick !== undefined) {
       hooks.onBasePick?.(); // redraws the window itself once the folder is chosen
+      return;
+    }
+    if (hit.dataset.updateCheck !== undefined) {
+      hooks.onUpdateCheck?.(); // the shell answers in a dialog of its own
+      return;
+    }
+    const scope = hit.dataset.scope as Scope | undefined;
+    if (scope) {
+      store.setScope(scope);
+      draw();
+      return;
+    }
+    if (hit.dataset.dropOverrides !== undefined) {
+      store.dropOverrides();
+      draw();
       return;
     }
     const picked = hit.dataset.tab as Tab | undefined;

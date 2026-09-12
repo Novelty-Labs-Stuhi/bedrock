@@ -5,6 +5,9 @@ interface FileSystemDirectoryHandle {
   entries(): AsyncIterableIterator<[string, FileSystemHandle]>;
 }
 
+/** A newer Bedrock the shell has downloaded and is holding until a restart. */
+type UpdateInfo = { version: string };
+
 interface Window {
   showDirectoryPicker(options?: { mode?: "read" | "readwrite"; id?: string }): Promise<FileSystemDirectoryHandle>;
   /** The desktop shell's bridge (electron/preload.cjs); absent in a plain browser. */
@@ -210,6 +213,17 @@ interface Window {
 
     /** The menu bar speaking: Settings… or Open Vault… was picked. */
     onMenu(fn: (what: "settings" | "open-vault") => void): void;
+
+    /** What this build calls itself — package.json's version, stamped per release. */
+    appVersion(): Promise<string>;
+    /** The newer Bedrock already downloaded, if there is one; null until then. */
+    updateStatus(): Promise<UpdateInfo | null>;
+    /** Quits into the downloaded update. False when there is none to install. */
+    updateInstall(): Promise<boolean>;
+    /** Asks the bucket now, and tells the person the answer in a dialog either way. */
+    updateCheck(): Promise<void>;
+    /** A newer Bedrock finished downloading while this window was open. */
+    onUpdateReady(fn: (info: UpdateInfo) => void): void;
 
     /** This window saying which vault it now has open, so the others can be asked whether
         a vault is already on screen. Null when it has none, or none with a known path. */

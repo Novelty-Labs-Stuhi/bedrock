@@ -49,6 +49,16 @@ jobs:
 
       - run: npm ci
 
+      # The updater in the app compares versions, so every build that ships has to carry
+      # a new one. package.json keeps major.minor; the patch is this run's number, which
+      # only goes up. Not committed back — the repo stays at x.y.0, the dmg says what it is.
+      - name: Stamp the version
+        run: |
+          set -euo pipefail
+          base="$(node -p "require('./package.json').version.split('.').slice(0, 2).join('.')")"
+          npm version "$base.$GITHUB_RUN_NUMBER" --no-git-tag-version
+          echo "building $(node -p "require('./package.json').version")" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Import signing certificate
         env:
           CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
@@ -121,6 +131,15 @@ jobs:
           xcrun stapler validate "$DMG"
           spctl -a -t open --context context:primary-signature -v "$DMG"
 
+      # The manifest running apps poll. Squirrel.Mac installs from the zip, so a manifest
+      # without one is an update nobody can take.
+      - name: Verify the update manifest
+        run: |
+          set -euo pipefail
+          test -f release/latest-mac.yml
+          grep -q '\.zip' release/latest-mac.yml
+          cat release/latest-mac.yml
+
       - uses: google-github-actions/auth@v2
         with:
           project_id: cleveland-464404-m0
@@ -134,13 +153,21 @@ jobs:
           set -euo pipefail
           DMG="$(ls release/*.dmg)"
 
-          # Versioned name is what site/nginx.conf currently redirects to, so
-          # overwriting it needs no site redeploy.
-          gcloud storage cp "$DMG" "gs://getbedrock-downloads/$(basename "$DMG")" \
-            --cache-control="public, max-age=3600"
+          # The versioned dmg and zip, plus their blockmaps — the updater downloads only
+          # the blocks that changed when it can. Versioned names never change, so they
+          # may cache.
+          for f in release/*.dmg release/*.zip release/*.blockmap; do
+            gcloud storage cp "$f" "gs://getbedrock-downloads/$(basename "$f")" \
+              --cache-control="public, max-age=3600"
+          done
 
-          # Stable alias, so a version bump stops meaning a site redeploy once
-          # nginx.conf is pointed here instead.
+          # What running apps poll to learn there is a newer version. Never cached: a
+          # stale manifest is an update nobody hears about.
+          gcloud storage cp release/latest-mac.yml "gs://getbedrock-downloads/latest-mac.yml" \
+            --cache-control="no-cache, max-age=0"
+
+          # Stable alias: site/nginx.conf redirects here, so a new version needs no
+          # site redeploy.
           gcloud storage cp "$DMG" "gs://getbedrock-downloads/Bedrock-latest-arm64.dmg" \
             --cache-control="public, max-age=300"
 

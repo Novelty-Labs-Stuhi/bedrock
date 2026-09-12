@@ -9,7 +9,7 @@ export type Section = {
   index: number;
   /** The heading's words, links taken out. */
   title: string;
-  /** Everything under the heading up to the next one — what a leaf shows when hovered. */
+  /** Everything under the heading up to the next one. Not drawn anywhere; the note has it. */
   body: string;
   /** The notes the heading line links to, as written. */
   targets: string[];
@@ -67,6 +67,34 @@ export function withoutSectionLinks(text: string): string {
     lines[section.line] = lines[section.line].replace(LINK_RE, "").trimEnd();
   }
   return lines.join("\n");
+}
+
+/**
+ * Names the arrow a section draws: `label:: [[target]]` on a line of its own straight under
+ * the heading that links to the target — the heading line itself stays as it is, a relation
+ * name having no place there. An earlier name for the same arrow goes; a null label only
+ * takes it away. Unchanged when no heading links there. `matches` says which spellings are
+ * that target, the same way the graph resolves them.
+ */
+export function labelSection(
+  text: string,
+  matches: (target: string) => boolean,
+  spelling: string,
+  label: string | null,
+): string {
+  const sections = parseSections(text);
+  const section = sections.find((s) => s.targets.some(matches));
+  if (!section) return text;
+  const lines = text.split("\n");
+  const end = sections[section.index + 1]?.line ?? lines.length;
+  const NAME_LINE = /^\s*[^:\n]+::\s*\[\[([^\][|]+)(?:\|[^\][]*)?\]\]\s*$/;
+  const isNameLine = (line: string): boolean => {
+    const found = NAME_LINE.exec(line);
+    return !!found && matches(found[1].trim());
+  };
+  const body = lines.slice(section.line + 1, end).filter((line) => !isNameLine(line));
+  if (label) body.unshift(`${label}:: [[${spelling}]]`);
+  return [...lines.slice(0, section.line + 1), ...body, ...lines.slice(end)].join("\n");
 }
 
 /** The heading line of section `index` with `[[target]]` at its end — unchanged if it already points there. */

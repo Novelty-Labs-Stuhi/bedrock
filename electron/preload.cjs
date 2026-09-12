@@ -111,4 +111,14 @@ contextBridge.exposeInMainWorld("bedrock", {
   claudeCliStatus: () => ipcRenderer.invoke("claude-cli-status"),
   claudeCliStart: (folder, resume, title) => ipcRenderer.invoke("claude-cli-start", folder, resume, title),
   claudeAccount: () => ipcRenderer.invoke("claude-account"),
+
+  // Updates. The shell downloads a newer Bedrock on its own and says so once it is on
+  // disk (`onUpdateReady`); `updateStatus` is a window that opened after that asking.
+  // `updateInstall` restarts into it; `updateCheck` is the Settings button — the shell
+  // answers in a dialog of its own, either way.
+  appVersion: () => ipcRenderer.invoke("app-version"),
+  updateStatus: () => ipcRenderer.invoke("update-status"),
+  updateInstall: () => ipcRenderer.invoke("update-install"),
+  updateCheck: () => ipcRenderer.invoke("update-check"),
+  onUpdateReady: (fn) => ipcRenderer.on("update-ready", (_e, info) => fn(info)),
 });

@@ -1,6 +1,6 @@
 import "./style.css";
 import { GraphView, TYPE_ICONS, type Client, type Doc, type DraftKind, type SessionState } from "./graph";
-import { deleteSection, keepSections, leafOf, linkSection, parseSections, sectionKey, unlinkSection } from "./granola";
+import { deleteSection, keepSections, labelSection, leafOf, linkSection, parseSections, sectionKey, unlinkSection } from "./granola";
 import {
   LinkResolver,
   parseLinks,
@@ -19,6 +19,7 @@ import { showStylePicker } from "./node-style";
 import { askChoice, askConfirm, askPick, askText } from "./dialog";
 import { ARROW, EDGE_DIR, edgeNotePath, isEdgeNote, renamedEdgeNote } from "./edges";
 import { showMenu, type MenuItem } from "./menu";
+import { mountUpdates } from "./update";
 import {
   CONFIG_FILE,
   SettingsStore,
@@ -100,6 +101,7 @@ const ui = {
   status: el("status"),
   settings: el<HTMLButtonElement>("settings"),
   settingsPanel: el("settings-modal"),
+  updatePlaque: el("update-plaque"),
 };
 
 
@@ -225,6 +227,7 @@ const graphView = new GraphView(ui.cy, {
   onOpenNotion: (path, url) => void openNotionNode(path, url),
   onOpenGranola: (path, meeting) => void openGranolaNode(path, meeting),
   onLeafMenu: (leaf, client) => showLeafMenu(leaf, client),
+  onLeafDrop: (leaf, title, at) => void createNoteFromLeaf(leaf, title, at),
   onOpenRef: (path, target, corner) => void openRefNode(path, target, corner),
   onOpenSlack: (path, url) => void openSlackNode(path, url),
   onOpenGoogleTask: (path, task, url) => void openGoogleTaskNode(path, task, url),
@@ -317,8 +320,9 @@ const graphView = new GraphView(ui.cy, {
     // The pulse a note can wear, on the line between two of them. Naming the line stays
     // a click on it; the menu offers the same, so the right button is never a dead end.
     const items: MenuItem[] = [];
-    // A leaf's arrow lives on a heading line, where a relation name has no place.
-    if (!leafOf(source) && graphView.nodeType(source) !== "granola") {
+    // A leaf's own arrow is on the canvas only until the rebuild; a meeting's can be named,
+    // the name going on a line under the heading that draws it (`labelSection`).
+    if (!leafOf(source)) {
       items.push({ label: "Name this connection…", run: () => relabelEdge(source, target) });
     }
     if (settings.enabled("active")) {
@@ -1140,7 +1144,7 @@ async function openVault(next: Vault): Promise<void> {
   await spatial.attach(vault); // this folder's own arrangement, not the last one's
   await stickies.attach(vault);
   await issueIds.attach(vault); // and this folder's own issues
-  await settings.attach(vault); // and its own set of switched-on integrations
+  await settings.attach(vault, await settingsRoot(vault)); // its own answers, over the Bedrock folder's
   applyFeatures();
   panes = [{ tabs: [{ kind: "graph" }], active: 0 }];
   focused = 0;
@@ -1153,6 +1157,23 @@ async function openVault(next: Vault): Promise<void> {
   // The shell keeps a note of which window holds which vault, so opening the vault behind
   // a node can raise the window that already has it instead of making another one.
   void window.bedrock?.windowRoot(knownVaultRoot());
+}
+
+/**
+ * The Bedrock folder as a vault, for the settings to read every vault's answers from —
+ * null in a browser tab, which has no folder, and when `opened` is the folder itself, whose
+ * own config then IS the folder's. Asked of the shell here rather than read off `baseRoot`,
+ * which may not have come back yet when a window opens straight onto a vault.
+ */
+async function settingsRoot(opened: Vault): Promise<Vault | null> {
+  const bridge = window.bedrock;
+  if (!bridge) return null;
+  const base = baseRoot ?? (await bridge.baseGet().catch(() => null));
+  if (!base) return null;
+  baseRoot = base;
+  const trim = (p: string): string => p.replace(/[\\/]+$/, "");
+  if (opened instanceof ShellVault && trim(opened.root) === trim(base)) return null;
+  return new ShellVault(base);
 }
 
 /* ----------------------------------------------------------------- paths --- */
@@ -1586,6 +1607,22 @@ async function applyEdgeLabel(source: string, target: string, fresh: string | nu
   const text = await vault.read(source);
   const resolver = new LinkResolver(filePaths());
   const spelling = target.replace(/\.md$/i, "");
+  const same = (t: string): boolean => resolver.resolve(t) === target || t.trim() === spelling.trim();
+  if (graphView.nodeType(source) === "granola") {
+    // A meeting's arrow is drawn by a heading line, where a relation name has no place: the
+    // name goes on a line of its own under that heading, which the graph reads like any link.
+    const next = labelSection(text, same, spelling, label);
+    if (next !== text) {
+      await vault.write(source, next);
+      syncOpenPanes(source, next);
+    }
+    graphView.setEdgeLabel(source, target, label);
+    graphStale = true;
+    ui.status.textContent = label
+      ? `${noteName(source)} —${label}→ ${noteName(target)}`
+      : `unnamed: ${noteName(source)} → ${noteName(target)}`;
+    return;
+  }
   const lines = text.split("\n");
   const at = lines.findIndex((line) =>
     linkTargets(line).some((t) => resolver.resolve(t) === target || t.trim() === spelling.trim()),
@@ -1646,9 +1683,9 @@ async function deleteEdge(source: string, target: string): Promise<void> {
   const cut = (t: string): boolean => resolver.resolve(t) === target || t.trim() === spelling.trim();
   const text = await vault.read(source);
   // A meeting's headings link on behalf of their sections: the link comes off the heading
-  // whole. A link in the body of the note is cut the way any note's is.
-  const trimmed = graphView.nodeType(source) === "granola" ? unlinkSection(text, null, cut) : text;
-  const next = trimmed !== text ? trimmed : unlinkText(text, cut);
+  // whole — and then the body is cut the way any note's is, which is where the arrow's
+  // name lives if it was given one (`labelSection`).
+  const next = unlinkText(graphView.nodeType(source) === "granola" ? unlinkSection(text, null, cut) : text, cut);
   if (next !== text) {
     await vault.write(source, next);
     syncOpenPanes(source, next);
@@ -1711,6 +1748,22 @@ async function createHolderAt(
       if (source) await finishLink(source, finalPath, null);
     })();
   });
+  await refreshSidebar();
+}
+
+/**
+ * A leaf dropped on empty canvas: a note named after its heading, made where it landed and
+ * pointed at from the section — the leaf's menu with the answer already given. The name is
+ * the heading's words as a file can carry them; one already taken gets a number.
+ */
+async function createNoteFromLeaf(leaf: string, title: string, at: { x: number; y: number }): Promise<void> {
+  const name = tidyName(title) || HOLDER_NAME;
+  const path = freshPath("", name);
+  await vault.createFile(path, "");
+  entries = [...entries, { path, kind: "file" }];
+  graphView.commitLink(leaf, path, { label: noteName(path), at });
+  graphStale = true;
+  await finishLink(leaf, path, null);
   await refreshSidebar();
 }
 
@@ -6985,7 +7038,13 @@ const redrawSettings = mountSettings(ui.settings, ui.settingsPanel, settings, {
   onLayoutAll: () => graphView.runLayoutAll(),
   base: () => baseRoot,
   onBasePick: () => void pickBase(),
+  version: () => appVersion,
+  onUpdateCheck: () => void window.bedrock?.updateCheck(),
 });
+/** The build's version, for the General tab. Asked once; a build does not change while it runs. */
+let appVersion: string | null = null;
+void window.bedrock?.appVersion().then((v) => (appVersion = v)).catch(() => undefined);
+mountUpdates(ui.updatePlaque);
 // All of these are the shell's to know, and all can change while the app runs — an agy
 // install, a claude install, a `/login` inside a session, a commit made in a terminal.
 ui.settings.addEventListener("click", () => {
