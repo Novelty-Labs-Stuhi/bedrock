@@ -115,6 +115,13 @@ export type LayoutPrefs = {
    * is dragged with the right button held. Right-drag pans in both.
    */
   scroll: "pan" | "zoom";
+  /**
+   * How many levels of branches open by themselves when this folder is opened: 0 folds
+   * every branch away, 1 opens the branches directly in this folder and folds theirs, and
+   * so on. What is opened and folded by hand afterwards is not remembered — the next open
+   * starts from this again.
+   */
+  branchDepth: number;
 };
 
 export const LAYOUT_DEFAULT: LayoutPrefs = {
@@ -124,7 +131,12 @@ export const LAYOUT_DEFAULT: LayoutPrefs = {
   edgeLength: 140,
   nodeSpacing: 14,
   scroll: "pan",
+  branchDepth: 1,
 };
+/** How deep the branches can be asked to open by default. */
+export const BRANCH_DEPTH_RANGE = { min: 0, max: 9 };
+const clampDepth = (value: number): number =>
+  Math.min(BRANCH_DEPTH_RANGE.max, Math.max(BRANCH_DEPTH_RANGE.min, Math.round(value)));
 /** What the two layout dials run between. */
 export const EDGE_LENGTH_RANGE = { min: 40, max: 400 };
 export const NODE_SPACING_RANGE = { min: 0, max: 80 };
@@ -374,6 +386,8 @@ function parsePrefs(parsed: {
   }
   const scroll = parsed.layout?.scroll;
   if (scroll === "zoom" || scroll === "pan") prefs.layout.scroll = scroll;
+  const depth = parsed.layout?.branchDepth;
+  if (typeof depth === "number" && Number.isFinite(depth)) prefs.layout.branchDepth = clampDepth(depth);
   return prefs;
 }
 
@@ -564,7 +578,9 @@ export class SettingsStore {
           ? (clampSize(value) as never)
           : key === "edgeLength" || key === "nodeSpacing"
             ? (clampDial(key, value) as never)
-            : value;
+            : key === "branchDepth"
+              ? (clampDepth(value) as never)
+              : value;
       if (this.write("layout", key, next)) changed = true;
     }
     if (changed) this.onLayout?.();
@@ -918,6 +934,13 @@ export function mountSettings(
       `<div class="settings-look"><h5>Note sizes</h5><small>what a note's circle is sized by</small>` +
       choices("sizing", prefs.sizing, SIZINGS) +
       `<div class="settings-nums">${number("sizeMin", "smallest")}${number("sizeMax", "biggest")}</div></div>` +
+      `<div class="settings-look"><h5>Branches</h5>` +
+      `<small>a folder with a .notes of its own is a branch. A folded branch's notes are off the canvas; a note connected` +
+      ` to some of them wears their count at its top-right, and a click there brings one of them here, wearing the branch` +
+      ` mark that opens the whole branch — right-click a note in an open branch to fold it back.` +
+      ` How many levels open on their own when this folder is opened (0 folds them all)</small>` +
+      `<div class="settings-nums"><label class="settings-num"><span>open to depth</span>` +
+      `<input type="number" data-layout="branchDepth" value="${prefs.branchDepth}" min="${BRANCH_DEPTH_RANGE.min}" max="${BRANCH_DEPTH_RANGE.max}" step="1" /></label></div></div>` +
       `<div class="settings-look"><h5>Scrolling</h5>` +
       `<small>a drag on empty canvas draws a selection; the right button (or Space) held down drags the canvas itself</small>` +
       choices("scroll", prefs.scroll, [
@@ -957,6 +980,7 @@ export function mountSettings(
       edgeLength: "Pull",
       nodeSpacing: "Spread",
       scroll: "Scrolling",
+      branchDepth: "Branches open to depth",
     }[key] ?? key);
 
   /**
@@ -1032,7 +1056,7 @@ export function mountSettings(
       store.setLayout({ scroll: box.value === "zoom" ? "zoom" : "pan" });
       return;
     }
-    if (field === "sizeMin" || field === "sizeMax" || field === "edgeLength" || field === "nodeSpacing") {
+    if (field === "sizeMin" || field === "sizeMax" || field === "edgeLength" || field === "nodeSpacing" || field === "branchDepth") {
       const value = Number(box.value);
       if (Number.isFinite(value)) store.setLayout({ [field]: value });
       box.value = String(store.shown().layout[field]); // say what was kept, if it had to be clamped

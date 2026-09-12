@@ -43,6 +43,12 @@ export class SpatialStore {
   private backedUp = false;
   /** Bumped on every attach, so the graph can tell it is looking at a different vault. */
   private gen = 0;
+  /**
+   * Notes that exist but are not on the canvas right now — the notes of a folded branch.
+   * Their positions are kept through a capture, so a branch opened again comes back where
+   * it was, and only a note that is actually gone drops out of the file.
+   */
+  private retained = new Set<string>();
 
   /**
    * Points the store at a vault and reads back whatever arrangement it holds. Any
@@ -54,6 +60,7 @@ export class SpatialStore {
     this.vault = vault;
     this.gen++;
     this.nodes.clear();
+    this.retained.clear();
     this.opened = "";
     this.backedUp = false;
 
@@ -96,13 +103,46 @@ export class SpatialStore {
     return this.nodes.get(path);
   }
 
+  /** The box round every remembered position, or null with nothing remembered. */
+  bounds(): { x1: number; y1: number; x2: number; y2: number } | null {
+    if (!this.nodes.size) return null;
+    const box = { x1: Infinity, y1: Infinity, x2: -Infinity, y2: -Infinity };
+    for (const at of this.nodes.values()) {
+      box.x1 = Math.min(box.x1, at.x);
+      box.y1 = Math.min(box.y1, at.y);
+      box.x2 = Math.max(box.x2, at.x);
+      box.y2 = Math.max(box.y2, at.y);
+    }
+    return box;
+  }
+
+  /**
+   * Hands one note's remembered place to another that has none — a note taking over from
+   * the reference that stood in for it. Remembered, not yet written: the next capture
+   * decides whether anything changed.
+   */
+  carryOver(from: string, to: string): void {
+    const at = this.nodes.get(from);
+    if (at && !this.nodes.has(to)) this.nodes.set(to, { ...at });
+  }
+
+  /** Which notes are off the canvas but still on disk — see `retained`. */
+  retain(paths: Iterable<string>): void {
+    this.retained = new Set(paths);
+  }
+
   /**
    * Takes the positions of everything currently on the canvas. Replacing rather than
    * merging is deliberate: notes that have been deleted drop out of the file instead of
-   * accumulating in it forever.
+   * accumulating in it forever. The one exception is a note that is only folded away
+   * (`retain`): it keeps the place it had.
    */
   takeNodes(positions: Iterable<[string, Point]>): void {
     const next = new Map(positions);
+    for (const path of this.retained) {
+      const held = this.nodes.get(path);
+      if (held && !next.has(path)) next.set(path, held);
+    }
     if (next.size === this.nodes.size) {
       let same = true;
       for (const [path, at] of next) {

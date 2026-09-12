@@ -73,8 +73,6 @@ contextBridge.exposeInMainWorld("bedrock", {
   granolaStatus: () => ipcRenderer.invoke("granola-status"),
   granolaForget: () => ipcRenderer.invoke("granola-forget"),
   granolaList: () => ipcRenderer.invoke("granola-list"),
-  granolaGet: (id) => ipcRenderer.invoke("granola-get", id),
-  granolaCopies: (id) => ipcRenderer.invoke("granola-copies", id),
   granolaOpen: (url) => ipcRenderer.invoke("granola-open", url),
   wordStatus: () => ipcRenderer.invoke("word-status"),
   wordRecent: (limit) => ipcRenderer.invoke("word-recent", limit),

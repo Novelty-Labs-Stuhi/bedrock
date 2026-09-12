@@ -621,7 +621,8 @@ ipcMain.handle("vault-fs", async (_event, root, op, rel, arg) => {
           if (entry.name.startsWith(".")) continue;
           const full = path.join(dir, entry.name);
           if (entry.isDirectory()) {
-            entries.push({ path: posix(full), kind: "dir" });
+            // A folder with a `.notes/` of its own is a branch of this graph (see `Entry`).
+            entries.push({ path: posix(full), kind: "dir", ...(isVaultDir(full) ? { branch: true } : {}) });
             walk(full);
           } else if (/\.md$/i.test(entry.name)) entries.push({ path: posix(full), kind: "file" });
           else if (VAULT_IMAGES.test(entry.name)) assets.push(posix(full));
@@ -3400,58 +3401,6 @@ ipcMain.handle("granola-list", async () => {
   const trouble = toolTrouble(result, "Granola");
   if (trouble) throw trouble;
   return granolaMeetings(result).map(({ id, title, at, url }) => ({ id, title, at, url }));
-});
-
-ipcMain.handle("granola-get", async (_event, rawId) => {
-  const id = String(rawId || "").trim().toLowerCase();
-  if (!UUID_RE.test(id)) throw new Error("that is not a Granola meeting id");
-  const tool = await granola.tool(["get_meetings", "get-meetings", "get_meeting"]);
-  const result = await granola.call("tools/call", { name: tool, arguments: { meeting_ids: [id] } });
-  const trouble = toolTrouble(result, "Granola");
-  if (trouble) throw trouble;
-  const note = granolaMeetings(result).find((meeting) => meeting.id === id);
-  if (!note) throw new Error("Granola answered, but said nothing about that meeting");
-  return note;
-});
-
-/**
- * Every note standing for meeting `id` in any vault under the base folder — the whole
- * system of vaults, not just the one asking. A meeting attached into a second vault
- * brings only the sections nobody has assigned or deleted in the copies that already
- * exist, and this is how the renderer learns what those copies say. Files are read
- * whole (they are small), hidden folders and node_modules skipped, as the index does.
- */
-ipcMain.handle("granola-copies", (_event, rawId) => {
-  const id = String(rawId || "").trim().toLowerCase();
-  if (!UUID_RE.test(id)) return [];
-  const mark = new RegExp(`^meeting::\\s*${id}\\s*$`, "im");
-  const copies = [];
-  const walk = (dir, depth) => {
-    if (depth > 12) return;
-    let entries;
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const entry of entries) {
-      if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        walk(full, depth + 1);
-      } else if (/\.md$/i.test(entry.name)) {
-        try {
-          if (fs.statSync(full).size > 512 * 1024) continue;
-          const text = fs.readFileSync(full, "utf8");
-          if (/^type::\s*granola\s*$/im.test(text) && mark.test(text)) copies.push({ path: full, text });
-        } catch {
-          /* unreadable: not a copy anybody can use */
-        }
-      }
-    }
-  };
-  walk(baseDir(), 0);
-  return copies;
 });
 
 ipcMain.handle("granola-open", (_event, rawUrl) => {

@@ -1,6 +1,5 @@
 import "./style.css";
-import { GraphView, TYPE_ICONS, type Client, type Doc, type DraftKind, type SessionState } from "./graph";
-import { deleteSection, keepSections, labelSection, leafOf, linkSection, parseSections, sectionKey, unlinkSection } from "./granola";
+import { BRANCH_ICON, GraphView, TYPE_ICONS, type Client, type Doc, type DraftKind, type SessionState } from "./graph";
 import {
   LinkResolver,
   parseLinks,
@@ -34,7 +33,7 @@ import { imageFiles, resetAssets, saveImage } from "./images";
 import { createEditor, type Editor } from "./editor";
 import { linkTargets } from "./markdown";
 import { Sidebar } from "./sidebar";
-import { SpatialStore, LAYOUT_FILE } from "./spatial";
+import { SpatialStore, LAYOUT_FILE, NOTES_DIR } from "./spatial";
 import { STICKY_DIR, StickyStore, isCardPath, stamp } from "./sticky";
 import {
   IdStore,
@@ -56,6 +55,7 @@ import {
   FolderVault, ShellVault,
   LocalVault,
   basename,
+  branchFolders,
   canPickFolder,
   dirname,
   isMarkdown,
@@ -226,17 +226,19 @@ const graphView = new GraphView(ui.cy, {
   onOpenVault: (path, folder) => void openVaultNode(path, folder),
   onOpenNotion: (path, url) => void openNotionNode(path, url),
   onOpenGranola: (path, meeting) => void openGranolaNode(path, meeting),
-  onLeafMenu: (leaf, client) => showLeafMenu(leaf, client),
-  onLeafDrop: (leaf, title, at) => void createNoteFromLeaf(leaf, title, at),
   onOpenRef: (path, target, corner) => void openRefNode(path, target, corner),
+  onOpenBranch: (path, folders, client) => openBranchFrom(path, folders, client),
+  onOpenExternal: (path, links, client) => openExternalFrom(path, links, client),
   onOpenSlack: (path, url) => void openSlackNode(path, url),
   onOpenGoogleTask: (path, task, url) => void openGoogleTaskNode(path, task, url),
   onOpenAppleNote: (path, note) => void openAppleNoteNode(path, note),
   onOpenWord: (path, doc) => void openWordNode(path, doc),
   onLinkExisting: (source, target) => linkNotes(source, target),
   onLinkNew: (source, at, kind) => {
-    // A note made on the canvas lands at the vault root: folders are the sidebar's, not the graph's.
-    const folder = null;
+    // A note made from another lands in that note's BRANCH: a thought that grows out of a
+    // note about Theory is a Theory note, wherever the canvas happened to be opened from.
+    // From a note of the trunk itself, or in a browser tab, the root.
+    const folder = branchOf(source);
     if (kind === "vault") void createVaultAt(at, folder, source);
     else if (kind === "antigravity") void createAntigravityAt(at, folder, source);
     else if (kind === "claude") void createClaudeAt(at, folder, source);
@@ -309,6 +311,9 @@ const graphView = new GraphView(ui.cy, {
     if (window.bedrock && kindHere !== "ref" && kindHere !== "vault") {
       items.push({ label: "Move into…", run: () => void moveNoteInto(path) });
     }
+    // A note in an open branch can fold the branch — from any note of it, not from a
+    // pointer: there is none. One row per branch on the way down to it.
+    items.push(...foldRows(path));
     items.push(
       { label: "Copy path", run: () => void copyNotePath(path) },
       { label: "Rename", run: () => renameOnGraph(path) },
@@ -320,11 +325,7 @@ const graphView = new GraphView(ui.cy, {
     // The pulse a note can wear, on the line between two of them. Naming the line stays
     // a click on it; the menu offers the same, so the right button is never a dead end.
     const items: MenuItem[] = [];
-    // A leaf's own arrow is on the canvas only until the rebuild; a meeting's can be named,
-    // the name going on a line under the heading that draws it (`labelSection`).
-    if (!leafOf(source)) {
-      items.push({ label: "Name this connection…", run: () => relabelEdge(source, target) });
-    }
+    items.push({ label: "Name this connection…", run: () => relabelEdge(source, target) });
     if (settings.enabled("active")) {
       const mark = graphView.edgeMark(source, target);
       items.push({
@@ -432,18 +433,562 @@ async function readDocs(): Promise<Doc[]> {
   const texts = await readTexts(drawn);
   const all: Doc[] = drawn.flatMap((path) => (texts.has(path) ? [{ path, text: texts.get(path)! }] : []));
   if (all.length < drawn.length) ui.status.textContent = `${drawn.length - all.length} note(s) could not be read and are not drawn`;
-  // A vault inside this one is opaque from out here: its notes are its own graph, and
-  // the one node standing for it is all this canvas shows of it.
-  const vaults = all.filter((doc) => parseType(doc.text) === "vault");
-  const nested = vaults.map((doc) => vaultFolderOf(doc.path, doc.text));
-  const docs = all.filter((doc) => !nested.some((folder) => doc.path.startsWith(folder + "/")));
-  // The one node standing for a vault is sized by what is inside it.
-  for (const doc of vaults) {
+  settleBranches();
+  await seedOpenBranches(all.map((doc) => doc.path));
+  // The whole tree is one graph. A branch that is folded keeps its notes off the canvas;
+  // what stays is the mark on every note outside it that links into it, or is linked
+  // from it — the door the branch opens from. Worked out over every link in every note,
+  // because a link from a folded note to a shown one is as much a way in as the reverse.
+  /*
+   * What is on the canvas, in three kinds:
+   *
+   * - The OPEN notes: every note whose branches all stand open.
+   * - Their OUTGOING connections: every note an open note links to that is in a folded
+   *   branch is drawn too, on its own, wearing the branch mark for the folder it came out
+   *   of — so what this vault reaches into is on the canvas, and the mark opens the rest.
+   * - Notes SPANNED here by hand (see `spanned`), the same way.
+   *
+   * What is NOT drawn is what links INTO the canvas from folded branches: every drawn note
+   * counts the notes it is connected to that are off the canvas — for an open note, those
+   * are the notes linking into it — and the count at its top-right lists them to span one.
+   */
+  for (const path of spanned) if (branchVisible(path)) spanned.delete(path); // its branch has opened: an ordinary note now
+  const open = new Set(all.filter((doc) => branchVisible(doc.path)).map((doc) => doc.path));
+  const resolver = new LinkResolver(drawn);
+  const linksOf = new Map<string, string[]>();
+  for (const doc of all) {
+    const out = new Set<string>();
+    for (const target of linkTargets(doc.text)) {
+      const resolved = resolver.resolve(target.split("#")[0].trim());
+      if (resolved && resolved !== doc.path) out.add(resolved);
+    }
+    linksOf.set(doc.path, [...out]);
+  }
+  const reached = new Map<string, string[]>(); // a folded note an open one links to → the open notes linking to it
+  for (const path of open) {
+    for (const target of linksOf.get(path) ?? []) {
+      if (open.has(target)) continue;
+      const from = reached.get(target) ?? [];
+      from.push(path);
+      reached.set(target, from);
+    }
+  }
+  const shown = (path: string): boolean => open.has(path) || reached.has(path) || spanned.has(path);
+  const docs = all.filter((doc) => shown(doc.path));
+  const hidden = new Set(all.filter((doc) => !shown(doc.path)).map((doc) => doc.path));
+  spatial.retain(hidden); // their places are kept for when they are opened again
+  const away = new Map<string, Set<string>>();
+  const reach = (from: string, to: string): void => {
+    let set = away.get(from);
+    if (!set) away.set(from, (set = new Set()));
+    set.add(to);
+  };
+  if (hidden.size) {
+    for (const doc of all) {
+      const fromHidden = hidden.has(doc.path);
+      for (const resolved of linksOf.get(doc.path) ?? []) {
+        const toHidden = hidden.has(resolved);
+        if (fromHidden && !toHidden) reach(resolved, doc.path);
+        else if (!fromHidden && toHidden) reach(doc.path, resolved);
+      }
+    }
+  }
+  for (const doc of docs) {
+    const folded = open.has(doc.path) ? null : foldedBranchOf(doc.path);
+    doc.branches = folded ? [folded] : [];
+    const set = away.get(doc.path);
+    doc.external = set ? [...set].sort((a, b) => noteName(a).localeCompare(noteName(b)) || a.localeCompare(b)) : [];
+  }
+  seedReached(reached);
+  // A vault note left over from before branches (a browser tab's folder, say) is still
+  // sized by what is inside its folder.
+  for (const doc of docs) {
+    if (parseType(doc.text) !== "vault") continue;
     const folder = vaultFolderOf(doc.path, doc.text);
     doc.holds = all.filter((other) => other.path.startsWith(folder + "/")).length;
   }
   waiting = waitedFor(docs); // the graph's own read is also the answer `freshPath` needs
   return docs;
+}
+
+/* -------------------------------------------------------------- branches --- */
+/*
+ * A BRANCH is a folder with a `.notes/` of its own — what used to be a vault inside a
+ * vault, opened in a window of its own behind one node. There is no node any more: the
+ * folder's notes are part of this graph, and the branch is either OPEN (its notes drawn,
+ * linked to whatever they link to) or FOLDED (its notes off the canvas, and every note
+ * that links into it wearing the branch mark at its corner, which opens it). Which
+ * branches stand open is this session's alone: every opening of the folder starts from
+ * `branchDepth` in the settings, and nothing is written about it anywhere.
+ */
+
+/**
+ * The one-time change from vaults-in-vaults to branches, run whenever a folder is opened by
+ * path and finds something left to change. Two kinds of note become the graph itself:
+ *
+ * - A REFERENCE (`type:: ref`) to a note that is under this folder. Every link to the
+ *   reference is repointed at the note it stood for, spelled as a full path so it means
+ *   that note whatever else is called the same; then the reference goes. A reference to a
+ *   note outside this folder is left standing — it still points somewhere else.
+ * - A VAULT NOTE (`type:: vault`) whose folder is a branch here, or a reference to such a
+ *   folder. Its folder's notes are on this canvas now (folded or open), so the pointer has
+ *   nothing to do; links to it are taken out, and it goes.
+ *
+ * Nothing is lost: every file removed or rewritten is kept as it was in one JSON file in
+ * `.notes/`, so the change can be undone by hand if it ever has to be.
+ */
+async function migrateToBranches(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge || !(vault instanceof ShellVault)) return;
+  const root = vault.root.replace(/[\\/]+$/, "");
+  const base = ((baseRoot ?? (await bridge.baseGet().catch(() => null))) ?? "").replace(/[\\/]+$/, "");
+  entries = await vault.entries();
+  const paths = filePaths();
+  const texts = await readTexts(paths);
+  const branches = new Set(branchFolders(entries));
+  const stood = new Map<string, string>(); // reference → the note here it stood for
+  const pointers: string[] = []; // vault notes whose folder is a branch here
+  // A vault note's `vault::` line was written relative to the vault the note was made in,
+  // which is some branch above it now (or this folder). Tried from the innermost out.
+  const pointsAtBranch = (path: string, folder: string): boolean => {
+    const roots = [...branchAncestors(path).reverse(), ""];
+    return roots.some((root) => branches.has(join(root, folder)));
+  };
+  for (const path of paths) {
+    const text = texts.get(path);
+    if (text === undefined) continue;
+    const type = parseType(text);
+    if (type === "vault") {
+      if (pointsAtBranch(path, vaultFolderOf(path, text))) pointers.push(path);
+      continue;
+    }
+    if (type !== "ref") continue;
+    const target = parseField(text, "ref");
+    if (!target) continue;
+    // A `ref::` line is relative to the Bedrock folder, or absolute (see `refForm`).
+    const abs = target.startsWith("/") ? target : target.startsWith("~") || !base ? null : `${base}/${target}`;
+    if (!abs || !abs.startsWith(`${root}/`)) continue;
+    const here = abs.slice(root.length + 1);
+    if (here === path) continue;
+    // A reference to a whole vault under this folder is a pointer to a branch: nothing
+    // stands for a branch any more, so it goes the way a vault note does.
+    if (branches.has(here)) {
+      pointers.push(path);
+      continue;
+    }
+    if (!paths.includes(here)) continue;
+    stood.set(path, here);
+  }
+  if (!stood.size && !pointers.length) return;
+  await flushAll();
+  const resolver = new LinkResolver(paths);
+  const gone = new Set([...stood.keys(), ...pointers]);
+  const pin = (target: string): string | null => {
+    const from = resolver.resolve(target);
+    const to = from ? stood.get(from) : undefined;
+    return to ? to.replace(/\.md$/i, "") : null;
+  };
+  const dead = (target: string): boolean => {
+    const from = resolver.resolve(target);
+    return !!from && pointers.includes(from);
+  };
+  const rewrite = (text: string): string => {
+    let next = stood.size ? pinText(text, pin) : text;
+    if (pointers.length) next = unlinkText(next, dead);
+    return next;
+  };
+  // A pointer that also carries links of its own — a vault note that was linked onward, a
+  // reference made by Move into… with the note's connections — is not thrown away with
+  // them: its pointer lines go and it stays as a plain note under its name, to be deleted
+  // by hand if nothing in it is wanted. A bare pointer goes.
+  const stays = new Set<string>();
+  for (const path of pointers) {
+    const text = texts.get(path) ?? "";
+    if (parseLinks(text).length) stays.add(path);
+  }
+  for (const path of stays) gone.delete(path);
+  const kept: Record<string, string> = {};
+  let touched = 0;
+  for (const path of stays) {
+    const text = texts.get(path) ?? "";
+    let next = text;
+    for (const field of ["type", "vault", "ref", "target"]) next = setField(next, field, null);
+    kept[path] = text;
+    await vault.write(path, next.replace(/^\n+/, ""));
+    touched++;
+  }
+  for (const path of paths) {
+    if (gone.has(path) || stays.has(path)) continue;
+    const text = texts.get(path);
+    if (text === undefined) continue;
+    const next = rewrite(text);
+    if (next === text) continue;
+    kept[path] = text;
+    await vault.write(path, next);
+    touched++;
+  }
+  stickies.rewriteTexts(rewrite); // the card files were rewritten on disk like any note
+  // The note takes the place its stand-in had on this canvas: that is where it was meant to be.
+  for (const [ref, here] of stood) spatial.carryOver(ref, here);
+  for (const path of gone) {
+    kept[path] = texts.get(path) ?? "";
+    await vault.remove(path, "file");
+  }
+  const when = new Date().toISOString();
+  await vault
+    .write(
+      `${NOTES_DIR}/branches-migration-${when.replace(/[:.]/g, "-")}.json`,
+      JSON.stringify({ when, removed: [...gone], rewritten: Object.keys(kept).filter((p) => !gone.has(p)), files: kept }, null, 1) + "\n",
+    )
+    .catch(() => undefined);
+  entries = await vault.entries();
+  const refs = stood.size ? `${stood.size} reference${stood.size === 1 ? "" : "s"}` : "";
+  const notes = pointers.length ? `${pointers.length} vault note${pointers.length === 1 ? "" : "s"}` : "";
+  const held = stays.size ? `; ${stays.size} pointer${stays.size === 1 ? "" : "s"} with links of its own kept as a plain note` : "";
+  ui.status.textContent = `branches: ${[refs, notes].filter(Boolean).join(" and ")} folded into the graph, ${touched} note${touched === 1 ? "" : "s"} rewritten${held} — the old files are kept in .notes/`;
+}
+
+/** The branches standing open right now, as folders relative to the vault root. */
+let openBranches = new Set<string>();
+/** The branch folders the open set has been decided for; a folder new to this set takes the default. */
+let knownBranches = new Set<string>();
+/** True when the open set is to be started over from the default depth — on opening a folder, or changing the depth. */
+let branchesReset = true;
+/**
+ * Notes brought onto the canvas ON THEIR OWN out of folded branches — picked from the count
+ * on a note they are connected to. Each stands here wearing the branch mark for its folder,
+ * connected to whatever else is drawn, until its branch opens (then it is an ordinary note
+ * of it) or folds (then it goes with it), or it is hidden again from its menu. This
+ * session's alone, like the open branches.
+ */
+const spanned = new Set<string>();
+
+/**
+ * The branch this window was opened FOR (see `trunkFor`), or null for the trunk itself. The
+ * depth counts from it: its own sub-branches are the first level, the branches beside it
+ * start folded.
+ */
+let branchFocus: string | null = null;
+
+/** How many branch folders lie on the way to `path` — 1 for a note directly in a top-level branch. */
+const branchDepthOf = (folder: string): number => branchAncestors(folder).length + 1;
+
+/** The branch folders, as a set, worked out once per listing — this is asked for every note on every read. */
+let branchSet = new Set<string>();
+let branchSetFor: Entry[] | null = null;
+function branchesNow(): Set<string> {
+  if (branchSetFor !== entries) {
+    branchSetFor = entries;
+    branchSet = new Set(branchFolders(entries));
+  }
+  return branchSet;
+}
+
+/** The branch folders above (or at) a path, outermost first — only branches, not every folder. */
+function branchAncestors(path: string, including = false): string[] {
+  const branches = branchesNow();
+  const out: string[] = [];
+  const segments = path.split("/").filter(Boolean);
+  const upto = including ? segments.length : segments.length - 1;
+  for (let i = 1; i <= upto; i++) {
+    const folder = segments.slice(0, i).join("/");
+    if (branches.has(folder)) out.push(folder);
+  }
+  return out;
+}
+
+/**
+ * Brings the open set up to date with the folders on disk: started over from the default
+ * depth when asked to (`branchesReset`), else only deciding for branches not seen before.
+ */
+function settleBranches(): void {
+  const depth = settings.layout().branchDepth;
+  const folders = branchFolders(entries);
+  if (branchesReset) {
+    branchesReset = false;
+    openBranches = new Set();
+    knownBranches = new Set();
+  }
+  const focus = branchFocus;
+  const focusDepth = focus ? branchDepthOf(focus) : 0;
+  for (const folder of folders) {
+    if (knownBranches.has(folder)) continue;
+    knownBranches.add(folder);
+    if (focus) {
+      // The focused branch stands open; below it the depth counts from there; everything
+      // else — the branches above it included — is folded.
+      const below = folder.startsWith(focus + "/") && branchDepthOf(folder) - focusDepth <= depth;
+      if (focus === folder || below) openBranches.add(folder);
+    } else if (branchDepthOf(folder) <= depth) openBranches.add(folder);
+  }
+}
+
+/** The branch a note is IN: the innermost branch folder above it, or null for a note of the trunk itself. */
+const branchOf = (path: string): string | null => {
+  const above = branchAncestors(path);
+  return above.length ? above[above.length - 1] : null;
+};
+
+/**
+ * Whether a note's branch stands open. A branch is its own folder and nothing more: the
+ * branches above it have no say — Theory/Classical Statistics open shows its notes whether
+ * or not Theory's own notes are drawn — so one click on a note's mark is always enough.
+ */
+const branchVisible = (path: string): boolean => {
+  const own = branchOf(path);
+  return !own || openBranches.has(own);
+};
+
+/** The folded branch a note is in — the one its mark opens — or null for a shown note. */
+const foldedBranchOf = (path: string): string | null => {
+  const own = branchOf(path);
+  return own && !openBranches.has(own) ? own : null;
+};
+
+/**
+ * Opens a branch: its notes come onto the canvas, and cola runs over everything from where
+ * it all stands — the branch takes its room, and the rest makes it. Only this branch: the
+ * folders above it keep their own state (see `branchVisible`). `anchor` is the note whose
+ * mark was clicked: the branch's own arrangement, when it has one, is set down beside it,
+ * so the notes start from something like their shape rather than from a heap.
+ */
+async function openBranch(folder: string, anchor: string | null = null): Promise<void> {
+  // Seeds FIRST, then the branch stands open: the seeding reads a file, and a redraw that
+  // lands in that gap would draw the notes where they were remembered, seeds or no seeds.
+  await seedBranch(folder, anchor);
+  openBranches.add(folder);
+  knownBranches.add(folder);
+  for (const path of spanned) if (branchVisible(path)) spanned.delete(path); // ordinary notes of the branch now
+  graphStale = true;
+  await showAll();
+  graphView.runLayoutAll();
+  const inside = filePaths().filter((path) => path.startsWith(folder + "/") && !isCardPath(path)).length;
+  ui.status.textContent = `${folder} opened — ${inside} note${inside === 1 ? "" : "s"}; right-click one of them to fold it back`;
+}
+
+/** Folds a branch: its notes leave the canvas, and the notes that link into it wear the mark again. */
+async function collapseBranch(folder: string): Promise<void> {
+  // The branch and everything under it: a fold is of the whole limb.
+  for (const open of [...openBranches]) if (open === folder || open.startsWith(folder + "/")) openBranches.delete(open);
+  for (const path of spanned) if (path.startsWith(folder + "/")) spanned.delete(path); // folded away with the rest
+  graphStale = true;
+  await showAll();
+  ui.status.textContent = `${folder} folded — the marked notes link into it`;
+}
+
+/**
+ * A place for every note drawn as an OUTGOING connection that has none yet: beside the
+ * note that links to it, fanned out when one note reaches several, so a vault's outward
+ * connections stand round its edge rather than in a heap in the middle. A note that has
+ * stood here before keeps its place (`SpatialStore.retain`), and a note whose linker has
+ * no place yet either is left to the free-spot fallback.
+ */
+function seedReached(reached: Map<string, string[]>): void {
+  const seeds: Array<[string, { x: number; y: number }]> = [];
+  const fanned = new Map<string, number>();
+  // Where a linker is, or is about to be: a seed for a note arriving in this same pass
+  // beats the place remembered for it, which may be from the far side of the trunk.
+  const placeOf = (one: string) => graphView.seedOf(one) ?? graphView.nodePosition(one) ?? spatial.node(one) ?? null;
+  for (const [path, from] of reached) {
+    if (graphView.hasNode(path)) continue; // already standing here; nothing to place
+    const anchor = from.find((one) => placeOf(one));
+    if (!anchor) continue;
+    const at = placeOf(anchor)!;
+    // A place remembered near its linker is kept; one far off — the other end of the trunk,
+    // from a showing of the whole — is not worth a line across the canvas.
+    const held = spatial.node(path);
+    if (held && Math.hypot(held.x - at.x, held.y - at.y) < 700) continue;
+    const n = fanned.get(anchor) ?? 0;
+    fanned.set(anchor, n + 1);
+    // Round the linker, a step apart; the first to the right, then on round the clock.
+    const angle = -0.35 + n * 0.7;
+    seeds.push([path, { x: at.x + 170 * Math.cos(angle), y: at.y + 170 * Math.sin(angle) }]);
+  }
+  if (seeds.length) graphView.seedPositions(seeds);
+}
+
+/**
+ * Places a branch's notes for their showing. Every note keeps its place from the last time
+ * it stood on this canvas (`SpatialStore.retain`), or takes the one the branch's own
+ * arrangement (`.notes/layout.json` in its folder) gives it, or is left to cola. Opened
+ * from a note's mark (`anchor`), the branch is set down BESIDE that note — the whole block
+ * shifted as one piece, its shape kept — unless it is already near: a branch that was last
+ * seen at the far end of the canvas must not open off the screen you are looking at.
+ * With no anchor the notes still to be placed go past `cursor` (the last branch set down
+ * in the same pass), or to the right of everything already drawn.
+ */
+async function seedBranch(folder: string, anchor: string | null, cursor: { x: number; y: number } | null = null): Promise<{ x: number; y: number } | null> {
+  let layout: { nodes?: Record<string, { x: number; y: number }> } = {};
+  try {
+    layout = JSON.parse(await vault.read(join(folder, LAYOUT_FILE))) as typeof layout;
+  } catch {
+    /* a branch with no arrangement of its own: whatever is remembered here, else cola */
+  }
+  const own = new Map<string, { x: number; y: number }>();
+  for (const [inside, at] of Object.entries(layout.nodes ?? {})) {
+    if (at && Number.isFinite(at.x) && Number.isFinite(at.y)) own.set(join(folder, inside), { x: at.x, y: at.y });
+  }
+  const held: Array<[string, { x: number; y: number }]> = []; // placed here before
+  const fresh: Array<[string, { x: number; y: number }]> = []; // placed from the branch's own arrangement
+  for (const path of filePaths()) {
+    if (!path.startsWith(folder + "/") || isCardPath(path)) continue;
+    // A seed already given — by the opening that brought this pass about — stands.
+    if (!anchor && graphView.seedOf(path)) continue;
+    const at = spatial.node(path);
+    if (at) held.push([path, { ...at }]);
+    else if (own.has(path)) fresh.push([path, own.get(path)!]);
+  }
+  const at = anchor ? graphView.nodePosition(anchor) : null;
+  const boxOf = (points: Array<[string, { x: number; y: number }]>) => {
+    const xs = points.map(([, p]) => p.x);
+    const ys = points.map(([, p]) => p.y);
+    return { x1: Math.min(...xs), x2: Math.max(...xs), y1: Math.min(...ys), y2: Math.max(...ys) };
+  };
+  const shifted = (points: Array<[string, { x: number; y: number }]>, to: { x: number; y: number }): Array<[string, { x: number; y: number }]> => {
+    const box = boxOf(points);
+    const dx = to.x - (box.x1 + box.x2) / 2;
+    const dy = to.y - (box.y1 + box.y2) / 2;
+    return points.map(([path, p]) => [path, { x: p.x + dx, y: p.y + dy }]);
+  };
+  if (at) {
+    // Beside the note whose mark was clicked. A note remembered NEAR it stays where it was;
+    // the ones remembered far off — the far side of the trunk, from a showing of the whole
+    // — and the ones never placed here come as one block, in whatever shape they had, its
+    // centre half its width plus a gap to the right of the note. Judged note by note: one
+    // block of near and far together has a centre that says nothing about either.
+    const NEAR = 900;
+    const far = held.filter(([, p]) => Math.hypot(p.x - at.x, p.y - at.y) > NEAR);
+    const moving = [...far, ...fresh];
+    if (!moving.length) return null;
+    // The notes that move take the shape the branch's OWN arrangement gives them — where the
+    // trunk remembered them, scattered along a strip of every vault side by side, is no
+    // shape worth keeping. A note the branch's arrangement never placed keeps its own point.
+    const block: Array<[string, { x: number; y: number }]> = moving.map(([path, p]) => [path, own.get(path) ?? p]);
+    const box = boxOf(block);
+    const half = (box.x2 - box.x1) / 2;
+    const target = { x: at.x + half + 200, y: at.y };
+    graphView.seedPositions(shifted(block, target));
+    return { x: target.x + half, y: target.y };
+  }
+  if (!fresh.length) return null;
+  const box = boxOf(fresh);
+  const half = (box.x2 - box.x1) / 2;
+  // Where everything already is: the canvas when there is one, else what the arrangement
+  // file remembers — a folder being opened has no canvas yet.
+  const canvas = graphView.notesBox() ?? spatial.bounds();
+  const target = cursor
+    ? { x: cursor.x + half + 200, y: cursor.y }
+    : canvas
+      ? { x: canvas.x2 + half + 200, y: (canvas.y1 + canvas.y2) / 2 }
+      : { x: (box.x1 + box.x2) / 2, y: (box.y1 + box.y2) / 2 };
+  graphView.seedPositions(shifted(fresh, target));
+  return { x: target.x + half, y: target.y };
+}
+
+/**
+ * The branches that stand open but have notes with no place on this canvas yet — the first
+ * showing of a folder whose branches were vaults of their own until now — are set down from
+ * their own arrangements, side by side to the right of what is already placed. Cola is not
+ * run: what was arranged stays as arranged, and one run from the settings tidies the rest.
+ */
+async function seedOpenBranches(paths: string[]): Promise<void> {
+  let cursor: { x: number; y: number } | null = null;
+  const folders = [...openBranches].sort((a, b) => a.split("/").length - b.split("/").length || a.localeCompare(b));
+  for (const folder of folders) {
+    if (!branchVisible(folder + "/x")) continue; // behind a folded branch itself
+    const unplaced = paths.some((path) => path.startsWith(folder + "/") && !isCardPath(path) && !spatial.node(path) && !graphView.seedOf(path));
+    if (!unplaced) continue;
+    cursor = (await seedBranch(folder, null, cursor)) ?? cursor;
+  }
+}
+
+/**
+ * Click on the branch mark: one branch opens at once; several are offered as a list at the
+ * click, each row saying how many notes it holds.
+ */
+function openBranchFrom(path: string, folders: string[], client: Client): void {
+  const live = folders.filter((folder) => !openBranches.has(folder));
+  if (!live.length) return;
+  if (live.length === 1) {
+    void openBranch(live[0], path);
+    return;
+  }
+  const count = (folder: string): number => filePaths().filter((p) => p.startsWith(folder + "/") && !isCardPath(p)).length;
+  showMenu(
+    client,
+    live.map((folder) => ({
+      label: folder,
+      icon: BRANCH_ICON,
+      hint: `${count(folder)} note${count(folder) === 1 ? "" : "s"}`,
+      run: () => void openBranch(folder, path),
+    })),
+  );
+}
+
+/**
+ * Click on the incoming mark at a note's top-right: every note connected to it that is off
+ * the canvas comes here, beside it — no picking, the mark means all of them.
+ */
+function openExternalFrom(path: string, links: string[], _client: Client): void {
+  const away = links.filter((link) => !graphView.hasNode(link));
+  if (away.length) void spanNotes(away, path);
+}
+
+/** Several notes out of folded branches at once, fanned round the note they arrive at. */
+async function spanNotes(paths: string[], anchor: string): Promise<void> {
+  const at = graphView.nodePosition(anchor);
+  const seeds: Array<[string, { x: number; y: number }]> = [];
+  paths.forEach((path, i) => {
+    spanned.add(path);
+    // Round the anchor, a step apart; the first to the right, then on round the clock.
+    if (at) seeds.push([path, { x: at.x + 170 * Math.cos(-0.35 + i * 0.7), y: at.y + 170 * Math.sin(-0.35 + i * 0.7) }]);
+  });
+  if (seeds.length) graphView.seedPositions(seeds);
+  graphStale = true;
+  await showAll();
+  ui.status.textContent = `${paths.length === 1 ? `${noteName(paths[0])} brought here` : `${paths.length} notes brought here`} — the mark at a corner opens its whole branch`;
+}
+
+/** Sends a spanned note back into its folded branch. */
+async function unspanNote(path: string): Promise<void> {
+  spanned.delete(path);
+  graphStale = true;
+  await showAll();
+  ui.status.textContent = `${noteName(path)} folded away again`;
+}
+
+/** The "Fold …" rows of a note's menu: one per open branch on the way to it, outermost first. */
+function foldRows(path: string): MenuItem[] {
+  // A spanned note's branch is folded already: it can only be sent back into it.
+  if (spanned.has(path)) return [{ label: `Hide ${noteName(path)}`, icon: BRANCH_ICON, hint: foldedBranchOf(path) ?? undefined, run: () => void unspanNote(path) }];
+  // Not the branch this window was opened for, nor one above it: folding either would fold
+  // the vault you are looking at.
+  const keep = (folder: string): boolean => !branchFocus || !(branchFocus === folder || branchFocus.startsWith(folder + "/"));
+  return branchAncestors(path)
+    .filter((folder) => openBranches.has(folder) && keep(folder))
+    .map((folder) => ({ label: `Fold ${folder}`, icon: BRANCH_ICON, run: () => void collapseBranch(folder) }));
+}
+
+/**
+ * Makes a note that is folded away visible: opens every branch on the way to it. Nothing
+ * happens for a note already shown. The branches open without a cola run — the caller is
+ * about to place or link the note and has its own idea of where things go.
+ */
+/** Brings a note into view, opening the branches folded over it first. */
+async function goToNote(path: string): Promise<void> {
+  await revealPath(path);
+  graphView.focusNode(path);
+}
+
+async function revealPath(path: string): Promise<boolean> {
+  const folded = foldedBranchOf(path);
+  if (!folded) return false;
+  await seedBranch(folded, null); // before the branch stands open — see `openBranch`
+  openBranches.add(folded);
+  knownBranches.add(folded);
+  graphStale = true;
+  await showAll();
+  return true;
 }
 
 /**
@@ -1107,14 +1652,16 @@ async function pickFolder(): Promise<void> {
     // nobody is ever asked twice. The folder handle stays the browser's way in.
     const chosen = await bridge.pickPath("folder").catch(() => null);
     if (!chosen) return; // the dialog was dismissed
-    const root = chosen.replace(/[\\/]+$/, "");
-    const next = new ShellVault(root);
+    const picked = chosen.replace(/[\\/]+$/, "");
     // A folder made in the sheet with New Folder IS the way a vault is made now, so it is
     // one from this moment — not only once the graph has been touched — and the search
     // across vaults sees it straight away.
-    if (!(await next.exists(dirname(CONFIG_FILE)))) await next.createDir(dirname(CONFIG_FILE)).catch(() => undefined);
+    const made = new ShellVault(picked);
+    if (!(await made.exists(dirname(CONFIG_FILE)))) await made.createDir(dirname(CONFIG_FILE)).catch(() => undefined);
+    const { root, branch } = await trunkFor(picked);
+    const next = new ShellVault(root);
     localStorage.setItem(ROOT_KEY + next.name, root);
-    await openVault(next);
+    await openVault(next, branch);
     return;
   }
   if (!canPickFolder()) {
@@ -1131,12 +1678,30 @@ async function pickFolder(): Promise<void> {
 }
 
 /**
+ * Which folder a picked folder is OPENED AS. Every folder under the Bedrock folder is a
+ * branch of one graph, so opening one opens the Bedrock folder as the trunk with that
+ * branch in focus: its notes drawn, every other branch folded behind the marks on the
+ * notes that link into it — which is how a note in another vault is reached and its
+ * branch opened, from inside this one. A folder kept elsewhere is its own trunk, as before.
+ */
+async function trunkFor(picked: string): Promise<{ root: string; branch: string | null }> {
+  const bridge = window.bedrock;
+  const trim = (p: string): string => p.replace(/[\\/]+$/, "");
+  const chosen = trim(picked);
+  const base = bridge ? trim((baseRoot ?? (await bridge.baseGet().catch(() => null))) ?? "") : "";
+  if (base) baseRoot = base;
+  if (!base || chosen === base || !chosen.startsWith(`${base}/`)) return { root: chosen, branch: null };
+  return { root: base, branch: chosen.slice(base.length + 1) };
+}
+
+/**
  * Makes `next` the vault on screen — picked from disk, or entered from a vault node.
  * Everything that belongs to a vault is re-read from this one: arrangement, stickies,
  * issues, settings.
  */
-async function openVault(next: Vault): Promise<void> {
+async function openVault(next: Vault, focus: string | null = null): Promise<void> {
   vault = next;
+  branchFocus = focus;
   // Throw the old vault's graph away FIRST. A live instance makes the next render take
   // the `sync` path, which would treat the whole new vault as newly-added notes, scatter
   // them, and then save that over the arrangement this folder already had.
@@ -1144,14 +1709,21 @@ async function openVault(next: Vault): Promise<void> {
   await spatial.attach(vault); // this folder's own arrangement, not the last one's
   await stickies.attach(vault);
   await issueIds.attach(vault); // and this folder's own issues
-  await settings.attach(vault, await settingsRoot(vault)); // its own answers, over the Bedrock folder's
+  // The settings are the FOCUSED vault's — its integrations, its connections, its look — over
+  // the Bedrock folder's, exactly as when it was a vault of its own; the trunk opened as
+  // itself answers from the folder's config alone.
+  const focusVault = focus && vault instanceof ShellVault ? new ShellVault(`${vault.root.replace(/[\\/]+$/, "")}/${focus}`) : null;
+  await settings.attach(focusVault ?? vault, focusVault ? vault : await settingsRoot(vault));
   applyFeatures();
   panes = [{ tabs: [{ kind: "graph" }], active: 0 }];
   focused = 0;
   lastFile = null;
-  sidebar.reveal("");
-  ui.crumb.textContent = "/";
+  sidebar.reveal(focus ?? "");
+  ui.crumb.textContent = "/" + (focus ?? "");
+  branchesReset = true; // which branches stand open starts from the setting, every time
+  await migrateToBranches();
   await refresh();
+  if (focus) graphView.fitTo(focus + "/"); // the vault asked for fills the view; the rest is around it
   ui.welcome.hidden = true;
   vaultOpen = true;
   // The shell keeps a note of which window holds which vault, so opening the vault behind
@@ -1560,20 +2132,6 @@ async function save(index: number): Promise<void> {
  */
 async function insertCitation(source: string, target: string, label: string | null = null): Promise<void> {
   if (source === target) return;
-  const leaf = leafOf(source);
-  if (leaf) {
-    // A section's link goes at the end of its heading line in the meeting's note — the
-    // relation name has no place there, so a leaf's arrow is always a bare link.
-    if (leaf.path === target) return;
-    await flushAll(); // the meeting's note may be open, with the heading in its buffer
-    const before = await vault.read(leaf.path);
-    const after = linkSection(before, leaf.index, target.replace(/\.md$/i, ""));
-    if (after !== before) {
-      await vault.write(leaf.path, after);
-      syncOpenPanes(leaf.path, after);
-    }
-    return;
-  }
   const text = await vault.read(source);
   const resolver = new LinkResolver(filePaths());
   const spelling = target.replace(/\.md$/i, "");
@@ -1607,22 +2165,6 @@ async function applyEdgeLabel(source: string, target: string, fresh: string | nu
   const text = await vault.read(source);
   const resolver = new LinkResolver(filePaths());
   const spelling = target.replace(/\.md$/i, "");
-  const same = (t: string): boolean => resolver.resolve(t) === target || t.trim() === spelling.trim();
-  if (graphView.nodeType(source) === "granola") {
-    // A meeting's arrow is drawn by a heading line, where a relation name has no place: the
-    // name goes on a line of its own under that heading, which the graph reads like any link.
-    const next = labelSection(text, same, spelling, label);
-    if (next !== text) {
-      await vault.write(source, next);
-      syncOpenPanes(source, next);
-    }
-    graphView.setEdgeLabel(source, target, label);
-    graphStale = true;
-    ui.status.textContent = label
-      ? `${noteName(source)} —${label}→ ${noteName(target)}`
-      : `unnamed: ${noteName(source)} → ${noteName(target)}`;
-    return;
-  }
   const lines = text.split("\n");
   const at = lines.findIndex((line) =>
     linkTargets(line).some((t) => resolver.resolve(t) === target || t.trim() === spelling.trim()),
@@ -1651,25 +2193,6 @@ async function applyEdgeLabel(source: string, target: string, fresh: string | nu
  * exists is a file nothing on the canvas can ever reach again.
  */
 async function deleteEdge(source: string, target: string): Promise<void> {
-  const leaf = leafOf(source);
-  if (leaf) {
-    const title = `${linkSourceName(source)}${ARROW}${noteName(target)}`;
-    if (!(await askConfirm(`Cut the section's arrow ${title}?`, "Delete"))) return;
-    await flushAll();
-    const resolver = new LinkResolver(filePaths());
-    const spelling = target.replace(/\.md$/i, "");
-    const cut = (t: string): boolean => resolver.resolve(t) === target || t.trim() === spelling.trim();
-    const before = await vault.read(leaf.path);
-    const after = unlinkSection(before, leaf.index, cut);
-    if (after !== before) {
-      await vault.write(leaf.path, after);
-      syncOpenPanes(leaf.path, after);
-    }
-    await refresh();
-    await showAll();
-    ui.status.textContent = after === before ? `nothing to cut: ${title}` : `cut ${title}`;
-    return;
-  }
   const title = `${noteName(source)}${ARROW}${noteName(target)}`;
   const note = edgeNotePath(source, target);
   const described = await vault.exists(note);
@@ -1682,10 +2205,7 @@ async function deleteEdge(source: string, target: string): Promise<void> {
   const spelling = target.replace(/\.md$/i, "");
   const cut = (t: string): boolean => resolver.resolve(t) === target || t.trim() === spelling.trim();
   const text = await vault.read(source);
-  // A meeting's headings link on behalf of their sections: the link comes off the heading
-  // whole — and then the body is cut the way any note's is, which is where the arrow's
-  // name lives if it was given one (`labelSection`).
-  const next = unlinkText(graphView.nodeType(source) === "granola" ? unlinkSection(text, null, cut) : text, cut);
+  const next = unlinkText(text, cut);
   if (next !== text) {
     await vault.write(source, next);
     syncOpenPanes(source, next);
@@ -1748,22 +2268,6 @@ async function createHolderAt(
       if (source) await finishLink(source, finalPath, null);
     })();
   });
-  await refreshSidebar();
-}
-
-/**
- * A leaf dropped on empty canvas: a note named after its heading, made where it landed and
- * pointed at from the section — the leaf's menu with the answer already given. The name is
- * the heading's words as a file can carry them; one already taken gets a number.
- */
-async function createNoteFromLeaf(leaf: string, title: string, at: { x: number; y: number }): Promise<void> {
-  const name = tidyName(title) || HOLDER_NAME;
-  const path = freshPath("", name);
-  await vault.createFile(path, "");
-  entries = [...entries, { path, kind: "file" }];
-  graphView.commitLink(leaf, path, { label: noteName(path), at });
-  graphStale = true;
-  await finishLink(leaf, path, null);
   await refreshSidebar();
 }
 
@@ -2075,8 +2579,13 @@ async function openVaultAt(root: string, focus: string | null = null): Promise<v
     return;
   }
   const here = knownVaultRoot();
-  if (here && samePath(here, root)) {
-    if (focus) graphView.focusNode(focus);
+  // A folder under the Bedrock folder is a branch of the trunk this window may already be
+  // showing: then the branch opens here, and the note asked for is brought into view.
+  const { root: trunk, branch } = await trunkFor(root);
+  if (here && samePath(here, trunk)) {
+    if (branch && !openBranches.has(branch)) await openBranch(branch);
+    if (focus) await goToNote(branch ? `${branch}/${focus}` : focus);
+    else if (branch) graphView.fitTo(branch + "/");
     return;
   }
   await flushAll();
@@ -2095,13 +2604,14 @@ async function openVaultAt(root: string, focus: string | null = null): Promise<v
     // is no window to close to come back, so the status bar says what the way back is —
     // ⌘O reaches any folder, this one included, and lands it in this same window.
     const came = vault.name;
-    const next = new ShellVault(root);
-    localStorage.setItem(ROOT_KEY + next.name, root);
-    await openVault(next);
-    if (focus) graphView.focusNode(focus);
-    ui.status.textContent = `${next.name} — ⌘O to go back to ${came}`;
+    const next = new ShellVault(trunk);
+    localStorage.setItem(ROOT_KEY + next.name, trunk);
+    await openVault(next, branch);
+    if (focus) await goToNote(branch ? `${branch}/${focus}` : focus);
+    ui.status.textContent = `${vaultNameOf(root)} — ⌘O to go back to ${came}`;
     return;
   }
+  // The folder as asked for: the new window works out its trunk and branch for itself.
   if (!(await bridge.windowOpen(root, focus).catch(() => false))) ui.status.textContent = "the shell would not open a second window";
 }
 
@@ -2115,25 +2625,26 @@ const vaultNameOf = (root: string): string => root.replace(/[\\/]+$/, "").split(
  */
 function adoptVaultFromPath(): void {
   const address = new URL(location.href);
-  const root = address.searchParams.get("root");
-  if (!root || !window.bedrock) return;
-  const next = new ShellVault(root);
-  localStorage.setItem(ROOT_KEY + next.name, root);
+  const asked = address.searchParams.get("root");
+  if (!asked || !window.bedrock) return;
   const focus = address.searchParams.get("focus");
   // The door closes at once: a big vault takes a moment to read, and a welcome screen
   // standing there meanwhile reads as "nothing happened". If the open does fail, the
   // door comes back with the reason on it.
   ui.welcome.hidden = true;
-  ui.status.textContent = `opening ${next.name}…`;
-  openVault(next)
-    .then(() => {
-      if (focus) graphView.focusNode(focus);
-    })
-    .catch((err) => {
-      console.error(err);
-      ui.welcome.hidden = false;
-      ui.status.textContent = `${next.name} could not be opened — ${shellError(err)}`;
-    });
+  ui.status.textContent = `opening ${vaultNameOf(asked)}…`;
+  (async () => {
+    const { root, branch } = await trunkFor(asked);
+    const next = new ShellVault(root);
+    localStorage.setItem(ROOT_KEY + next.name, root);
+    await openVault(next, branch);
+    // The note asked for is relative to the folder asked for; here it is under the trunk.
+    if (focus) await goToNote(branch ? `${branch}/${focus}` : focus);
+  })().catch((err) => {
+    console.error(err);
+    ui.welcome.hidden = false;
+    ui.status.textContent = `${vaultNameOf(asked)} could not be opened — ${shellError(err)}`;
+  });
 }
 
 /**
@@ -2203,6 +2714,10 @@ async function moveNoteInto(path: string): Promise<void> {
     ui.status.textContent = "moving a note into another vault needs the desktop app";
     return;
   }
+  if (!ownNote(path)) {
+    ui.status.textContent = `${noteName(path)} belongs to ${branchOf(path) ?? "the trunk"} — open that branch to move it`;
+    return;
+  }
   const picked = await bridge
     .pickPath("folder", { defaultPath: baseRoot ?? undefined, message: `Move ${noteName(path)} into which vault?` })
     .catch(() => null);
@@ -2214,8 +2729,8 @@ async function moveNoteInto(path: string): Promise<void> {
     return;
   }
   const other = new ShellVault(dest);
-  if (dest.startsWith(`${here}/`) && !(await other.exists(dirname(CONFIG_FILE)))) {
-    ui.status.textContent = `${fsBasename(dest)} is a folder inside this vault, not a vault — drag the note there instead`;
+  if (dest.startsWith(`${here}/`)) {
+    await moveIntoBranch([path], dest.slice(here.length + 1));
     return;
   }
   await flushAll();
@@ -2251,6 +2766,41 @@ async function moveNoteInto(path: string): Promise<void> {
     ui.status.textContent = `${noteName(path)} could not be moved — ${shellError(err)}`;
   }
 }
+
+/**
+ * Notes moved into a folder of this graph — picked in the sheet, made there with New Folder
+ * as often as not. The folder becomes a BRANCH if it is not one yet (its own `.notes/`, a
+ * copy of this vault's settings), and stands open, so what was moved is still on the canvas
+ * afterwards. Each note simply moves, links following, and its node stays where it stands:
+ * a reference would be a pointer to a note that is on this same canvas.
+ */
+async function moveIntoBranch(paths: string[], dir: string, leftBehind = 0): Promise<void> {
+  if (!(await vault.exists(join(dir, CONFIG_FILE)))) {
+    await vault.createDir(join(dir, dirname(CONFIG_FILE)));
+    await vault.write(join(dir, CONFIG_FILE), settings.snapshot());
+  }
+  entries = await vault.entries();
+  openBranches.add(dir);
+  knownBranches.add(dir);
+  let moved = 0;
+  for (const path of paths) {
+    if (dirname(path) === dir) continue;
+    const before = entries.length;
+    await moveEntry(path, "file", dir, true);
+    if (entries.length === before) moved++;
+  }
+  graphView.clearPicked();
+  const rest = leftBehind ? `; ${leftBehind} from other branches left where ${leftBehind === 1 ? "it is" : "they are"}` : "";
+  ui.status.textContent = `${moved === 1 ? "1 note" : `${moved} notes`} → ${dir}${moved !== paths.length ? " (the rest were there already)" : ""}${rest}`;
+}
+
+/**
+ * Whether a note on the canvas is THIS folder's to move: not drawn here out of a folded
+ * branch (it wears the branch mark), and — in a window opened for one vault — inside that
+ * vault's folder rather than in a branch opened beside it.
+ */
+const ownNote = (path: string): boolean =>
+  foldedBranchOf(path) === null && (!branchFocus || path === branchFocus || path.startsWith(branchFocus + "/"));
 
 /** A note's connections, as lines of their own: each distinct link once, with its relation name. */
 function linkLines(text: string): string {
@@ -2309,9 +2859,13 @@ async function moveSelectionTo(picked: string[]): Promise<void> {
     ui.status.textContent = "moving notes into another vault needs the desktop app";
     return;
   }
-  const notes = picked.filter((path) => graphView.nodeType(path) !== "vault");
+  // Only what is THIS folder's goes: a note drawn here out of another branch — wearing the
+  // branch mark, or in a sibling vault opened alongside — stays where it lives, and the
+  // links between them keep pointing across, being paths.
+  const notes = picked.filter((path) => graphView.nodeType(path) !== "vault" && ownNote(path));
+  const foreign = picked.length - notes.length;
   if (!notes.length) {
-    ui.status.textContent = "nothing to move — a vault node stays with its folder";
+    ui.status.textContent = foreign ? "nothing to move — those notes belong to other branches, and stay there" : "nothing to move — a vault node stays with its folder";
     return;
   }
   const chosen = await bridge
@@ -2325,8 +2879,8 @@ async function moveSelectionTo(picked: string[]): Promise<void> {
     return;
   }
   const other = new ShellVault(dest);
-  if (dest.startsWith(`${here}/`) && !(await other.exists(dirname(CONFIG_FILE)))) {
-    ui.status.textContent = `${fsBasename(dest)} is a folder inside this vault, not a vault — drag the notes there instead`;
+  if (dest.startsWith(`${here}/`)) {
+    await moveIntoBranch(notes, dest.slice(here.length + 1), foreign);
     return;
   }
   await flushAll();
@@ -2373,7 +2927,7 @@ async function moveSelectionTo(picked: string[]): Promise<void> {
 /**
  * The two branches every link starts from — "Link + Create" makes something new on the
  * other end, "Link + Attach" puts something that already exists there — for a note, or
- * for a leaf of a meeting (see `granola.ts`): the draft's source is whichever asked.
+ * from whichever note asked.
  */
 function linkBranches(source: string): MenuItem[] {
     const create: MenuItem[] = [
@@ -2417,46 +2971,15 @@ function linkBranches(source: string): MenuItem[] {
       },
       ...attachMenu(
         (option, kind) => () =>
-          graphView.startLink(source, kind, (at, source) => void option.place(at, null, source)),
+          graphView.startLink(source, kind, (at, source) => void option.place(at, branchOf(source ?? "") ?? null, source)),
       ),
     ];
     items.push({ label: "Link + Attach", children: attach });
     return items;
 }
 
-/**
- * Click on a leaf: where should this section point? The same two branches a note's
- * menu opens with, and nothing else — a leaf has no file of its own to rename or delete.
- */
-function showLeafMenu(leaf: string, client: { x: number; y: number }): void {
-  const found = leafOf(leaf);
-  if (!found) return;
-  const items = linkBranches(leaf);
-  // The section can go from the copy here — Granola keeps the meeting itself.
-  items.push({ label: "Delete section", run: () => void deleteLeaf(found.path, found.index) });
-  showMenu(client, items);
-}
-
-/** Takes a section — heading and text — out of the meeting's note, after asking. */
-async function deleteLeaf(path: string, index: number): Promise<void> {
-  const title = graphView.leafTitle(path, index) || `section ${index + 1}`;
-  if (!(await askConfirm(`Delete “${title}” from ${noteName(path)}? Granola keeps the meeting itself.`, "Delete"))) return;
-  await flushAll();
-  const before = await vault.read(path);
-  const after = deleteSection(before, index);
-  if (after === before) return;
-  await vault.write(path, after);
-  syncOpenPanes(path, after);
-  await refresh();
-  await showAll();
-  ui.status.textContent = `deleted “${title}” from ${noteName(path)}`;
-}
-
-/** A link's source as a status line names it: the note, or "meeting § n" for a leaf. */
-function linkSourceName(source: string): string {
-  const leaf = leafOf(source);
-  return leaf ? `${noteName(leaf.path)} § ${leaf.index + 1}` : noteName(source);
-}
+/** A link's source as a status line names it. */
+const linkSourceName = (source: string): string => noteName(source);
 
 /* ---------------------------------------------------------------- linear --- */
 
@@ -4415,7 +4938,7 @@ async function connectGranola(): Promise<void> {
 }
 
 async function unlinkGranola(): Promise<void> {
-  if (!(await askConfirm("Unlink the Granola account? Notes keep their copies of the meetings.", "Unlink"))) return;
+  if (!(await askConfirm("Unlink the Granola account? Meeting notes keep pointing at their meetings.", "Unlink"))) return;
   await window.bedrock?.granolaForget().catch(() => false);
   granolaWord = "";
   ui.status.textContent = "Granola: unlinked — the token is forgotten";
@@ -4439,22 +4962,13 @@ async function granolaReady(): Promise<boolean> {
 }
 
 /**
- * A meeting note: the pointer (the id Granola minted, and the meeting's own address),
- * the date, who was there — and then the notes themselves, as Granola wrote them. The
- * copy is the point: the graph can show what was said without asking the server, and
- * a section of it can be linked to a note of your own.
+ * A meeting note is a pointer in the page note's mould: the id Granola minted, the
+ * meeting's own address, its day — and nothing said on its behalf. The notes themselves
+ * stay Granola's own; a click opens them there.
  */
-const granolaTemplate = (note: GranolaNote): string => {
-  const day = note.at ? new Date(note.at).toISOString().slice(0, 10) : "";
-  const head = [
-    "type:: granola",
-    "",
-    `meeting:: ${note.id}`,
-    `url:: ${note.url}`,
-    ...(day ? [`date:: ${day}`] : []),
-    ...(note.attendees.length ? [`attendees:: ${note.attendees.join(", ")}`] : []),
-  ];
-  return `${head.join("\n")}\n\n${note.notes.trim()}\n`;
+const granolaTemplate = (meeting: GranolaMeeting): string => {
+  const day = meeting.at ? new Date(meeting.at).toISOString().slice(0, 10) : "";
+  return ["type:: granola", "", `meeting:: ${meeting.id}`, `url:: ${meeting.url}`, ...(day ? [`date:: ${day}`] : [])].join("\n") + "\n";
 };
 
 /** Click on a meeting node: open the meeting in Granola. There is no making one. */
@@ -4477,7 +4991,7 @@ async function openGranolaNode(path: string, meeting: string | null): Promise<vo
   say(opened ? `${noteName(path)} → Granola` : `the note's meeting:: line is not a Granola meeting id`);
 }
 
-/** Fetches the meeting whole and puts it on the canvas as a note — notes copied in. */
+/** Puts a meeting on the canvas as a note pointing at it — nothing read, nothing copied. */
 async function attachGranolaMeeting(
   meeting: GranolaMeeting,
   at: { x: number; y: number },
@@ -4485,58 +4999,13 @@ async function attachGranolaMeeting(
   source: string | null,
 ): Promise<void> {
   if (!(await granolaReady())) return;
-  const bridge = window.bedrock;
-  if (!bridge) return;
-  ui.status.textContent = `Granola: reading “${meeting.title || "Untitled"}”…`;
-  let note: GranolaNote;
-  try {
-    note = await bridge.granolaGet(meeting.id);
-  } catch (err) {
-    ui.status.textContent = `Granola: ${shellError(err)}`;
-    return;
-  }
-  const title = meeting.title || note.title || "Untitled";
-  // The same meeting may already stand in another vault under the base folder. Its copy
-  // there says which sections are spoken for: one that has been pointed at a note, and
-  // one that was deleted from the copy, do not come along a second time — this copy is
-  // made of what is still free, across every vault.
-  const total = parseSections(note.notes).length;
-  let free = total;
-  const copies = await bridge.granolaCopies(note.id).catch(() => []);
-  if (copies.length) {
-    const assigned = new Set<string>();
-    const present: Array<Set<string>> = [];
-    for (const copy of copies) {
-      const sections = parseSections(copy.text);
-      present.push(new Set(sections.map((section) => sectionKey(section.title))));
-      for (const section of sections) if (section.targets.length) assigned.add(sectionKey(section.title));
-    }
-    note.notes = keepSections(note.notes, (section) => {
-      const key = sectionKey(section.title);
-      const spoken = assigned.has(key) || present.some((had) => !had.has(key));
-      if (spoken) free--;
-      return !spoken;
-    });
-  }
-  const spare =
-    free === total
-      ? "notes copied in"
-      : free
-        ? `${free} of ${total} sections still free — the rest are assigned or deleted in another vault`
-        : "every section is already assigned or deleted in another vault";
+  const title = meeting.title || "Untitled";
   await attachNodeAt(
-    {
-      kind: "granola",
-      title,
-      text: granolaTemplate({ ...note, title, at: note.at || meeting.at, url: note.url || meeting.url }),
-      handle: note.id,
-      done: `${title} → its meeting in Granola, ${spare}`,
-    },
+    { kind: "granola", title, text: granolaTemplate(meeting), handle: meeting.id, done: `${title} → its meeting in Granola` },
     at,
     folder,
     source,
   );
-  await showAll(); // the ring of sections is read off the file: draw it now, not at the next change
 }
 
 /* ---------------------------------------------------------------- notion --- */
@@ -6260,10 +6729,10 @@ async function attachIndexed(
   const bridge = window.bedrock;
   if (!bridge) return;
   const { failed, hint } = attachReporters();
-  // A note inside a vault nested in this one is in this vault's files, but not on this
-  // canvas — the nested vault stands here as one node. It is somewhere else, as far as
-  // the canvas is concerned, and gets a reference like any note in another vault.
-  if (note.relative !== null && !note.nested) {
+  // A note anywhere under this folder is on this canvas — in a branch that is folded,
+  // perhaps, in which case the branch opens first. Only a note outside the folder is
+  // somewhere else, and gets a reference.
+  if (note.relative !== null) {
     const here = entries.find((entry) => entry.kind === "file" && entry.path === note.relative);
     if (!here) {
       hint(`${note.name} is in this vault, but the graph does not list it`);
@@ -6274,8 +6743,11 @@ async function attachIndexed(
       return;
     }
     if (!graphView.hasNode(here.path)) {
-      hint(`${note.name} is in this vault, but not drawn on this canvas`);
-      return;
+      const opened = await revealPath(here.path);
+      if (!opened || !graphView.hasNode(here.path)) {
+        hint(`${note.name} is in this vault, but not drawn on this canvas`);
+        return;
+      }
     }
     bringHere(here.path, note.name, source, at);
     return;
@@ -6359,31 +6831,11 @@ async function attachIndexedVault(
   const bridge = window.bedrock;
   if (!bridge) return;
   const { failed, hint } = attachReporters();
-  if (found.relative !== null && !found.nested) {
-    const standing = graphView.vaultNode(found.relative);
-    if (standing && standing === source) {
-      hint("a vault does not link to itself");
-      return;
-    }
-    if (standing) {
-      bringHere(standing, found.name, source, at);
-      return;
-    }
-    // No node stands for it yet: one is made, the way Create → Vault makes one for a new
-    // folder — and from then on this canvas shows the folder's notes as that one node.
-    const relative = found.relative;
-    const make = (drop: { x: number; y: number }, from: string | null): void => {
-      attachNodeAt(
-        { kind: "vault", title: found.name, text: vaultTemplate(relative), handle: relative, done: `${found.name} → the vault at ${relative}` },
-        drop,
-        folder,
-        from,
-      ).catch((err) => failed(`the node for ${found.name} could not be made`, err));
-    };
-    if (source) {
-      graphView.startLink(source, "vault", (drop, from) => make(drop, from));
-      hint(`${found.name} is a vault in here with no node yet — click empty space to put one there (Esc cancels)`);
-    } else if (at) make(at, null);
+  if (found.relative !== null) {
+    // A branch of this graph: there is no node to link to, and nothing to make — the
+    // branch opens, and its notes are here to be linked one by one.
+    if (openBranches.has(found.relative)) hint(`${found.name} is a branch of this graph, and already open`);
+    else await openBranch(found.relative, source);
     return;
   }
   let peek: NotePeek | null;
@@ -6999,11 +7451,8 @@ async function finishLink(source: string, target: string, label: string | null):
   await insertCitation(source, target, label);
   // Re-commit before labelling: if the note was renamed between drawing and naming, the rename's
   // sync dropped the provisional edge (the file did not carry the link yet at that moment).
-  // Not for a leaf: its arrow comes out of the meeting on the rebuild, named by the heading.
-  if (!leafOf(source)) {
-    graphView.commitLink(source, target);
-    graphView.setEdgeLabel(source, target, label);
-  }
+  graphView.commitLink(source, target);
+  graphView.setEdgeLabel(source, target, label);
   graphStale = true;
   await showAll();
   ui.status.textContent = label
@@ -7072,7 +7521,18 @@ window.bedrock?.onMenu((what) => {
 settings.onChange = applyFeatures;
 settings.onLook = applyLook;
 // Sizes follow the rule the moment it changes; the scroll setting is read per wheel tick.
-settings.onLayout = () => graphView.applySizing();
+settings.onLayout = () => {
+  graphView.applySizing();
+  // A new default depth starts the branches over from it, the way opening the folder would.
+  if (settings.layout().branchDepth !== branchDepthShown) {
+    branchDepthShown = settings.layout().branchDepth;
+    branchesReset = true;
+    graphStale = true;
+    void showAll();
+  }
+};
+/** The depth the canvas was last folded to, so only a change to it refolds the branches. */
+let branchDepthShown = settings.layout().branchDepth;
 // A card is a file in a visible folder, so making or deleting one must show in the tree.
 stickies.onFilesChanged = () => void refreshSidebar();
 
@@ -7253,7 +7713,7 @@ if (window.bedrock) {
   if (!opened.get("root") && !opened.get("vault")) void pickFolder();
 }
 // A window that was raised instead of opened is told which note it was raised for.
-window.bedrock?.onGoto((focus) => graphView.focusNode(focus));
+window.bedrock?.onGoto((focus) => void goToNote(focus));
 // Another window repointed references in this vault's files: re-read, so the nodes point
 // where the files now say. Nothing else in the graph has changed, and the arrangement stays.
 window.bedrock?.onRefsChanged((roots) => {
