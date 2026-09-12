@@ -167,6 +167,7 @@ function buildMenu() {
     if (target) target.webContents.send("menu", what);
   };
   const settingsItem = { label: "Settings…", accelerator: "CmdOrCtrl+,", click: tell("settings") };
+  const updatesItem = { label: "Check for Updates…", click: (_item, win) => void checkForUpdatesByHand(win) };
   Menu.setApplicationMenu(
     Menu.buildFromTemplate([
       ...(process.platform === "darwin"
@@ -175,6 +176,7 @@ function buildMenu() {
               label: app.name,
               submenu: [
                 { role: "about" },
+                updatesItem,
                 { type: "separator" },
                 settingsItem,
                 { type: "separator" },
@@ -194,7 +196,7 @@ function buildMenu() {
         submenu: [
           { label: "Open Vault…", accelerator: "CmdOrCtrl+O", click: tell("open-vault") },
           { label: "New Window", accelerator: "CmdOrCtrl+N", click: () => createWindow() },
-          ...(process.platform === "darwin" ? [] : [{ type: "separator" }, settingsItem]),
+          ...(process.platform === "darwin" ? [] : [{ type: "separator" }, settingsItem, updatesItem]),
           { type: "separator" },
           { role: process.platform === "darwin" ? "close" : "quit" },
         ],
@@ -3905,6 +3907,95 @@ ipcMain.handle("google-open", (_event, rawUrl) => {
   return true;
 });
 
+/* ------------------------------------------------------------------ updates --- */
+/*
+ * A new Bedrock arrives on its own. The packaged app asks the download bucket for
+ * `latest-mac.yml` shortly after launch and every few hours after that, and when the
+ * version there is newer it fetches the zip in the background. Nobody hears about the
+ * check or the download; the windows are told once, when the update is on disk, and
+ * show a plaque that offers a restart. Left alone, the update installs itself the next
+ * time the app quits — "Later" costs nothing.
+ *
+ * Squirrel.Mac will only take an update signed by the identity the running app carries,
+ * and electron-updater checks the zip against the hash the manifest names, so the
+ * bucket being public is not a way in. Nothing runs from the repo: `electron .` has no
+ * signature to check against, and the updater is off unless the app is packaged.
+ *
+ * Which bucket: the `publish` block in package.json, written into the bundle as
+ * app-update.yml by electron-builder; the release workflow uploads the manifest there.
+ */
+const { autoUpdater } = require("electron-updater");
+
+/** The update sitting on disk, once one is: `{ version }`. Null until then. */
+let readyUpdate = null;
+
+const CHECK_EVERY = 4 * 60 * 60 * 1000;
+
+function startUpdates() {
+  if (!app.isPackaged) return;
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.on("update-downloaded", (info) => {
+    readyUpdate = { version: String(info.version) };
+    for (const win of BrowserWindow.getAllWindows()) win.webContents.send("update-ready", readyUpdate);
+  });
+  // No network, a bucket outage, the app running off the mounted dmg rather than from
+  // /Applications — none of it is the person's problem. Noted, and asked again later.
+  autoUpdater.on("error", (err) => console.warn("update check failed:", err && err.message ? err.message : err));
+  const check = () => autoUpdater.checkForUpdates().catch(() => null);
+  setTimeout(check, 10_000);
+  setInterval(check, CHECK_EVERY);
+}
+
+/**
+ * The menu's Check for Updates… and the button in Settings: the same poll, but with an
+ * answer either way, since somebody asked. One dialog, on the window that asked.
+ */
+async function checkForUpdatesByHand(win) {
+  const say = (message, detail) => dialog.showMessageBox(win || undefined, { type: "info", message, detail, buttons: ["OK"] });
+  if (!app.isPackaged) {
+    await say("Updates come with the packaged app", "Run from the repo, there is nothing to update to.");
+    return;
+  }
+  if (readyUpdate) {
+    const { response } = await dialog.showMessageBox(win || undefined, {
+      type: "info",
+      message: `Bedrock ${readyUpdate.version} is downloaded`,
+      detail: "It installs when Bedrock restarts.",
+      buttons: ["Restart Now", "Later"],
+      defaultId: 0,
+      cancelId: 1,
+    });
+    if (response === 0) autoUpdater.quitAndInstall();
+    return;
+  }
+  let result;
+  try {
+    result = await autoUpdater.checkForUpdates();
+  } catch (err) {
+    await say("Could not check for updates", err && err.message ? err.message : String(err));
+    return;
+  }
+  if (result && result.isUpdateAvailable) {
+    await say(
+      `Bedrock ${result.updateInfo.version} is on its way`,
+      "It is downloading now. A plaque in the corner will say when it is ready to install.",
+    );
+  } else {
+    await say(`Bedrock ${app.getVersion()} is the latest version`);
+  }
+}
+
+ipcMain.handle("app-version", () => app.getVersion());
+// A window opened after the download asks, rather than waiting for a message it missed.
+ipcMain.handle("update-status", () => readyUpdate);
+ipcMain.handle("update-install", () => {
+  if (!readyUpdate) return false;
+  autoUpdater.quitAndInstall();
+  return true;
+});
+ipcMain.handle("update-check", (event) => checkForUpdatesByHand(BrowserWindow.fromWebContents(event.sender)));
+
 app.whenReady().then(() => {
   protocol.handle("app", serve);
   if (process.platform === "darwin" && !app.isPackaged && fs.existsSync(DEV_ICON)) {
@@ -3912,6 +4003,7 @@ app.whenReady().then(() => {
   }
   buildMenu();
   createWindow();
+  startUpdates();
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
