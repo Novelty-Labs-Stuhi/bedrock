@@ -1151,18 +1151,9 @@ function colaOptions(prefs: LayoutPrefs, patch: Record<string, unknown>): Layout
     edgeSymDiffLength: undefined,
     edgeJaccardLength: undefined,
 
-    /*
-     * The three phases of a solve from scratch: iterations with no constraints at all, then
-     * with the user's, then with non-overlap as well — and only then the run to convergence.
-     * Left undefined (cytoscape-cola's default) webcola runs NONE of them and starts the
-     * descent with non-overlap already on, so notes scattered at random can never pass
-     * through one another to where the stress wants them, and the tangle they landed in is
-     * the tangle they keep. These matter only with `randomize`; a run from where things
-     * stand (`runLayout`) is already past that.
-     */
-    unconstrIter: 200,
-    userConstIter: 50,
-    allConstIter: 100,
+    unconstrIter: undefined,
+    userConstIter: undefined,
+    allConstIter: undefined,
     ...patch,
   } as unknown as LayoutOptions;
 }
@@ -4087,56 +4078,15 @@ export class GraphView {
     layout.run();
   }
 
-  /**
-   * The whole canvas laid out AFRESH: one cola solve from random seeds — the same solve a
-   * vault gets the first time it is opened (`settle`), not a nudge of where things stand,
-   * which is what running cola from the stored positions amounts to — and then every note
-   * glides to where the solve put it. Run on every branch opened and from the settings'
-   * button; a selection is still laid out in place by `runLayout`.
-   */
+  /** The whole canvas at once. */
   runLayoutAll(): void {
     const cy = this.cy;
     if (!cy) return;
-    this.stopLayout();
-    this.clearPicked();
-    if (this.draftSource) this.cancelDraft();
-    const eles = this.solvable(cy);
-    const notes = eles.nodes().filter((node) => node.data("kind") === "file");
-    if (notes.length < 2) return;
-    const start = new Map<string, cytoscape.Position>();
-    notes.forEach((node) => {
-      start.set(node.id(), { ...node.position() });
+    const all: string[] = [];
+    cy.nodes().forEach((node) => {
+      if (node.data("kind") === "file") all.push(node.id());
     });
-    this.handlers.onHint("Laying out");
-    cy.layout(
-      colaOptions(this.settings.layout(), {
-        animate: false,
-        randomize: true,
-        centerGraph: true,
-        handleDisconnected: true,
-        eles,
-      }),
-    ).run();
-    const solved = new Map<string, cytoscape.Position>();
-    notes.forEach((node) => {
-      solved.set(node.id(), { ...node.position() });
-    });
-    // Back to where they were, and glide to where the solve put them.
-    cy.batch(() => {
-      notes.forEach((node) => {
-        node.position(start.get(node.id())!);
-      });
-    });
-    this.ready = true;
-    notes.forEach((node) => {
-      node.animate({ position: solved.get(node.id())!, duration: 700, easing: "ease-in-out-cubic" });
-    });
-    window.setTimeout(() => {
-      this.fit();
-      this.drawOverlay();
-      this.capture();
-      this.handlers.onHint(null);
-    }, 750);
+    this.runLayout(all);
   }
 
   /** Stops the run and keeps whatever it had reached. */
