@@ -20,6 +20,11 @@ contextBridge.exposeInMainWorld("bedrock", {
   vaultFs: (root, op, rel, arg) => ipcRenderer.invoke("vault-fs", root, op, rel, arg),
   peekNote: (target, root) => ipcRenderer.invoke("note-peek", target, root),
   vaultIndex: (root) => ipcRenderer.invoke("vault-index", root),
+  // The references elsewhere that point INTO this vault, by the note they point at.
+  refsInto: (root) => ipcRenderer.invoke("refs-into", root),
+  // The disk under a vault, watched; `onVaultChanged` hears about anything not the app's own.
+  vaultWatch: (root) => ipcRenderer.invoke("vault-watch", root),
+  onVaultChanged: (fn) => ipcRenderer.on("vault-changed", (_e, root) => fn(root)),
   agyStatus: () => ipcRenderer.invoke("agy-status"),
   agyCreate: (folder, name) => ipcRenderer.invoke("agy-create", folder, name),
   agyOpen: (options) => ipcRenderer.invoke("agy-open", options),

@@ -758,8 +758,6 @@ export type PanelHooks = {
   base?: () => string | null;
   /** The General tab's "Choose…" beside it: pick another folder. */
   onBasePick?: () => void;
-  /** The Layout tab's one button: relax the whole graph from where it is. */
-  onLayoutAll?: () => void;
   /** What this build calls itself — null in a browser tab, which has no build. */
   version?: () => string | null;
   /** The General tab's "Check for updates…": ask the bucket now, answer in a dialog. */
@@ -907,11 +905,10 @@ export function mountSettings(
       `<label class="settings-num"><span>${label}</span>` +
       `<input type="number" data-layout="${field}" value="${prefs[field]}" min="${SIZE_RANGE.min}" max="${SIZE_RANGE.max}" step="1" /> px</label>`;
     return (
-      `<div class="settings-look"><h5>Run the layout</h5>` +
-      `<small>nothing on the canvas moves until you ask: this arranges every note from where it is now (cola —` +
-      ` linked notes at the Pull distance, every note keeping the Spread clear round its label), and a drag round` +
-      ` some notes offers the same for just those, with the rest held still</small>` +
-      `<button type="button" class="settings-run" data-layout-run>Lay out the whole graph</button>` +
+      `<div class="settings-look"><h5>The layout</h5>` +
+      `<small>nothing that has a place ever moves on its own. A drag round some notes lays out just those (cola —` +
+      ` linked notes at the Pull distance, every note keeping the Spread clear round its label) with the rest held` +
+      ` still, and a note that arrives without a place settles among its links the same way</small>` +
       dial("edgeLength", "Pull", "how long a link wants to be — shorter knots a cluster tighter", EDGE_LENGTH_RANGE) +
       dial("nodeSpacing", "Spread", "clear ground round every note — more pushes everything apart", NODE_SPACING_RANGE) +
       `</div>` +
@@ -1063,11 +1060,6 @@ export function mountSettings(
 
     if (hit.classList.contains("settings-close")) {
       show(false);
-      return;
-    }
-    if (hit.dataset.layoutRun !== undefined) {
-      show(false); // the run is the thing to watch, and the window is over it
-      hooks.onLayoutAll?.();
       return;
     }
     if (hit.dataset.basePick !== undefined) {

@@ -199,13 +199,6 @@ const NOTE_DOT =
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="#f92411"/></svg>',
   );
 
-/** A vault in a menu: the same red as a holder's dot, squared — as the node is on the canvas. */
-const NOTE_SQUARE =
-  "data:image/svg+xml;utf8," +
-  encodeURIComponent(
-    '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><rect x="2" y="2" width="12" height="12" rx="3" fill="#f92411"/></svg>',
-  );
-
 const graphView = new GraphView(ui.cy, {
   // There are no pages any more — the graph is the whole app, and a note is a pointer
   // at something with its own home. A holder has nowhere to go yet, and says what would
@@ -223,7 +216,7 @@ const graphView = new GraphView(ui.cy, {
   },
   onOpenEdge: (source, target) => relabelEdge(source, target),
   onOpenFreeform: (path, board) => void openFreeformNode(path, board),
-  onOpenVault: (path, folder) => void openVaultNode(path, folder),
+  onOpenIncoming: (path) => void openIncoming(path),
   onOpenNotion: (path, url) => void openNotionNode(path, url),
   onOpenGranola: (path, meeting) => void openGranolaNode(path, meeting),
   onLeafMenu: (leaf, client) => showLeafMenu(leaf, client),
@@ -237,8 +230,7 @@ const graphView = new GraphView(ui.cy, {
   onLinkNew: (source, at, kind) => {
     // A note made on the canvas lands at the vault root: folders are the sidebar's, not the graph's.
     const folder = null;
-    if (kind === "vault") void createVaultAt(at, folder, source);
-    else if (kind === "antigravity") void createAntigravityAt(at, folder, source);
+    if (kind === "antigravity") void createAntigravityAt(at, folder, source);
     else if (kind === "claude") void createClaudeAt(at, folder, source);
     else if (kind === "file" || kind === "folder") void createFsAt(at, folder, kind, source);
     else if (kind === "web") void createWebAt(at, folder, source);
@@ -303,10 +295,9 @@ const graphView = new GraphView(ui.cy, {
       items.push({ label: "Style…", run: () => void styleNode(path, client) });
     }
     // A note can be promoted out of this vault into another: it moves, and a reference
-    // under its own name stays behind. Not for a reference (it is already elsewhere) or a
-    // vault node (its folder would not follow).
+    // under its own name stays behind. Not for a reference (it is already elsewhere).
     const kindHere = graphView.nodeType(path);
-    if (window.bedrock && kindHere !== "ref" && kindHere !== "vault") {
+    if (window.bedrock && kindHere !== "ref") {
       items.push({ label: "Move into…", run: () => void moveNoteInto(path) });
     }
     items.push(
@@ -420,6 +411,8 @@ const graphView = new GraphView(ui.cy, {
 /* -------------------------------------------------------------- reading --- */
 
 const filePaths = (): string[] => entries.filter((e) => e.kind === "file").map((e) => e.path);
+/** The folders inside this vault that are vaults of their own (a `.notes/` each), root-relative. */
+const nestedVaultFolders = (): string[] => entries.filter((e) => e.kind === "dir" && e.vault).map((e) => e.path);
 
 /**
  * What the graph draws. Sticky files are real notes in a real folder — the
@@ -432,16 +425,11 @@ async function readDocs(): Promise<Doc[]> {
   const texts = await readTexts(drawn);
   const all: Doc[] = drawn.flatMap((path) => (texts.has(path) ? [{ path, text: texts.get(path)! }] : []));
   if (all.length < drawn.length) ui.status.textContent = `${drawn.length - all.length} note(s) could not be read and are not drawn`;
-  // A vault inside this one is opaque from out here: its notes are its own graph, and
-  // the one node standing for it is all this canvas shows of it.
-  const vaults = all.filter((doc) => parseType(doc.text) === "vault");
-  const nested = vaults.map((doc) => vaultFolderOf(doc.path, doc.text));
+  // A vault inside this one — a folder with a `.notes/` of its own — is opaque from out
+  // here: its notes are its own graph, and nothing here stands for it. What joins the two
+  // is a reference to a note in it, the same as for any other vault.
+  const nested = nestedVaultFolders();
   const docs = all.filter((doc) => !nested.some((folder) => doc.path.startsWith(folder + "/")));
-  // The one node standing for a vault is sized by what is inside it.
-  for (const doc of vaults) {
-    const folder = vaultFolderOf(doc.path, doc.text);
-    doc.holds = all.filter((other) => other.path.startsWith(folder + "/")).length;
-  }
   waiting = waitedFor(docs); // the graph's own read is also the answer `freshPath` needs
   return docs;
 }
@@ -657,6 +645,7 @@ async function renderPage(index: number): Promise<void> {
 async function drawGraph(): Promise<void> {
   graphStale = false;
   graphView.render(await readDocs(), lastFile, await describedEdges());
+  void paintIncoming(); // and the chains on the notes other vaults point at
   void pollSessions(); // the dots belong to the graph that has just gone up
   void pollTasks(); // and the ticks
   refreshWebIcons(); // likewise the faces: a page linked in another window is scraped here too
@@ -971,7 +960,6 @@ async function applyRename(path: string, kind: "file" | "dir", name: string): Pr
     return path;
   }
   retargetTabs(path, next);
-  if (kind === "file") await followVaultFolder(next); // a vault's folder is named after its note
   retargetRefs(path, next); // after the status line below is written: it appends to it
   // "New note" targets the selected folder, so a rename has to follow it there.
   if (kind === "dir" && (sidebar.activeDir === path || sidebar.activeDir.startsWith(path + "/"))) {
@@ -1157,6 +1145,8 @@ async function openVault(next: Vault): Promise<void> {
   // The shell keeps a note of which window holds which vault, so opening the vault behind
   // a node can raise the window that already has it instead of making another one.
   void window.bedrock?.windowRoot(knownVaultRoot());
+  // And watches the folder, so a note moved in the Finder is news here (see `onDiskChanged`).
+  void window.bedrock?.vaultWatch(knownVaultRoot() ?? "");
 }
 
 /**
@@ -1865,8 +1855,6 @@ async function turnHolderInto(path: string, kind: HolderKind, label: string): Pr
   let next = setField(text, "type", kind);
   if (kind === "web" && pointer) next = setField(next, "url", pointer);
   if ((kind === "file" || kind === "folder") && pointer) next = setField(next, "path", pointer);
-  // A vault is the folder called what the holder is called, beside it.
-  if (kind === "vault") next = setField(next, "vault", noteName(path));
   // A session runs where the vault says its sessions run, when it has said; the note asks
   // otherwise, on its first opening, exactly as a session made from "Create" would.
   const runIn =
@@ -1881,8 +1869,6 @@ async function turnHolderInto(path: string, kind: HolderKind, label: string): Pr
   graphStale = true;
 
   switch (kind) {
-    case "vault":
-      return makeNestedVault(path);
     case "applenote":
       return makeAppleNote(path);
     case "notion":
@@ -1910,139 +1896,6 @@ async function turnHolderInto(path: string, kind: HolderKind, label: string): Pr
     default:
       ui.status.textContent = `${noteName(path)} → ${pointer}`;
   }
-}
-
-/* ---------------------------------------------------------- nested vaults --- */
-
-/**
- * A vault note is a pointer in the board note's mould: the folder it stands for, and
- * nothing else. The folder IS a vault — its own `.notes/`, its own arrangement, its own
- * settings — and clicking the node opens it in a window of its own, beside this one.
- */
-const vaultTemplate = (folder: string): string => `type:: vault\n\nvault:: ${folder}\n`;
-
-/** The folder a vault note stands for: its `vault::` line, else the folder called what it is. */
-const vaultFolderOf = (path: string, text: string): string => parseField(text, "vault") || noteName(path);
-
-/**
- * Brings the vault a note stands for into being, if it is not there yet: the folder, and a
- * copy of this vault's settings in it — a vault starts as its parent is set up, and drifts
- * from there. Then opens it, in a window of its own.
- */
-async function makeNestedVault(path: string): Promise<void> {
-  await spawnVaultWindow(await ensureNestedVault(path));
-}
-
-/** The folder a vault note stands for, made a vault if it is not one yet. */
-async function ensureNestedVault(path: string): Promise<string> {
-  const text = await vault.read(path);
-  const folder = vaultFolderOf(path, text);
-  if (!(await vault.exists(join(folder, CONFIG_FILE)))) {
-    await vault.createDir(join(folder, dirname(CONFIG_FILE)));
-    // As this vault is set up right now, defaults and all — not the file, which a vault
-    // that never changed a setting does not have yet.
-    await vault.write(join(folder, CONFIG_FILE), settings.snapshot());
-  }
-  return folder;
-}
-
-/**
- * A vault note renamed is a vault renamed: its folder follows the new name, and the
- * `vault::` line with it — a vault called Research whose folder is still "Vault 2" would
- * be a lie the sidebar-less canvas has no way to show. A folder that was never made only
- * needs the line moved; a name another folder already has leaves the folder as it was.
- */
-async function followVaultFolder(notePath: string): Promise<void> {
-  const text = await vault.read(notePath);
-  if (parseType(text) !== "vault") return;
-  const folder = vaultFolderOf(notePath, text);
-  const wanted = join(dirname(notePath), noteName(notePath));
-  if (folder === wanted) return;
-  const made = await vault.exists(join(folder, CONFIG_FILE));
-  if (made) {
-    if (entries.some((entry) => entry.path === wanted)) {
-      ui.status.textContent = `${wanted} already exists — the vault keeps its folder ${folder}`;
-      return;
-    }
-    if (!(await tryVault(`could not rename the vault's folder ${folder}`, () => vault.rename(folder, wanted, "dir")))) return;
-    retargetRefs(folder, wanted); // the vault, and every note in it, moved with the folder
-  }
-  await vault.write(notePath, setField(text, "vault", wanted));
-}
-
-/** Click on a vault node: open its vault in a new window — making the vault first if the click is its first. */
-async function openVaultNode(path: string, folder: string | null): Promise<void> {
-  if (!folder || !(await vault.exists(join(folder, CONFIG_FILE)))) {
-    await makeNestedVault(path);
-    return;
-  }
-  await spawnVaultWindow(folder);
-}
-
-/** The message a child window sends once it is listening, and the one it is answered with. */
-const VAULT_READY = "bedrock:vault-ready";
-const VAULT_OPEN = "bedrock:vault-open";
-type VaultOpenMessage = { type: typeof VAULT_OPEN; handle: FileSystemDirectoryHandle; root: string | null };
-
-/**
- * Opens `folder` — a vault inside this one — as a second window of the app. This window
- * stays on its own vault; closing the new one is the way back. The folder travels as a
- * directory handle over `postMessage`, which is the one way a window can hand another a
- * folder without a picker: so the child is opened from here, says when it is listening,
- * and is answered with the handle. `root` is this vault's absolute path when known, so
- * the child can tell the shell its own (git, sessions).
- */
-async function spawnVaultWindow(folder: string): Promise<void> {
-  const here = vault;
-  // A vault reached by path opens its inner vaults by path too: no handle to hand over.
-  if (here instanceof ShellVault) {
-    await openVaultAt(`${here.root.replace(/[\\/]+$/, "")}/${folder}`);
-    return;
-  }
-  if (!(here instanceof FolderVault)) {
-    ui.status.textContent = "a vault inside a vault needs a real folder on disk";
-    return;
-  }
-  await flushAll();
-  await spatial.flush();
-  await settings.flush();
-  const child = await here.child(folder);
-  const root = knownVaultRoot();
-  const at = root ? `${root.replace(/[\\/]+$/, "")}/${folder}` : null;
-  // The same three answers a vault reached by path gets (see `openVaultAt`), as far as a
-  // folder handle allows: raise the window that already has it, or — from full screen,
-  // where a second window would land on a space of its own — open it in this one.
-  const state = (await window.bedrock?.windowState().catch(() => null)) ?? null;
-  const already = at ? state?.windows.find((win) => !win.self && win.root && samePath(win.root, at)) : null;
-  if (already && (await window.bedrock?.windowShow(already.id).catch(() => false))) {
-    ui.status.textContent = `${folder} is already open — brought that window forward`;
-    return;
-  }
-  if (state?.fullScreen) {
-    const came = vault.name;
-    if (at) localStorage.setItem(ROOT_KEY + child.name, at);
-    await openVault(child);
-    ui.status.textContent = `${child.name} — ⌘O to go back to ${came}`;
-    return;
-  }
-  const address = new URL(location.href);
-  address.searchParams.set("vault", folder);
-  const opened = window.open(address.toString(), "_blank");
-  if (!opened) {
-    ui.status.textContent = "the browser would not open a second window";
-    return;
-  }
-  const onReady = (event: MessageEvent): void => {
-    if (event.source !== opened || event.data !== VAULT_READY) return;
-    window.removeEventListener("message", onReady);
-    const message: VaultOpenMessage = {
-      type: VAULT_OPEN,
-      handle: child.directory,
-      root: at,
-    };
-    opened.postMessage(message, location.origin === "null" ? "*" : location.origin);
-  };
-  window.addEventListener("message", onReady);
 }
 
 /** Two paths meaning the same folder. Trailing slashes are noise; the shell resolves the
@@ -2134,54 +1987,6 @@ function adoptVaultFromPath(): void {
       ui.welcome.hidden = false;
       ui.status.textContent = `${next.name} could not be opened — ${shellError(err)}`;
     });
-}
-
-/**
- * The other half, in the child window: opened with `?vault=` in its address, it skips the
- * front door and asks the window that opened it for the folder. Nothing happens until the
- * handle arrives, and an opener that never answers leaves the door where it was.
- */
-function adoptVaultFromOpener(): void {
-  const folder = new URL(location.href).searchParams.get("vault");
-  if (!folder || !window.opener) return;
-  const onOpen = (event: MessageEvent<VaultOpenMessage>): void => {
-    if (event.source !== window.opener || event.data?.type !== VAULT_OPEN || !event.data.handle) return;
-    window.removeEventListener("message", onOpen);
-    const next = new FolderVault(event.data.handle);
-    if (event.data.root) localStorage.setItem(ROOT_KEY + next.name, event.data.root);
-    void openVault(next);
-  };
-  window.addEventListener("message", onOpen);
-  (window.opener as Window).postMessage(VAULT_READY, location.origin === "null" ? "*" : location.origin);
-}
-
-/**
- * "Create → Vault" — from the canvas menu, or from a link draft released on empty space.
- * The note comes first and gets its name; committing the name is what makes the vault,
- * named to match, and goes into it.
- */
-async function createVaultAt(
-  at: { x: number; y: number },
-  folder: string | null,
-  source: string | null = null,
-): Promise<void> {
-  const dir = folder ?? "";
-  const path = uniquePath(filePaths(), dir, "Vault", ".md");
-  await vault.createFile(path, vaultTemplate(noteName(path)));
-  entries = [...entries, { path, kind: "file" }]; // so the rename's collision check sees it
-  if (source) graphView.commitLink(source, path, { label: noteName(path), at, type: "vault" });
-  else graphView.commitNode(path, noteName(path), at, "vault");
-  graphStale = true;
-  await refreshSidebar();
-  ui.status.textContent = `created ${path} — name it, and the vault is made to match`;
-  graphView.renameNode(path, (name) => {
-    void (async () => {
-      // `applyRename` carries the folder (and the `vault::` line) along with the name.
-      const finalPath = name ? ((await applyRename(path, "file", name)) ?? path) : path;
-      if (source) await finishLink(source, finalPath, null);
-      await makeNestedVault(finalPath);
-    })();
-  });
 }
 
 /**
@@ -2309,11 +2114,8 @@ async function moveSelectionTo(picked: string[]): Promise<void> {
     ui.status.textContent = "moving notes into another vault needs the desktop app";
     return;
   }
-  const notes = picked.filter((path) => graphView.nodeType(path) !== "vault");
-  if (!notes.length) {
-    ui.status.textContent = "nothing to move — a vault node stays with its folder";
-    return;
-  }
+  const notes = picked;
+  if (!notes.length) return;
   const chosen = await bridge
     .pickPath("folder", { defaultPath: baseRoot ?? undefined, message: `Move ${notes.length} note(s) into which vault?` })
     .catch(() => null);
@@ -6124,12 +5926,12 @@ async function searchNote(message: string): Promise<{ target: string; peek: Note
     ui.status.textContent = `could not read the folders — ${shellError(err)}`;
     return null;
   }
-  if (!index.notes.length && !index.vaults.length) {
+  if (!index.notes.length) {
     ui.status.textContent = `no notes under ${index.top}`;
     return null;
   }
   const rows = indexRows(index);
-  const picked = await askPick(message, rows.map((row) => ({ label: row.label, hint: row.hint })), "Search notes and vaults…");
+  const picked = await askPick(message, rows.map((row) => ({ label: row.label, hint: row.hint })), "Search notes…");
   const hit = picked === null ? null : rows.find((row) => row.label === picked);
   if (!hit) return null;
   const peek = await bridge.peekNote(hit.path, root);
@@ -6141,26 +5943,14 @@ async function searchNote(message: string): Promise<{ target: string; peek: Note
 }
 
 /**
- * Every target in the index as a row: the notes, then the vaults themselves — a whole vault
- * can be linked, and the node standing for it is only a holder pointing at it. Rows answer
- * by label, so twins — one name in two places — carry their place in the label, and a
- * vault says it is one.
+ * Every note in the index as a row. Rows answer by label, so twins — one name in two
+ * places — carry their place in the label.
  */
 function indexRows(index: VaultIndex): Array<{ label: string; hint: string; path: string; ref: string }> {
   const twins = new Map<string, number>();
   for (const one of index.notes) twins.set(one.name, (twins.get(one.name) ?? 0) + 1);
-  const vaultTwins = new Map<string, number>();
-  for (const one of index.vaults) vaultTwins.set(one.name, (vaultTwins.get(one.name) ?? 0) + 1);
   const placed = (name: string, place: string, twin: boolean): string => (twin ? `${name} — ${place || "/"}` : name);
-  return [
-    ...index.notes.map((one) => ({ label: placed(one.name, one.place, (twins.get(one.name) ?? 0) > 1), hint: one.place, path: one.path, ref: one.ref })),
-    ...index.vaults.map((one) => ({
-      label: `${placed(one.name, one.place, (vaultTwins.get(one.name) ?? 0) > 1)} (vault)`,
-      hint: `vault · ${one.place || "/"}`,
-      path: one.path,
-      ref: one.ref,
-    })),
-  ];
+  return index.notes.map((one) => ({ label: placed(one.name, one.place, (twins.get(one.name) ?? 0) > 1), hint: one.place, path: one.path, ref: one.ref }));
 }
 
 /** Where a reference says it is going: its vault when it has one, else its folder. */
@@ -6225,18 +6015,6 @@ async function existingNodeRows(
       hint: note.place || "/",
       run: () => void attachIndexed(note, root, source, at, folder),
     }));
-  // Then the vaults themselves — a whole vault linked is a vault node here when it is one
-  // of this vault's own, and a square reference when it is elsewhere. The one this arrow
-  // starts from is left out, as a note is.
-  for (const found of [...index.vaults].sort((a, b) => a.name.localeCompare(b.name) || a.place.localeCompare(b.place))) {
-    if (source && found.relative !== null && graphView.vaultNode(found.relative) === source) continue;
-    rows.push({
-      label: found.name,
-      hint: `vault · ${found.place || "/"}`,
-      icon: NOTE_SQUARE,
-      run: () => void attachIndexedVault(found, root, source, at, folder),
-    });
-  }
   // The panel's own last line says how far the search reaches: the top of the system of
   // vaults, which is this vault itself when nothing above it has ever been opened here.
   const top = fsBasename(index.top);
@@ -6261,8 +6039,8 @@ async function attachIndexed(
   if (!bridge) return;
   const { failed, hint } = attachReporters();
   // A note inside a vault nested in this one is in this vault's files, but not on this
-  // canvas — the nested vault stands here as one node. It is somewhere else, as far as
-  // the canvas is concerned, and gets a reference like any note in another vault.
+  // canvas — a nested vault is its own graph. It is somewhere else, as far as the canvas
+  // is concerned, and gets a reference like any note in another vault.
   if (note.relative !== null && !note.nested) {
     const here = entries.find((entry) => entry.kind === "file" && entry.path === note.relative);
     if (!here) {
@@ -6342,71 +6120,6 @@ function bringHere(path: string, name: string, source: string | null, at: { x: n
 }
 
 /**
- * A vault picked in the Search panel. One of this vault's OWN — a folder in here that is a
- * vault, and not behind another vault's node — is a vault node on this canvas: the one
- * already standing for it is brought to the drop and linked, or one is made there,
- * pointing at the folder. Any other vault — above this one, beside it, inside a nested
- * one — stands here as a reference, the way a note elsewhere does, wearing the vault's
- * square; its corner opens the vault.
- */
-async function attachIndexedVault(
-  found: IndexedVault,
-  root: string,
-  source: string | null,
-  at: { x: number; y: number } | null,
-  folder: string | null,
-): Promise<void> {
-  const bridge = window.bedrock;
-  if (!bridge) return;
-  const { failed, hint } = attachReporters();
-  if (found.relative !== null && !found.nested) {
-    const standing = graphView.vaultNode(found.relative);
-    if (standing && standing === source) {
-      hint("a vault does not link to itself");
-      return;
-    }
-    if (standing) {
-      bringHere(standing, found.name, source, at);
-      return;
-    }
-    // No node stands for it yet: one is made, the way Create → Vault makes one for a new
-    // folder — and from then on this canvas shows the folder's notes as that one node.
-    const relative = found.relative;
-    const make = (drop: { x: number; y: number }, from: string | null): void => {
-      attachNodeAt(
-        { kind: "vault", title: found.name, text: vaultTemplate(relative), handle: relative, done: `${found.name} → the vault at ${relative}` },
-        drop,
-        folder,
-        from,
-      ).catch((err) => failed(`the node for ${found.name} could not be made`, err));
-    };
-    if (source) {
-      graphView.startLink(source, "vault", (drop, from) => make(drop, from));
-      hint(`${found.name} is a vault in here with no node yet — click empty space to put one there (Esc cancels)`);
-    } else if (at) make(at, null);
-    return;
-  }
-  let peek: NotePeek | null;
-  try {
-    peek = await bridge.peekNote(found.path, root);
-  } catch (err) {
-    failed(`${found.path} could not be read`, err);
-    return;
-  }
-  if (!peek) {
-    hint(`${found.path} is not a vault any more`);
-    return;
-  }
-  const place = (drop: { x: number; y: number }, from: string | null): void => {
-    placeRef(found.ref, peek!, drop, folder, from).catch((err) => failed(`the reference to ${found.name} could not be made`, err));
-  };
-  if (source) {
-    graphView.startLink(source, "ref", (drop, from) => place(drop, from));
-    hint(`${found.name} is a whole vault, at ${found.path} — click empty space to put a reference to it there (Esc cancels)`);
-  } else if (at) place(at, null);
-}
-
-/**
  * Click on a reference. The CORNER — the arrow — is the doorway: it opens the vault the
  * note lives in, in a window of its own, landed on that note. The body only says where
  * the note is; a reference is a pointer, and the pointer is not the thing. A note that
@@ -6454,6 +6167,156 @@ async function openRefNode(path: string, target: string | null, corner: boolean)
   // The note's place inside its vault, so the new window lands on it ("" for a whole vault).
   say(`${noteName(path)} → the vault at ${peek.vault}`);
   await openVaultAt(peek.vault, peek.inside || null);
+}
+
+/* ------------------------------------------------------- connections from outside --- */
+
+/** Note path here → the references in other vaults that point at it, as the shell last read them. */
+let incomingRefs = new Map<string, IncomingRef[]>();
+
+/**
+ * Reads which notes on this canvas are pointed at from other vaults and marks them (the
+ * chain on the corner, see `drawIncomingBadges`). Asked after every draw and whenever
+ * references elsewhere change; the walk is milliseconds. A browser tab has no disk to ask
+ * and wears no marks.
+ */
+async function paintIncoming(): Promise<void> {
+  const bridge = window.bedrock;
+  const root = knownVaultRoot();
+  if (!bridge || !root) return;
+  try {
+    incomingRefs = new Map(Object.entries(await bridge.refsInto(root)));
+  } catch {
+    return; // the marks are a courtesy; a walk that failed leaves the last ones standing
+  }
+  graphView.setIncoming(new Map([...incomingRefs].map(([path, refs]) => [path, refs.length])));
+}
+
+/**
+ * The chain clicked: go along a connection that leaves this vault. Backwards, to the vault
+ * holding a reference that points here (landed on the reference); or forwards, through a
+ * reference this note is linked with, to the note it stands for — the same door its own
+ * notch is. One connection opens straight away; several ask which.
+ */
+async function openIncoming(path: string): Promise<void> {
+  const back = incomingRefs.get(path) ?? [];
+  const forth = graphView.externalLinks(path);
+  type Way = { label: string; hint: string; go: () => Promise<void> };
+  const ways: Way[] = [
+    ...back.map((ref) => ({
+      label: `← ${ref.name}`,
+      hint: `${noteName(ref.note)} there points here`,
+      go: () => openVaultAt(ref.vault, ref.note),
+    })),
+    ...forth.map((link) => ({
+      label: `→ ${noteName(link.node)}`,
+      hint: link.target ? `in ${link.target.replace(/[\\/][^\\/]*$/, "")}` : "a reference with no ref:: line",
+      go: () => openRefNode(link.node, link.target, true),
+    })),
+  ];
+  if (!ways.length) {
+    ui.status.textContent = `${noteName(path)} has no connection outside this vault any more`;
+    void paintIncoming();
+    return;
+  }
+  let chosen = ways[0];
+  if (ways.length > 1) {
+    const picked = await askPick(`${noteName(path)} connects outside in ${ways.length} ways — go which?`, ways.map(({ label, hint }) => ({ label, hint })), "Connections…");
+    const hit = picked === null ? -1 : ways.findIndex((way) => way.label === picked);
+    if (hit < 0) return;
+    chosen = ways[hit];
+  }
+  ui.status.textContent = `${noteName(path)} ${chosen.label}`;
+  await chosen.go();
+}
+
+/* ------------------------------------------------------------ the disk, watched --- */
+
+/**
+ * Something under this vault changed on disk and it was not this app: a note moved,
+ * renamed or made in the Finder, a folder created there. The graph re-reads, and two
+ * things a plain re-read would lose are kept:
+ *
+ * - A note moved to another folder INSIDE the vault is the same note: its node keeps its
+ *   place (the id is the path, so to the graph the move is a remove and an add).
+ * - A note moved OUT of the vault that notes here still link to leaves a reference behind
+ *   under its own name, in its exact place — what "Move into…" does — so every link to it
+ *   survives and leads there. The folder it went to is made a vault if it belongs to none
+ *   yet, so the reference has somewhere to open. A note simply deleted leaves nothing.
+ */
+async function onDiskChanged(): Promise<void> {
+  if (!window.bedrock || !(vault instanceof ShellVault)) return;
+  const before = new Set(filePaths());
+  const next = await vault.entries();
+  const after = new Set(next.filter((entry) => entry.kind === "file").map((entry) => entry.path));
+  const gone = [...before].filter((path) => !after.has(path) && !isCardPath(path));
+  const came = [...after].filter((path) => !before.has(path));
+  const left: string[] = [];
+  for (const path of gone) {
+    const twin = came.find((other) => noteName(other).toLowerCase() === noteName(path).toLowerCase());
+    if (twin) graphView.carryPosition(path, twin); // moved within the vault: the same note, its place kept
+    else {
+      graphView.carryPosition(path, path); // should a reference take its place, it takes its spot too
+      left.push(path);
+    }
+  }
+  entries = next;
+  if (left.length) await leaveReferences(left);
+  await syncAfterStructuralChange();
+}
+
+/**
+ * For notes that have left the vault and are still linked from here: a reference under
+ * each one's name, pointing at where the note is now — when it can be found, in exactly
+ * one place outside this vault. Nothing is written for a note that is nowhere, or in two.
+ */
+async function leaveReferences(left: string[]): Promise<void> {
+  const bridge = window.bedrock;
+  const root = knownVaultRoot();
+  if (!bridge || !root) return;
+  const paths = filePaths();
+  const texts = await readTexts(paths);
+  const resolver = new LinkResolver([...paths, ...left]); // the gone notes still resolve, so links to them are found
+  const linked = new Set<string>();
+  for (const text of texts.values()) {
+    for (const link of parseLinks(text)) {
+      const to = resolver.resolve(link.target);
+      if (to && left.includes(to)) linked.add(to);
+    }
+  }
+  if (!linked.size) return;
+  let index: VaultIndex;
+  try {
+    index = await bridge.vaultIndex(root);
+  } catch {
+    return;
+  }
+  const made: string[] = [];
+  for (const path of linked) {
+    const name = noteName(path).toLowerCase();
+    const found = index.notes.filter((note) => note.relative === null && note.name.toLowerCase() === name);
+    if (found.length !== 1) continue;
+    const note = found[0];
+    // A folder that belongs to no vault yet (the Bedrock folder itself does not count as
+    // one) becomes a vault, as a folder picked for "Move into…" does.
+    const folder = note.path.replace(/[\\/][^\\/]*$/, "");
+    const inVault = note.vault !== null && !(baseRoot && samePath(note.vault, baseRoot));
+    if (!inVault && !(baseRoot && samePath(folder, baseRoot))) {
+      const other = new ShellVault(folder);
+      if (!(await other.exists(dirname(CONFIG_FILE)))) {
+        await other.createDir(dirname(CONFIG_FILE)).catch(() => undefined);
+        await other.write(CONFIG_FILE, settings.snapshot()).catch(() => undefined);
+      }
+    }
+    const peek = await bridge.peekNote(note.ref, root).catch(() => null);
+    await vault.write(path, refTemplate(note.ref, peek?.type ?? null));
+    made.push(path);
+  }
+  entries = await vault.entries();
+  if (made.length) {
+    const names = made.map(noteName).join(", ");
+    ui.status.textContent = `${names} left this vault — a reference stands where ${made.length === 1 ? "it" : "each"} was`;
+  }
 }
 
 /* ------------------------------------------- attaching to what is already there --- */
@@ -7035,7 +6898,6 @@ ui.graph.addEventListener("click", () => openGraph());
 const redrawSettings = mountSettings(ui.settings, ui.settingsPanel, settings, {
   page: integrationPage,
   onAction: runIntegrationAction,
-  onLayoutAll: () => graphView.runLayoutAll(),
   base: () => baseRoot,
   onBasePick: () => void pickBase(),
   version: () => appVersion,
@@ -7237,7 +7099,6 @@ let vaultOpen = false;
 
 el("welcome-open").addEventListener("click", () => void pickFolder());
 el("welcome-new").addEventListener("click", () => void pickFolder());
-adoptVaultFromOpener(); // a window opened from a vault node is handed its folder, no door
 adoptVaultFromPath(); // and one opened from a reference is told its path
 
 /*
@@ -7250,15 +7111,22 @@ adoptVaultFromPath(); // and one opened from a reference is told its path
  */
 if (window.bedrock) {
   const opened = new URL(location.href).searchParams;
-  if (!opened.get("root") && !opened.get("vault")) void pickFolder();
+  if (!opened.get("root")) void pickFolder();
 }
 // A window that was raised instead of opened is told which note it was raised for.
 window.bedrock?.onGoto((focus) => graphView.focusNode(focus));
+// The disk under this vault changed, and not by this app: re-read, keeping what a move would lose.
+window.bedrock?.onVaultChanged((root) => {
+  const here = knownVaultRoot();
+  if (here && samePath(here, root)) void onDiskChanged();
+});
 // Another window repointed references in this vault's files: re-read, so the nodes point
 // where the files now say. Nothing else in the graph has changed, and the arrangement stays.
 window.bedrock?.onRefsChanged((roots) => {
   const root = knownVaultRoot();
   if (root && roots.some((one) => samePath(one, root))) void syncAfterStructuralChange();
+  else void paintIncoming(); // references elsewhere changed: what points here may have too
+
 });
 document.addEventListener("keydown", (event) => {
   // The door can be closed over an open vault; before one is open there is nothing behind it.

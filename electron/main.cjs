@@ -621,7 +621,9 @@ ipcMain.handle("vault-fs", async (_event, root, op, rel, arg) => {
           if (entry.name.startsWith(".")) continue;
           const full = path.join(dir, entry.name);
           if (entry.isDirectory()) {
-            entries.push({ path: posix(full), kind: "dir" });
+            // A folder with a `.notes/` of its own is a vault inside this one: its notes are
+            // in this listing, but the canvas leaves them to their own graph.
+            entries.push({ path: posix(full), kind: "dir", vault: isVaultDir(full) });
             walk(full);
           } else if (/\.md$/i.test(entry.name)) entries.push({ path: posix(full), kind: "file" });
           else if (VAULT_IMAGES.test(entry.name)) assets.push(posix(full));
@@ -662,26 +664,32 @@ ipcMain.handle("vault-fs", async (_event, root, op, rel, arg) => {
     case "write": {
       const file = at(rel);
       fs.mkdirSync(path.dirname(file), { recursive: true });
+      selfTouched(file);
       fs.writeFileSync(file, String(arg ?? ""));
       return true;
     }
     case "mkdir":
+      selfTouched(at(rel));
       fs.mkdirSync(at(rel), { recursive: true });
       return true;
     case "create": {
       const file = at(rel);
       if (!fs.existsSync(file)) {
         fs.mkdirSync(path.dirname(file), { recursive: true });
+        selfTouched(file);
         fs.writeFileSync(file, String(arg ?? ""));
       }
       return true;
     }
     case "remove":
+      selfTouched(at(rel));
       fs.rmSync(at(rel), { recursive: arg === "dir", force: true });
       return true;
     case "rename": {
       const to = at(arg);
       fs.mkdirSync(path.dirname(to), { recursive: true });
+      selfTouched(at(rel));
+      selfTouched(to);
       fs.renameSync(at(rel), to);
       return true;
     }
@@ -728,30 +736,22 @@ ipcMain.handle("note-peek", async (_event, target, root) => {
   // A `ref::` line, as written: relative to the Bedrock folder, or absolute. A `..` written
   // into a note is resolved here and not carried any further.
   const file = refResolve(String(target));
-  // A vault's folder is a target too: a reference can point at a whole vault, not only
-  // at a note in one. It peeks as a vault-typed thing whose vault is itself, so the
-  // corner opens it with nothing to land on. Any other folder is nothing to point at.
-  let isDir = false;
+  // Only a note is a target. A folder — a vault's included — is nothing to point at: a
+  // vault is reached through the notes in it, never stood for by a node.
+  let text = "";
   try {
-    isDir = fs.statSync(file).isDirectory();
+    if (fs.statSync(file).isDirectory()) return null;
+    text = fs.readFileSync(file, "utf8");
   } catch {
     return null;
   }
-  let text = "";
-  if (!isDir) {
-    try {
-      text = fs.readFileSync(file, "utf8");
-    } catch {
-      return null;
-    }
-  } else if (!isVaultDir(file)) return null;
-  let type = isDir ? "vault" : (/^type::[ \t]*([\w-]+)[ \t]*$/im.exec(text)?.[1].toLowerCase() ?? null);
+  let type = /^type::[ \t]*([\w-]+)[ \t]*$/im.exec(text)?.[1].toLowerCase() ?? null;
   // A reference peeks as what it points at: the reference to a reference to a Notion page
   // wears the Notion tile too, not a picture of a picture.
   if (type === "ref") type = /^target::[ \t]*([\w-]+)[ \t]*$/im.exec(text)?.[1].toLowerCase() ?? null;
   // Up, folder by folder, to the nearest one that is a vault; the disk's own root ends it.
   let vault = null;
-  for (let dir = isDir ? file : path.dirname(file); ; dir = path.dirname(dir)) {
+  for (let dir = path.dirname(file); ; dir = path.dirname(dir)) {
     if (isVaultDir(dir)) {
       vault = dir;
       break;
@@ -760,7 +760,7 @@ ipcMain.handle("note-peek", async (_event, target, root) => {
   }
   // Where it sits inside that vault, "/"-relative — what a window opened onto the vault
   // lands on. Empty for the vault's own folder: there is nothing to land on but the whole.
-  const inside = vault && !isDir ? path.relative(vault, file).split(path.sep).join("/") : "";
+  const inside = vault ? path.relative(vault, file).split(path.sep).join("/") : "";
   // Inside the root asked about, or not — through real paths, so a symlinked folder and
   // the folder it stands for count as the same place ("/tmp" is one, see `sameDir`).
   let relative = null;
@@ -898,13 +898,8 @@ ipcMain.handle("vault-index", async (_event, root) => {
     return inside && !inside.startsWith("..") && !path.isAbsolute(inside) ? posix(inside) : null;
   };
   const notes = [];
-  // The vaults themselves are targets as much as the notes in them: a whole vault can be
-  // linked, and the node standing for it is only a holder pointing at it. Every vault in
-  // the system but the asker's own — the ones above it included, the top first.
-  const vaults = [];
-  if (top !== start && isVaultDir(top)) vaults.push({ path: top, ref: refForm(top), name: path.basename(top), place: "", relative: null, nested: false });
   // `nested`: the folder is a vault of its own INSIDE the asker's — its notes are in the
-  // asker's files, but not on the asker's canvas, which shows one node for the whole vault.
+  // asker's files, but not on the asker's canvas, which leaves them to their own graph.
   const walk = (dir, vault, nested) => {
     let entries;
     try {
@@ -917,9 +912,6 @@ ipcMain.handle("vault-index", async (_event, root) => {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) {
         const own = isVaultDir(full);
-        // For a vault, `nested` is the folder's own flag: a vault inside a vault inside the
-        // asker's is behind that one's node, and stands here as a reference, not a vault node.
-        if (own && full !== start) vaults.push({ path: full, ref: refForm(full), name: entry.name, place: posix(path.relative(top, dir)), relative: relativeTo(full), nested });
         walk(full, own ? full : vault, nested || (own && full.startsWith(start + path.sep)));
       } else if (/\.md$/i.test(entry.name)) {
         notes.push({
@@ -935,7 +927,95 @@ ipcMain.handle("vault-index", async (_event, root) => {
     }
   };
   walk(top, isVaultDir(top) ? top : null, false);
-  return { top, notes, vaults };
+  return { top, notes };
+});
+
+/*
+ * The connections that arrive at a vault's notes from OUTSIDE it: every reference in the
+ * system of vaults whose `ref::` line resolves to a note inside `root`, keyed by that
+ * note's path inside the root. The vault a reference lives in is what a click on the
+ * incoming mark opens, landed on the reference itself. Walked fresh, like the index.
+ */
+ipcMain.handle("refs-into", (_event, root) => {
+  const start = realDir(expandHome(String(root)));
+  const top = systemTop(start);
+  const posix = (p) => p.split(path.sep).join("/");
+  const into = {};
+  for (const file of markdownUnder(top)) {
+    let text;
+    try {
+      text = fs.readFileSync(file, "utf8");
+    } catch {
+      continue;
+    }
+    const line = /^ref::[ \t]*(.+?)[ \t]*$/m.exec(text);
+    if (!line || !/^type::[ \t]*ref[ \t]*$/im.test(text)) continue;
+    const at = realDir(refResolve(line[1]));
+    const inside = path.relative(start, at);
+    if (!inside || inside.startsWith("..") || path.isAbsolute(inside)) continue;
+    const vault = vaultOf(file);
+    // Only a reference from ANOTHER graph counts — a vault nested inside this folder is
+    // another graph, so its references in count; this vault's own do not.
+    if (!vault || vault === start) continue;
+    const key = posix(inside);
+    (into[key] ??= []).push({ vault, note: posix(path.relative(vault, file)), name: path.basename(vault) });
+  }
+  return into;
+});
+
+/*
+ * The disk, watched. Nothing in the app used to notice a note moved or renamed in the
+ * Finder until the vault was opened again; now the window showing a vault is told when
+ * anything under it changes, and re-reads. The app's own writes are remembered for a
+ * moment (`selfTouched`) so they do not come back as news, and the app's own `.notes/`
+ * is never news. One watch per window; a window that opens another vault replaces it.
+ */
+const SELF_TOUCH_MS = 2500;
+const touched = new Map(); // absolute path → when the app itself last wrote it
+function selfTouched(file) {
+  const now = Date.now();
+  touched.set(path.resolve(file), now);
+  if (touched.size > 500) for (const [p, when] of touched) if (now - when > SELF_TOUCH_MS) touched.delete(p);
+}
+const watches = new Map(); // webContents id → { root, close }
+ipcMain.handle("vault-watch", (event, root) => {
+  const id = event.sender.id;
+  watches.get(id)?.close();
+  watches.delete(id);
+  if (!root) return false;
+  const dir = path.resolve(expandHome(String(root)));
+  let timer = null;
+  let watcher;
+  try {
+    watcher = fs.watch(dir, { recursive: true }, (_kind, name) => {
+      if (!name) return;
+      const rel = String(name);
+      // The app's own folders, and anything hidden: not the notes.
+      if (rel.split(path.sep).some((part) => part.startsWith("."))) return;
+      const full = path.join(dir, rel);
+      const when = touched.get(full);
+      if (when && Date.now() - when < SELF_TOUCH_MS) return;
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        if (!event.sender.isDestroyed()) event.sender.send("vault-changed", dir);
+      }, 400);
+    });
+  } catch {
+    return false; // a folder that cannot be watched is read when the vault is opened, as before
+  }
+  watcher.on("error", () => undefined);
+  const close = () => {
+    clearTimeout(timer);
+    watcher.close();
+  };
+  watches.set(id, { root: dir, close });
+  event.sender.once("destroyed", () => {
+    if (watches.get(id)?.close === close) {
+      close();
+      watches.delete(id);
+    }
+  });
+  return true;
 });
 
 /**

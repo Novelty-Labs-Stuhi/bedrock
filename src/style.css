@@ -1610,6 +1610,29 @@ button.twisty:hover {
    when a turn has finished that nobody has looked at, and an empty ring otherwise. The
    blink is CSS for the same reason the active ring's beat is — it keeps time whether or
    not the canvas is redrawing, and costs nothing when no session is running. */
+/* The chain on a note's top-right: connections arrive here from other vaults, and the
+   mark is the way back along them. Cut into the corner like a reference's notch — a
+   rounded square in the canvas colour with the white chain in it — and clickable, the
+   one thing on the overlay that is. */
+.incoming-badge {
+  position: absolute;
+  border-radius: 20%; /* the notch's own corners (rx 26 of 128) */
+  background-color: var(--bg);
+  background-image: url("data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 128 128'%3E%3Cg fill='none' stroke='%23fff' stroke-width='16' stroke-linecap='round' transform='rotate(-45 64 64)'%3E%3Crect x='2' y='42' width='72' height='44' rx='22'/%3E%3Crect x='54' y='42' width='72' height='44' rx='22'/%3E%3C/g%3E%3C/svg%3E");
+  background-size: 100% 100%; /* the chain fills its square as the arrow fills the notch */
+  background-position: center;
+  background-repeat: no-repeat;
+  box-shadow: 0 0 0 0.1em var(--bg);
+  box-sizing: border-box;
+  transform: translate(-50%, -50%);
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.incoming-badge:hover {
+  filter: brightness(1.35);
+}
+
 .session-badge {
   position: absolute;
   border-radius: 50%;

@@ -1,7 +1,11 @@
 // A vault is a flat listing of markdown files + the folders that hold them.
 // Paths are always "/"-separated and relative to the vault root ("notes/idea.md").
 
-export type Entry = { path: string; kind: "file" | "dir" };
+/** A folder entry says whether it is a vault of its own (has a `.notes/`): its notes belong to its graph, not this one. */
+/** The app's own folder inside a vault — see spatial.ts. */
+const NOTES_DIR = ".notes";
+
+export type Entry = { path: string; kind: "file" | "dir"; vault?: boolean };
 
 export interface Vault {
   readonly name: string;
@@ -279,13 +283,17 @@ export class FolderVault implements Vault {
   private async scan(): Promise<{ entries: Entry[]; assets: string[] }> {
     const entries: Entry[] = [];
     const assets: string[] = [];
-    const walk = async (dir: FileSystemDirectoryHandle, prefix: string): Promise<void> => {
+    const walk = async (dir: FileSystemDirectoryHandle, prefix: string, own: Entry | null): Promise<void> => {
       for await (const handle of dir.values()) {
-        if (handle.name.startsWith(".")) continue;
+        if (handle.name.startsWith(".")) {
+          if (own && handle.kind === "directory" && handle.name === NOTES_DIR) own.vault = true;
+          continue;
+        }
         const path = join(prefix, handle.name);
         if (handle.kind === "directory") {
-          entries.push({ path, kind: "dir" });
-          await walk(handle as FileSystemDirectoryHandle, path);
+          const entry: Entry = { path, kind: "dir" };
+          entries.push(entry);
+          await walk(handle as FileSystemDirectoryHandle, path, entry);
         } else if (isMarkdown(handle.name)) {
           entries.push({ path, kind: "file" });
         } else if (isImage(handle.name)) {
@@ -293,7 +301,7 @@ export class FolderVault implements Vault {
         }
       }
     };
-    await walk(this.root, "");
+    await walk(this.root, "", null);
     return { entries, assets };
   }
 

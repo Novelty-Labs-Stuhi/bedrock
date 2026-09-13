@@ -38,6 +38,12 @@ interface Window {
     /** Every note in the system of vaults `root` is part of, by name and place — see
         `VaultIndex`. Made fresh from the disk on each call; nothing is kept. */
     vaultIndex(root: string): Promise<VaultIndex>;
+    /** Every reference elsewhere that points at a note inside `root`, keyed by that note's path inside the root. */
+    refsInto(root: string): Promise<Record<string, IncomingRef[]>>;
+    /** Watches the disk under `root` for this window; false when it cannot be watched. An empty root stops the watch. */
+    vaultWatch(root: string): Promise<boolean>;
+    /** Something under the watched root changed on disk — not by this app. */
+    onVaultChanged(fn: (root: string) => void): void;
     /** Where the `agy` CLI is (null when it is not installed), and whether it has ever run
         on this machine. There is no sign-in question: the CLI holds its own OAuth login in
         the keychain and asks for one in the terminal, where it can be answered. */
@@ -361,24 +367,18 @@ type IndexedNote = {
   nested: boolean;
 };
 
-/** One vault as the search index knows it — a whole world that can be linked, not only a note in it. */
-type IndexedVault = {
-  /** Absolute path of its folder on this disk. */
-  path: string;
-  /** The folder as a `ref::` line writes it: relative to the Bedrock folder when under it, else absolute. */
-  ref: string;
-  /** The folder's name — what the vault is called. */
-  name: string;
-  /** The folder it sits in, relative to the top of the system, "/"-separated; "" for the top itself. */
-  place: string;
-  /** Its folder inside the root asked about, or null when it is outside that root. */
-  relative: string | null;
-  /** Inside the root asked about, but behind another vault's node there — so a reference, not a vault node. */
-  nested: boolean;
-};
-
 /** The system of vaults a folder is part of: the top of it, every note under that, and every vault but the asker's own. */
-type VaultIndex = { top: string; notes: IndexedNote[]; vaults: IndexedVault[] };
+type VaultIndex = { top: string; notes: IndexedNote[] };
+
+/** A reference in another vault that points at a note here. */
+type IncomingRef = {
+  /** Absolute path of the vault the reference lives in. */
+  vault: string;
+  /** The reference's path inside that vault, "/"-separated — what a window onto it lands on. */
+  note: string;
+  /** The vault's folder name. */
+  name: string;
+};
 
 /** A meeting Granola took notes of, as its list names it. */
 type GranolaMeeting = {
