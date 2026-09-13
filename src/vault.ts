@@ -1,11 +1,11 @@
 // A vault is a flat listing of markdown files + the folders that hold them.
 // Paths are always "/"-separated and relative to the vault root ("notes/idea.md").
 
-/**
- * `branch` is set on a folder that is a BRANCH: one with a `.notes/` of its own — what used
- * to be a vault inside a vault. Its notes are part of this graph, folded away or opened.
- */
-export type Entry = { path: string; kind: "file" | "dir"; branch?: boolean };
+/** A folder entry says whether it is a vault of its own (has a `.notes/`): its notes belong to its graph, not this one. */
+/** The app's own folder inside a vault — see spatial.ts. */
+const NOTES_DIR = ".notes";
+
+export type Entry = { path: string; kind: "file" | "dir"; vault?: boolean };
 
 export interface Vault {
   readonly name: string;
@@ -77,10 +77,6 @@ export function uniquePath(existing: Iterable<string>, dir: string, base: string
   for (let n = 2; taken.has(candidate.toLowerCase()); n++) candidate = join(dir, `${base} ${n}${ext}`);
   return candidate;
 }
-
-/** The branch folders among a listing: every folder with a `.notes/` of its own. */
-export const branchFolders = (entries: Entry[]): string[] =>
-  entries.filter((entry) => entry.kind === "dir" && entry.branch).map((entry) => entry.path);
 
 /** Every ancestor folder of a path, outermost first: a/b/c.md -> ["a", "a/b"]. */
 export function ancestors(path: string): string[] {
@@ -287,14 +283,17 @@ export class FolderVault implements Vault {
   private async scan(): Promise<{ entries: Entry[]; assets: string[] }> {
     const entries: Entry[] = [];
     const assets: string[] = [];
-    const walk = async (dir: FileSystemDirectoryHandle, prefix: string): Promise<void> => {
+    const walk = async (dir: FileSystemDirectoryHandle, prefix: string, own: Entry | null): Promise<void> => {
       for await (const handle of dir.values()) {
-        if (handle.name.startsWith(".")) continue;
+        if (handle.name.startsWith(".")) {
+          if (own && handle.kind === "directory" && handle.name === NOTES_DIR) own.vault = true;
+          continue;
+        }
         const path = join(prefix, handle.name);
         if (handle.kind === "directory") {
-          const dir = handle as FileSystemDirectoryHandle;
-          entries.push({ path, kind: "dir", ...((await hasNotesDir(dir)) ? { branch: true } : {}) });
-          await walk(dir, path);
+          const entry: Entry = { path, kind: "dir" };
+          entries.push(entry);
+          await walk(handle as FileSystemDirectoryHandle, path, entry);
         } else if (isMarkdown(handle.name)) {
           entries.push({ path, kind: "file" });
         } else if (isImage(handle.name)) {
@@ -302,7 +301,7 @@ export class FolderVault implements Vault {
         }
       }
     };
-    await walk(this.root, "");
+    await walk(this.root, "", null);
     return { entries, assets };
   }
 
@@ -521,16 +520,6 @@ export class ShellVault implements Vault {
 
   async writeBinary(path: string, data: Blob): Promise<void> {
     await this.call("write-bin", path, new Uint8Array(await data.arrayBuffer()));
-  }
-}
-
-/** Whether a folder carries the app's own `.notes/` — the mark of a branch. */
-async function hasNotesDir(dir: FileSystemDirectoryHandle): Promise<boolean> {
-  try {
-    await dir.getDirectoryHandle(".notes");
-    return true;
-  } catch {
-    return false;
   }
 }
 

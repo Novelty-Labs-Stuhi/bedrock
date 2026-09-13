@@ -8,6 +8,7 @@ import cola from "cytoscape-cola";
 import { edgeNotePath, edgeTitle, isEdgeNote } from "./edges";
 import { inlineEdit, type InlineEditor } from "./inline";
 import { scoreNodes, sizeFor } from "./scoring";
+import { leafId, leafOf, meetingDay, parseSections, withoutSectionLinks } from "./granola";
 import {
   LinkResolver,
   parseField,
@@ -31,15 +32,8 @@ import {
   type TickState,
 } from "./linear";
 
-/**
- * A note as the graph reads it. `holds` is set on a vault note: how many notes are inside.
- * `branches` is set on a note SPANNED out of a folded branch — brought onto the canvas on
- * its own while the rest of its folder stays folded: the folder it belongs to, which the
- * branch mark at its bottom-right corner opens. `external` are the notes this one is
- * connected to that are NOT on the canvas — in folded branches — by path: the note wears a
- * count of them at its top-right, and a click there picks one to span.
- */
-export type Doc = { path: string; text: string; holds?: number; branches?: string[]; external?: string[] };
+/** A note as the graph reads it. */
+export type Doc = { path: string; text: string };
 
 cytoscape.use(cola);
 
@@ -350,10 +344,6 @@ const REF_RIM_OFFSET = `${(REF_MARK_AT - (1 - REF_MARK_SIZE) / 2) * 100}%`;
  * selector generated below.
  */
 const TYPE_STYLES: Record<string, Record<string, unknown>> = {
-  // A vault inside this one: a square where a note is a circle, in the same colours — it is
-  // made of the same stuff as the notes around it, only a container of them. A click
-  // opens it as the whole graph.
-  vault: { shape: "round-rectangle" },
   antigravity: {
     shape: "round-rectangle",
     "background-image": ANTIGRAVITY_ICON,
@@ -521,8 +511,7 @@ const refMark = (ground: string): string =>
  * A reference dressed as what it points at. The `target::` line rides the node as `rtype`,
  * and each type in `TYPE_STYLES` gets a rule: the type's own look — its tile, its icon —
  * with the notch laid over it as a second background image, cut into the bottom-right
- * corner. A type with no picture (a vault) is its shape with the notch; the plain note
- * keeps the circle-and-bite the `ref` type style gives it. A webpage reference wears the globe: the
+ * corner. The plain note keeps the circle-and-bite the `ref` type style gives it. A webpage reference wears the globe: the
  * site's own icon is the note's cache, not the reference's.
  */
 const refLookStyles = (ground: string): cytoscape.StylesheetJson => {
@@ -566,145 +555,6 @@ const refLookStyles = (ground: string): cytoscape.StylesheetJson => {
   }
   return rules as unknown as cytoscape.StylesheetJson;
 };
-
-/**
- * The branch glyph: a trunk with one bough leaving it, three knots — the shape a folded
- * branch of the graph has, drawn in white so it reads on the ground-coloured notch and on
- * a menu's disc alike.
- */
-const BRANCH_GLYPH_PATHS =
-  `<path d="M40 96V40" fill="none" stroke="#fff" stroke-width="11" stroke-linecap="round"/>` +
-  `<path d="M40 96C40 64 88 72 88 44" fill="none" stroke="#fff" stroke-width="11" stroke-linecap="round"/>` +
-  `<circle cx="40" cy="98" r="13" fill="#fff"/><circle cx="40" cy="30" r="13" fill="#fff"/><circle cx="88" cy="32" r="13" fill="#fff"/>`;
-
-/**
- * The mark a note wears for a folded branch it links into: the same notch a reference
- * wears — a rounded square in the ground colour, cut into the bottom-right corner — with
- * the branch glyph in it instead of the arrow. The branch is behind this note, and this is
- * the door to it (see `isRefCorner`, which answers for both marks).
- */
-const branchMark = (ground: string): string =>
-  "data:image/svg+xml;utf8," +
-  encodeURIComponent(
-    `<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">` +
-      `<rect width="128" height="128" rx="26" fill="${ground}"/>${BRANCH_GLYPH_PATHS}</svg>`,
-  );
-
-/** The branch glyph in a menu: on a slate disc, the way a reference's arrow rides its red one. */
-export const BRANCH_ICON =
-  "data:image/svg+xml;utf8," +
-  encodeURIComponent(
-    `<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">` +
-      `<circle cx="64" cy="64" r="60" fill="#5b6472"/><g transform="translate(14 8) scale(0.8)">${BRANCH_GLYPH_PATHS}</g></svg>`,
-  );
-
-/**
- * The reference's box-and-arrow, redrawn with ONE head, pointing in towards the note's
- * centre from the top-right corner: something arrives here from elsewhere. The reference's
- * own arrow has a head at both ends, so turning it round would say nothing.
- */
-const INCOMING_GLYPH_SVG =
-  `<g fill="none" stroke="#fff" stroke-width="10" stroke-linecap="round" stroke-linejoin="round">` +
-  `<rect x="22" y="22" width="84" height="84" rx="16"/>` +
-  `<path d="M94 34L46 82"/><path d="M46 50v32h32"/></g>`;
-
-/**
- * The mark for connections that ARRIVE from off the canvas: the same notch the reference and
- * the branch marks are — a rounded square in the ground colour, cut into the top-right corner
- * — with the reference's arrow turned to point into the note. Its left edge stands where the
- * branch mark's does at the bottom-right: one column of marks up the note's right side.
- */
-const incomingMark = (ground: string): string =>
-  "data:image/svg+xml;utf8," +
-  encodeURIComponent(
-    `<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">` +
-      `<rect width="128" height="128" rx="26" fill="${ground}"/>${INCOMING_GLYPH_SVG}</svg>`,
-  );
-
-/**
- * The marks a note wears at its corners, drawn as its background images — so they move with
- * it, zoom with it and are hit-tested with it — on top of whatever picture it already has: its
- * type's tile or icon, or the sign chosen for it by hand. Cytoscape draws several background
- * images per node, one set of geometry each, so every property here is a function mapper
- * answering an array, and the same `layers` walk builds all of them:
- *
- * - the note's own picture, in the geometry its own rule gives it;
- * - the BRANCH mark at the bottom-right, for a note drawn out of a folded branch;
- * - the INCOMING mark at the top-right, for connections arriving from off the canvas.
- *
- * The rule sits after the type and sign rules and overrides their `background-image`, so a
- * note with a mark keeps its picture by having it re-stated here. A reference keeps its own
- * notch and takes no marks (`marks` is 0 for it).
- */
-const markStyles = (ground: string): cytoscape.StylesheetJson => {
-  const branch = branchMark(ground);
-  const incoming = incomingMark(ground);
-  const size = `${REF_MARK_SIZE * 100}%`;
-  type Layer = { image: string; fit: string; width: string; height: string; px: string; py: string; ox: string; oy: string; clip: string };
-  const layers = (ele: NodeSingular): Layer[] => {
-    const out: Layer[] = [];
-    const type = (ele.data("ntype") as string) || "";
-    const sign = ele.data("sign") as string | undefined;
-    if (sign) out.push({ image: sign, fit: "none", width: "58%", height: "58%", px: "50%", py: "50%", ox: "0%", oy: "0%", clip: "node" });
-    else {
-      const own = TYPE_STYLES[type];
-      const picture = type === "web" ? ((ele.data("wicon") as string) || GLOBE_ICON) : (own?.["background-image"] as string | undefined);
-      if (picture) {
-        out.push({
-          image: picture,
-          fit: (own?.["background-fit"] as string | undefined) ?? "none",
-          width: (own?.["background-width"] as string | undefined) ?? "auto",
-          height: (own?.["background-height"] as string | undefined) ?? "auto",
-          px: "50%",
-          py: "50%",
-          ox: "0%",
-          oy: "0%",
-          clip: "node",
-        });
-      }
-    }
-    if ((ele.data("bcount") as number) > 0) {
-      out.push({ image: branch, fit: "none", width: size, height: size, px: "100%", py: "100%", ox: REF_RIM_OFFSET, oy: REF_RIM_OFFSET, clip: "none" });
-    }
-    if (((ele.data("xcount") as number) || 0) > 0) {
-      // The branch mark's geometry, mirrored up: the same offset out past the rim.
-      out.push({ image: incoming, fit: "none", width: size, height: size, px: "100%", py: "0%", ox: REF_RIM_OFFSET, oy: `-${REF_RIM_OFFSET}`, clip: "none" });
-    }
-    return out;
-  };
-  const pick = (key: keyof Layer) => (ele: NodeSingular) => layers(ele).map((layer) => layer[key]);
-  return [
-    {
-      selector: 'node[kind = "file"][marks > 0]',
-      style: {
-        "background-image": pick("image"),
-        "background-fit": pick("fit"),
-        "background-width": pick("width"),
-        "background-height": pick("height"),
-        "background-position-x": pick("px"),
-        "background-position-y": pick("py"),
-        "background-offset-x": pick("ox"),
-        "background-offset-y": pick("oy"),
-        "background-clip": pick("clip"),
-        "background-image-opacity": (ele: NodeSingular) => layers(ele).map(() => 1),
-        // The marks reach out past the node's box; the renderer must know to draw there.
-        "bounds-expansion": 30,
-      },
-    },
-  ] as unknown as cytoscape.StylesheetJson;
-};
-
-/**
- * Whether a click on a note landed on its INCOMING mark at the top-right — the reference
- * notch mirrored up. Like `isRefCorner`, only the part inside the node's shape is ever heard.
- */
-function isIncomingCorner(node: NodeSingular, at: cytoscape.Position): boolean {
-  const centre = node.position();
-  const width = node.width();
-  const c = REF_MARK_AT * width;
-  const half = (REF_MARK_SIZE / 2) * width;
-  return Math.max(Math.abs(at.x - centre.x - c), Math.abs(at.y - centre.y + c)) <= half * 1.2;
-}
 
 /*
  * An issue's progress used to be a coloured ring round its icon, and it made the icon
@@ -806,22 +656,64 @@ function styleSheet(look: Look): cytoscape.StylesheetJson {
       selector: 'node[kind = "file"]',
       style: { width: "data(size)", height: "data(size)", ...pieStyle() },
     },
+    // A leaf: a section of a meeting not yet pointed anywhere, as a small dot beside the
+    // tile in Granola's green, sized from the tile so it always reads as the smaller thing.
+    // No name on the canvas; hovering it says its heading beside it, as a note says its name.
+    {
+      selector: 'node[kind = "leaf"]',
+      style: {
+        width: "data(lsize)",
+        height: "data(lsize)",
+        shape: "ellipse",
+        label: "",
+        "background-color": GRANOLA_GREEN,
+        "background-opacity": 1,
+        "border-width": 1,
+        "border-color": ground,
+        "overlay-opacity": 0,
+        "z-index": 20,
+      },
+    },
     // Typed notes wear their type — an Antigravity session is the Antigravity mark.
     ...typeShapeStyles(),
     /*
-     * A meeting's tile is drawn a fifth bigger than the node: Granola's icon carries a clear
-     * margin inside its square, so drawn to fit it read as the smallest thing on the canvas
-     * next to a Notion page's edge-to-edge tile.
+     * A meeting says nothing until it is pointed at, and then only its day, beside it like
+     * any note's name: the leaves round it are what it is about, and a day under the ring
+     * was a second thing to read. The tile itself is drawn a fifth bigger than the node:
+     * Granola's icon carries a clear margin inside its square, so drawn to fit it read as
+     * the smallest thing on the canvas next to a Notion page's edge-to-edge tile.
      */
     {
       selector: 'node[ntype = "granola"]',
       style: {
+        label: "",
         "background-fit": "none",
         "background-width": "120%",
         "background-height": "120%",
         "background-clip": "node",
       },
     },
+    { selector: 'node[ntype = "granola"].named', style: { label: "data(label)", ...plate } },
+    // A hovered leaf grows a little and says its heading — to the side away from its
+    // meeting, so the words never lie across the tile.
+    {
+      selector: 'node[kind = "leaf"].hot',
+      style: {
+        width: "data(lhot)",
+        height: "data(lhot)",
+        label: "data(ltitle)",
+        color: ink,
+        "font-size": 10,
+        "text-valign": "center",
+        "text-halign": "right",
+        "text-margin-x": 4,
+        "text-wrap": "ellipsis",
+        "text-max-width": "220px",
+        "z-index": 30,
+        ...plate,
+      },
+    },
+    { selector: 'node[kind = "leaf"][lside = "left"].hot', style: { "text-halign": "left", "text-margin-x": -4 } },
     // A reference wears what it points at, with the notch cut from its corner.
     ...refLookStyles(ground),
     /*
@@ -854,8 +746,6 @@ function styleSheet(look: Look): cytoscape.StylesheetJson {
         "background-opacity": 1,
       },
     },
-    // The corner marks — branch, incoming count — over whatever picture the note has.
-    ...markStyles(ground),
     /*
      * A link has a direction — the note that points and the note pointed at — and a bare line
      * says nothing about which is which. So every edge carries a head at its target end.
@@ -943,6 +833,23 @@ function styleSheet(look: Look): cytoscape.StylesheetJson {
       selector: "node.draft",
       style: { width: 1, height: 1, "background-opacity": 0, label: "", events: "no" },
     },
+    // A spoke: the line from a meeting to one of its leaves, in the leaves' own green, out
+    // of the tile's edge and pointing at the leaf. Not a link — no name, nothing to click.
+    {
+      selector: "edge.spoke",
+      style: {
+        "line-color": GRANOLA_GREEN,
+        "line-opacity": 1,
+        width: 1.4,
+        "curve-style": "straight",
+        "target-arrow-shape": "triangle",
+        "target-arrow-color": GRANOLA_GREEN,
+        "arrow-scale": 0.8,
+        "target-distance-from-node": 1,
+        "source-distance-from-node": 0,
+        events: "no",
+      },
+    },
     {
       selector: "edge.draft",
       style: {
@@ -956,6 +863,8 @@ function styleSheet(look: Look): cytoscape.StylesheetJson {
       },
     },
     { selector: "node.draft-source", style: { "border-width": 3, "border-color": ink } },
+    // A leaf a draft has taken: out of sight until the draft ends one way or the other.
+    { selector: ".gone", style: { display: "none" } },
     // What a drawn rectangle took in, lit until something puts it out: a click on the
     // canvas, a click on a note, Esc, or the selection being acted on.
     {
@@ -1103,6 +1012,15 @@ function unstacked(
  */
 const edgeId = (source: string, target: string): string => `${source}\u0000${target}`;
 
+/** The smallest a leaf is drawn, in model units; a bigger tile gets bigger leaves (see `placeLeaves`). */
+const LEAF_SIZE = 7;
+
+/** Granola's own lime, read off the tile: what a meeting's leaves and the lines to them wear. */
+const GRANOLA_GREEN = "#b3c346";
+
+/** A line with a leaf at either end: a spoke, or the arrow a draft from a leaf drew before the rebuild. */
+const isLeafLine = (edge: EdgeSingular): boolean =>
+  edge.hasClass("spoke") || edge.source().data("kind") === "leaf" || edge.target().data("kind") === "leaf";
 
 /**
  * Nothing runs at build: a note is wherever it was left (`SpatialStore`), or wherever the one
@@ -1201,7 +1119,10 @@ export function buildElements(docs: Doc[], described: ReadonlySet<string> = new 
       ?.rows.filter((row) => row.state === "done" && row.target)
       .map((row) => resolver.resolve(row.target as string));
     const settledRows = settled ? new Set(settled) : null;
-    for (const link of parseLinks(doc.text)) {
+    // A meeting's heading lines link on behalf of its leaves (see `granola.ts`), so
+    // those links are read below, from the leaf, and not here from the note.
+    const meeting = types.get(doc.path) === "granola";
+    for (const link of parseLinks(meeting ? withoutSectionLinks(doc.text) : doc.text)) {
       const resolved = resolver.resolve(link.target);
       if (!resolved || resolved === doc.path || solved.has(resolved)) continue;
       if (settledRows?.has(resolved)) continue;
@@ -1215,6 +1136,24 @@ export function buildElements(docs: Doc[], described: ReadonlySet<string> = new 
       }
       byEdge.set(id, found);
     }
+    // A section that has been pointed somewhere is an arrow out of the meeting itself —
+    // the leaf it was is gone. Unnamed, like any other link: a name is given afterwards, and
+    // lands on a line under the heading (`labelSection`), which the pass above read.
+    if (meeting) {
+      for (const section of parseSections(doc.text)) {
+        for (const target of section.targets) {
+          const resolved = resolver.resolve(target);
+          if (!resolved || resolved === doc.path || solved.has(resolved)) continue;
+          const id = edgeId(doc.path, resolved);
+          const found = byEdge.get(id) ?? { source: doc.path, target: resolved, labels: [] };
+          if (!byEdge.has(id)) {
+            incoming.set(resolved, (incoming.get(resolved) ?? 0) + 1);
+            outgoing.set(doc.path, (outgoing.get(doc.path) ?? 0) + 1);
+          }
+          byEdge.set(id, found);
+        }
+      }
+    }
   }
 
   for (const doc of docs) {
@@ -1224,7 +1163,8 @@ export function buildElements(docs: Doc[], described: ReadonlySet<string> = new 
     elements.push({
       data: {
         id: doc.path,
-        label: noteName(doc.path),
+        // A meeting on the canvas is called by its day; the title stays on the file.
+        label: (type === "granola" ? meetingDay(parseField(doc.text, "date")) : null) ?? noteName(doc.path),
         kind: "file",
         size: nodeSize((incoming.get(doc.path) ?? 0) + (outgoing.get(doc.path) ?? 0)),
         // Always present (empty for untyped), so a removed type line clears on sync.
@@ -1252,9 +1192,6 @@ export function buildElements(docs: Doc[], described: ReadonlySet<string> = new 
         // A board node opens its board the same way: the uuid rides the node. Empty is
         // a note whose board has not been made yet — a click makes it (see main.ts).
         ...(type === "freeform" ? { fboard: parseField(doc.text, "board") ?? "" } : {}),
-        // A vault node opens the folder it names as a vault of its own. Empty means "the
-        // folder called what this note is called", which is what the note is born saying.
-        ...(type === "vault" ? { vfolder: parseField(doc.text, "vault") ?? "", vholds: doc.holds ?? 0 } : {}),
         // A page node opens its page the same way: the address rides the node. Empty is
         // a note whose page has not been made yet — a click makes it (see main.ts).
         ...(type === "notion" ? { nurl: parseField(doc.text, "page") ?? "" } : {}),
@@ -1280,17 +1217,6 @@ export function buildElements(docs: Doc[], described: ReadonlySet<string> = new 
         ...(type === "word" ? { wdoc: parseField(doc.text, "doc") ?? "" } : {}),
         // A reference node reveals the note it stands for, off the path riding here.
         ...(type === "ref" ? { rpath: parseField(doc.text, "ref") ?? "", rtype: parseField(doc.text, "target") ?? "" } : {}),
-        // The folded branches this note reaches into, and how many: always present, so a
-        // branch opened takes the mark off on the next sync (`sync` patches what is carried).
-        bfolders: doc.branches ?? [],
-        bcount: doc.branches?.length ?? 0,
-        // Likewise the notes it is connected to that are off the canvas: the badge at its
-        // top-right says how many, and lists them on a click.
-        xlinks: doc.external ?? [],
-        xcount: doc.external?.length ?? 0,
-        // Which corner marks it wears, as one number the stylesheet can select on. None for a
-        // reference: its own notch is its corner.
-        marks: type === "ref" ? 0 : (doc.branches?.length ? 1 : 0) + (doc.external?.length ? 2 : 0),
         // Same bargain for a session note: its id rides the node, so a click can go
         // straight to `claude://resume` without a read first. Empty until the Claude app
         // has minted one — that is a note that has never been run.
@@ -1313,6 +1239,46 @@ export function buildElements(docs: Doc[], described: ReadonlySet<string> = new 
         ...pieData(parseTags(doc.text)),
       },
     });
+  }
+
+  // A meeting's unassigned sections stand round it as leaves: one small circle per
+  // heading of the copied summary that points nowhere yet, from which the section is
+  // pointed at a note — dragged onto one, dragged onto empty canvas to make one, or from
+  // its menu — and once it is, the leaf goes and the meeting's arrow stands for it. Not
+  // files — the meeting's note holds them — so they are neither sized, saved nor laid
+  // out; the graph puts them round their meeting wherever it goes (`placeLeaves`).
+  for (const doc of docs) {
+    if (types.get(doc.path) !== "granola" || solved.has(doc.path)) continue;
+    for (const section of parseSections(doc.text)) {
+      const pointed = section.targets.some((target) => {
+        const resolved = resolver.resolve(target);
+        return resolved && resolved !== doc.path;
+      });
+      if (pointed) continue;
+      elements.push({
+        group: "nodes",
+        data: {
+          id: leafId(doc.path, section.index),
+          kind: "leaf",
+          label: "",
+          lof: doc.path,
+          lidx: section.index,
+          ltitle: section.title,
+          lsize: LEAF_SIZE,
+          lhot: LEAF_SIZE + 4,
+        },
+        // Grabbable: a leaf is dragged to where its section should point. Not locked — the
+        // layout leaves it alone anyway (`solvable`) and its meeting puts it back.
+        selectable: false,
+      });
+      // The spoke that ties the dot to its meeting: a hairline, no arrowhead, not a link.
+      elements.push({
+        group: "edges",
+        data: { id: edgeId(doc.path, leafId(doc.path, section.index)), source: doc.path, target: leafId(doc.path, section.index), spoke: 1 },
+        classes: "spoke",
+        selectable: false,
+      });
+    }
   }
 
   for (const [id, edge] of byEdge) {
@@ -1340,7 +1306,6 @@ export type DraftKind =
   | "note"
   /** A draft that only ever lands on a note already on the canvas — never makes one. */
   | "link"
-  | "vault"
   | "antigravity"
   | "claude"
   | "file"
@@ -1382,7 +1347,6 @@ const SESSION_TITLES: Record<SessionState, string> = {
 const DRAFT_NAMES: Record<DraftKind, string> = {
   note: "note",
   link: "link",
-  vault: "vault",
   antigravity: "Antigravity session",
   claude: "Claude session",
   web: "webpage",
@@ -1433,7 +1397,8 @@ export type GraphHandlers = {
    * Click on a vault node: open the folder it names as the whole graph. `folder` is the
    * note's `vault::` line, or null for a note that leaves it to its own name.
    */
-  onOpenVault: (path: string, folder: string | null) => void;
+  /** The incoming mark clicked: connections arrive at this note from references in other vaults. */
+  onOpenIncoming: (path: string) => void;
   /**
    * Click on a Notion page node: hand over the page's address stored on the node — null
    * for a note whose page was never made, which is an invitation to make it.
@@ -1441,23 +1406,19 @@ export type GraphHandlers = {
   onOpenNotion: (path: string, url: string | null) => void;
   /** Click on a Granola meeting node: hand over the meeting's id stored on the node. */
   onOpenGranola: (path: string, meeting: string | null) => void;
+  /** Click (or right-click) on a leaf: what to point this section at — a menu, at `client`. */
+  onLeafMenu: (leaf: string, client: { x: number; y: number }) => void;
+  /**
+   * A leaf dropped on empty canvas: make a note called `title` (the section's heading) at
+   * `at`, and point the section at it. A leaf dropped ON a note goes through `onLinkExisting`.
+   */
+  onLeafDrop: (leaf: string, title: string, at: cytoscape.Position) => void;
   /**
    * Click on a reference node: hand over the path of the note it stands for — null for a
    * note whose `ref::` line was stripped, which is an invitation to pick it again — and
    * whether the click was on the CORNER, the arrow that is the doorway to its vault.
    */
   onOpenRef: (path: string, target: string | null, corner: boolean) => void;
-  /**
-   * Click on the branch mark at a note's corner: `folders` are the folded branches the
-   * note reaches into (its `bfolders`), `client` where the click was, for a picker when
-   * there is more than one.
-   */
-  onOpenBranch: (path: string, folders: string[], client: Client) => void;
-  /**
-   * Click on the incoming mark at a note's top-right: `links` are the notes it is connected
-   * to that are not on the canvas (its `xlinks`), every one of which is to be brought here.
-   */
-  onOpenExternal: (path: string, links: string[], client: Client) => void;
   /**
    * Click on a Slack thread node: hand over the thread's link stored on the node — null
    * for a note whose thread was never started, which is an invitation to start it.
@@ -1561,6 +1522,10 @@ export class GraphView {
   private badgeEls = new Map<string, HTMLElement>();
   /** Note path -> the dot on its corner saying what its Claude session is doing. */
   private sessionEls = new Map<string, HTMLElement>();
+  /** Note path -> the incoming mark on its corner, for the notes that references elsewhere point at. */
+  private incomingEls = new Map<string, HTMLElement>();
+  /** What arrives from outside: note path -> how many references elsewhere point at it. */
+  private incoming = new Map<string, number>();
   /**
    * Address -> the site's icon, for as long as the app is open. Keyed by the address
    * rather than by the note, because that is what the icon belongs to: two notes about
@@ -1716,6 +1681,8 @@ export class GraphView {
     this.pulseEls.clear();
     for (const el of this.badgeEls.values()) el.remove();
     this.badgeEls.clear();
+    for (const el of this.incomingEls.values()) el.remove();
+    this.incomingEls.clear();
     this.issue?.el.remove();
     this.issue = null;
     this.fittedSize = null;
@@ -1742,7 +1709,7 @@ export class GraphView {
     // this vault's arrangement. The graph checks for itself rather than trusting every
     // caller to remember — the one time a caller did not, a whole vault was lost.
     if (this.cy && this.spatial.generation() !== this.builtFor) this.reset();
-    // The solver only runs on the first build and on explicit Re-layout —
+    // The solver only runs on the first build of a vault that has no arrangement yet —
     // re-solving on every edit would throw the whole graph around.
     if (this.cy) this.sync(docs, active, described);
     else this.build(docs, active, described);
@@ -1755,6 +1722,7 @@ export class GraphView {
   private sync(docs: Doc[], active: string | null, described: ReadonlySet<string>): void {
     const cy = this.cy;
     if (!cy) return;
+    const fresh: string[] = [];
     const defs = buildElements(docs, described);
     const nodeDefs = defs.filter((def) => !def.data.source);
     const edgeDefs = defs.filter((def) => def.data.source);
@@ -1784,11 +1752,10 @@ export class GraphView {
         }
         const carried = this.carried.get(nodeId);
         this.carried.delete(nodeId);
-        // Carried over a rename or seeded for a branch opening; else where the note was
-        // when it was last on this canvas (a branch folded and opened again); else a free
-        // spot, so a note that has just appeared never lands exactly on top of another —
-        // that reads as nothing having happened.
-        cy.add({ ...def, position: carried ?? this.spatial.node(nodeId) ?? this.freeSpot(this.spawnPoint()) });
+        // A note that has just appeared with no place of its own is seeded among its
+        // links once the edges are in (below), and then blooms — see `restore`.
+        if (!carried) fresh.push(nodeId);
+        cy.add({ ...def, position: carried ?? this.spawnPoint() });
       }
       for (const def of edgeDefs) {
         const existing = cy.getElementById(def.data.id as string);
@@ -1805,8 +1772,11 @@ export class GraphView {
         if (def.data.described) existing.data("described", 1);
         else existing.removeData("described");
       }
+      this.seed(cy, fresh); // the edges are in now, so a newcomer knows where its links stand
     });
 
+    cy.nodes(".gone").removeClass("gone"); // a draft's hidden dot: the files say now whether it stays
+    this.placeAllLeaves(); // a meeting that just arrived, or grew a section, gets its ring
     this.applySizing(); // the definitions carry the plain link count; the vault's rule is applied here
     // The open card's note may have just left the canvas — a finished issue folds away.
     if (this.issue && cy.getElementById(this.issue.path).empty()) this.closeIssue();
@@ -1815,6 +1785,7 @@ export class GraphView {
     this.applyMarks();
     this.drawOverlay();
     this.capture(); // notes added, moved or deleted since the cache was written
+    this.bloom(fresh);
   }
 
   /**
@@ -1824,31 +1795,6 @@ export class GraphView {
   carryPosition(fromPath: string, toPath: string): void {
     const node = this.cy?.getElementById(fromPath);
     if (node && node.nonempty()) this.carried.set(toPath, { ...node.position() });
-  }
-
-  /**
-   * Offers positions for notes about to appear — a branch's own arrangement, shifted to
-   * where the branch is being opened. Taken by the next build or sync for the notes that
-   * do arrive; a seed for a note that never comes is dropped by the next reset.
-   */
-  seedPositions(seeds: Iterable<[string, cytoscape.Position]>): void {
-    for (const [path, at] of seeds) this.carried.set(path, { ...at });
-  }
-
-  /** Where a note about to appear has been told to stand, if it has (see `seedPositions`). */
-  seedOf(path: string): cytoscape.Position | null {
-    const at = this.carried.get(path);
-    return at ? { ...at } : null;
-  }
-
-  /** The bounding box of every note on the canvas, or null for an empty one. */
-  notesBox(): { x1: number; y1: number; x2: number; y2: number } | null {
-    const cy = this.cy;
-    if (!cy) return null;
-    const notes = cy.nodes().filter((node) => node.data("kind") === "file" && node.id() !== DRAFT_NODE);
-    if (notes.empty()) return null;
-    const box = notes.boundingBox({ includeLabels: false });
-    return { x1: box.x1, y1: box.y1, x2: box.x2, y2: box.y2 };
   }
 
   /** Where a node with no remembered position should appear: the middle of the view. */
@@ -1934,10 +1880,9 @@ export class GraphView {
     this.builtFor = this.spatial.generation(); // this canvas belongs to this vault
     // A cached arrangement is restored as-is. Re-solving on every start is what made
     // the graph feel like it forgot everything the moment the app closed.
-    // Seeds count as an arrangement too: a folder opened for the first time with its
-    // branches' own arrangements offered is placed from those, not scattered.
-    if (this.spatial.hasLayout() || this.carried.size) this.restore(this.cy);
+    if (this.spatial.hasLayout()) this.restore(this.cy);
     else this.settle(); // solved straight away — there is no simulation to wait for
+    this.placeAllLeaves();
     this.applySizing();
     this.paintWebIcons(); // a rebuild within one session keeps the faces already fetched
     this.markActive(active);
@@ -1946,27 +1891,64 @@ export class GraphView {
 
   /**
    * Puts every note back where it was left. Notes added since the cache was written
-   * have nowhere to go back to, so they are slotted into a free spot near the middle —
-   * one new note must not rearrange the ones already placed.
+   * have nowhere to go back to: they are seeded among the notes they link to and then
+   * bloom — cola on just those, everything placed held still (see `bloom`). One new note
+   * must never rearrange the ones already placed.
    */
   private restore(cy: Core): void {
+    const fresh: string[] = [];
     cy.batch(() => {
       cy.nodes().forEach((node) => {
         const at = this.spatial.node(node.id());
         if (at) node.position(at);
+        else if (node.data("kind") !== "leaf") fresh.push(node.id());
       });
-      cy.nodes().forEach((node) => {
-        if (this.spatial.node(node.id())) return;
-        // Seeded (a branch's own arrangement, offered for its first showing here) or free.
-        const seeded = this.carried.get(node.id());
-        this.carried.delete(node.id());
-        node.position(seeded ?? this.freeSpot(this.spawnPoint()));
-      });
+      this.seed(cy, fresh);
     });
     this.fit();
     this.drawOverlay();
     this.ready = true; // restored — from here on, changes are worth saving
-    this.capture(); // the notes slotted in or seeded above are placed now, and that is worth keeping
+    this.bloom(fresh);
+  }
+
+  /**
+   * Starts each note in `fresh` from the middle of the notes it is linked to that already
+   * have a place (the middle of the view when it links to none), nudged clear of whatever
+   * sits there. Where the bloom begins; the bloom itself moves it from here.
+   */
+  private seed(cy: Core, fresh: string[]): void {
+    const unplaced = new Set(fresh);
+    for (const id of fresh) {
+      const node = cy.getElementById(id);
+      if (node.empty()) continue;
+      const placed = node.neighborhood("node").filter((other) => !unplaced.has(other.id()) && other.data("kind") !== "leaf");
+      let at = this.spawnPoint();
+      if (placed.nonempty()) {
+        let x = 0;
+        let y = 0;
+        placed.forEach((other) => {
+          x += other.position("x");
+          y += other.position("y");
+        });
+        at = { x: x / placed.length, y: y / placed.length };
+      }
+      node.position(this.freeSpot(at));
+    }
+  }
+
+  /**
+   * Settles notes that have no remembered place — appeared while the vault was closed, or
+   * were made from somewhere else — by cola from where they were seeded, with every other
+   * note held still. This is the only layout that ever runs on its own: nothing that has a
+   * place moves, and the newcomers find room among the notes they are linked to.
+   */
+  private bloom(fresh: string[]): void {
+    const cy = this.cy;
+    if (!cy) return;
+    const notes = fresh.filter((id) => cy.getElementById(id).data("kind") === "file");
+    if (!notes.length) return;
+    const things = notes.length === 1 ? "1 new note" : `${notes.length} new notes`;
+    this.runLayout(notes, `Placing ${things} among its links — Esc stops it where it is`);
   }
 
   /**
@@ -1998,7 +1980,8 @@ export class GraphView {
     if (!cy || !this.ready) return;
     const at: Array<[string, cytoscape.Position]> = [];
     cy.nodes().forEach((node) => {
-      if (node.id() === DRAFT_NODE) return;
+      // Leaves are placed from their meeting, never remembered on their own.
+      if (node.id() === DRAFT_NODE || node.data("kind") === "leaf") return;
       at.push([node.id(), { ...node.position() }]);
     });
     this.spatial.takeNodes(at);
@@ -2056,22 +2039,6 @@ export class GraphView {
   }
 
   /** Frames the whole graph. Counts as "the view is where it should be", not as a user move. */
-  /** Frames the notes whose path starts with `prefix` — a branch's — or everything when none do. */
-  fitTo(prefix: string): void {
-    const cy = this.cy;
-    if (!cy) return;
-    const inside = cy.nodes().filter((node) => node.data("kind") === "file" && node.id().startsWith(prefix));
-    if (inside.empty()) {
-      this.fit();
-      return;
-    }
-    this.fitting = true;
-    cy.fit(inside, 40);
-    this.fitting = false;
-    this.fittedSize = { w: cy.width(), h: cy.height() };
-    this.userMoved = false;
-  }
-
   fit(): void {
     const cy = this.cy;
     if (!cy || cy.elements().empty()) return;
@@ -2116,12 +2083,6 @@ export class GraphView {
     return moved;
   }
 
-  /** Re-solves the whole arrangement from scratch — deterministic, so it lands the same way twice. */
-  relayout(): void {
-    if (!this.cy) return;
-    this.settle();
-  }
-
   private wire(cy: Core): void {
     cy.on("tap", "node", (event) => {
       const node = event.target as NodeSingular;
@@ -2137,19 +2098,13 @@ export class GraphView {
       // Clicking a note opens it, which is done with the selection. A drag is not a tap,
       // so moving a group and letting it go leaves it lit.
       this.clearPicked();
+      // A leaf asks where its section should point: the menu is the whole click.
+      if (node.data("kind") === "leaf") {
+        this.coolLeaf();
+        this.handlers.onLeafMenu(node.id(), clientPoint(event));
+        return;
+      }
       if (node.data("kind") !== "file") return;
-      // The branch mark at a note's corner is the door to the folded branch behind it:
-      // a click there opens the branch, whatever kind of note wears the mark.
-      if ((node.data("bcount") as number) > 0 && node.data("ntype") !== "ref" && isRefCorner(node, event.position)) {
-        this.handlers.onOpenBranch(node.id(), [...((node.data("bfolders") as string[]) ?? [])], clientPoint(event));
-        return;
-      }
-      // The incoming mark at the top-right lists what points here from off the canvas.
-      const incoming = (node.data("xcount") as number) || 0;
-      if (incoming > 0 && node.data("ntype") !== "ref" && isIncomingCorner(node, event.position)) {
-        this.handlers.onOpenExternal(node.id(), [...((node.data("xlinks") as string[]) ?? [])], clientPoint(event));
-        return;
-      }
       // A session node is where the work is happening, not a page about it: clicking it
       // opens the session in a terminal. With the integration off it opens like any note.
       if (node.data("ntype") === "antigravity" && this.settings.enabled("antigravity")) {
@@ -2163,11 +2118,6 @@ export class GraphView {
         return;
       }
       const ntype = node.data("ntype") as string;
-      // A vault node is a doorway to another whole graph: clicking it goes through.
-      if (ntype === "vault") {
-        this.handlers.onOpenVault(node.id(), (node.data("vfolder") as string) || null);
-        return;
-      }
       // A file/folder node stands for something on the disk: clicking it opens THAT —
       // the note behind it is only the pointer, and stays reachable from the tree.
       if ((ntype === "file" || ntype === "folder") && this.settings.enabled("files")) {
@@ -2241,6 +2191,10 @@ export class GraphView {
     cy.on("tap", "edge", (event) => {
       if (this.draftSource) return; // a link is being drawn; the release belongs to that
       const edge = event.target as EdgeSingular;
+      if (edge.source().data("kind") === "leaf" || edge.source().data("ntype") === "granola") {
+        this.handlers.onHint("A meeting's arrow — right-click it to name it, or to cut it");
+        return;
+      }
       const label = (edge.data("label") as string | undefined) ?? null;
       this.handlers.onOpenEdge(edge.source().id(), edge.target().id(), label);
     });
@@ -2301,6 +2255,7 @@ export class GraphView {
       // A note of a lit selection speaks for the whole of it: the rectangle no longer
       // opens a menu of its own, so this is where a selection's actions are asked for.
       if (node && node.hasClass("picked")) this.handlers.onSelect(this.pickedPaths(), client);
+      else if (node && node.data("kind") === "leaf") this.handlers.onLeafMenu(node.id(), client);
       else if (node && node.data("kind") === "file") this.handlers.onNodeMenu(node.id(), client);
       else this.handlers.onCanvasMenu({ ...event.position }, client);
     });
@@ -2312,32 +2267,28 @@ export class GraphView {
 
     cy.on("mouseover", "node", (event) => {
       const node = event.target as NodeSingular;
+      if (node.data("kind") === "leaf") {
+        if (!this.draftSource && !this.leafDrag) this.hotLeaf(node);
+        return;
+      }
       if (this.draftSource || node.data("kind") !== "file") return;
       const neighborhood = node.closedNeighborhood();
       cy.elements().difference(neighborhood).addClass("faded");
       // Both halves of the spotlight: the notes themselves as well as the links between them.
-      const lit = neighborhood;
+      // A meeting's leaves and the lines to them keep their green rather than take the ink.
+      const lit = neighborhood.filter((ele) => ele.data("kind") !== "leaf" && !(ele.isEdge() && isLeafLine(ele as EdgeSingular)));
       lit.addClass("highlight");
       // A vault with names off asks for them by pointing: the note's own, its neighbours',
       // and what the links between them are called. That is the same neighbourhood the
       // highlight already works out, so it is the same one that speaks.
       if (this.namesOnDemand()) lit.addClass("named");
-      // A note wearing the branch mark says which folded branches it reaches into.
-      const folded = (node.data("bfolders") as string[] | undefined) ?? [];
-      const away = (node.data("xcount") as number | undefined) ?? 0;
-      const arriving = away ? `${away} connection${away === 1 ? "" : "s"} arrive from off the canvas — the mark at its top-right brings them here` : "";
-      if (folded.length) {
-        this.handlers.onHint(
-          `${node.data("label") as string} is in the folded branch ${folded.join(", ")} — the mark at its bottom-right corner opens it${arriving ? `; ${arriving}` : ""}`,
-        );
-      } else if (away) this.handlers.onHint(`${node.data("label") as string}: ${arriving}`);
+      // A meeting says its day only when pointed at, names on or off.
+      if (node.data("ntype") === "granola") node.addClass("named");
     });
-    cy.on("mouseout", "node", (event) => {
+    cy.on("mouseout", "node", () => {
+      this.coolLeaf();
       if (this.draftSource) return;
       this.clearSpotlight();
-      // The branch hint was the pointer's; it goes with it.
-      const node = event.target as NodeSingular;
-      if ((((node.data("bfolders") as string[] | undefined) ?? []).length || (node.data("xcount") as number)) && !this.drag) this.handlers.onHint(null);
     });
 
     // Nothing on the line itself says it can be opened, so the status bar says it.
@@ -2365,6 +2316,12 @@ export class GraphView {
 
     cy.on("grab", "node", (event) => {
       const node = event.target as NodeSingular;
+      // A leaf taken hold of is on its way to a note, or to where a note will be (`dropLeaf`).
+      if (node.data("kind") === "leaf") {
+        this.coolLeaf();
+        this.leafDrag = { id: node.id(), from: { ...node.position() } };
+        return;
+      }
       if (node.data("kind") !== "file") return;
       // Taking hold of one note of a drawn selection takes hold of all of them. Their
       // starting positions are read once, here: during the drag each is put back at its
@@ -2384,10 +2341,18 @@ export class GraphView {
       this.carryGroup();
       this.drawPulses(); // a note's own ring stays under the cursor with it
       this.placeIssueCard(); // as does an open card, if this is its node
-      this.drawIssueBadges(); // and the badge on an issue's corner
+      this.drawIssueBadges(); // and the badges on the corners — every kind, the same frame
+      this.drawSessionBadges();
+      this.drawIncomingBadges();
     });
 
     cy.on("free", "node", () => {
+      const leafDrag = this.leafDrag;
+      if (leafDrag) {
+        this.leafDrag = null;
+        this.dropLeaf(leafDrag);
+        return;
+      }
       const drag = this.drag;
       this.drag = null;
       if (drag && !drag.group.length) {
@@ -2404,6 +2369,19 @@ export class GraphView {
     // Cola moves notes between frames; the rings, badges and cards ride along.
     cy.on("position", "node", () => {
       if (this.layoutRun) this.drawOverlay();
+    });
+
+    // A meeting's leaves ride round it: dragged, laid out or restored, they follow. And
+    // they step round its arrows, so a note it points at moving moves them too.
+    cy.on("position", "node", (event) => {
+      const node = event.target as NodeSingular;
+      if (node.data("kind") !== "file") return;
+      if (node.data("ntype") === "granola") this.placeLeaves(node);
+      node.connectedEdges().forEach((edge) => {
+        if (isLeafLine(edge)) return;
+        const other = edge.source().id() === node.id() ? edge.target() : edge.source();
+        if (other.id() !== node.id() && other.data("ntype") === "granola") this.placeLeaves(other as NodeSingular);
+      });
     });
 
     cy.on("pan zoom", () => {
@@ -2651,6 +2629,7 @@ export class GraphView {
       this.placeIssueCard();
       this.drawIssueBadges();
       this.drawSessionBadges();
+      this.drawIncomingBadges();
     });
   }
 
@@ -2792,7 +2771,6 @@ export class GraphView {
   private pointerData(type: string | undefined, pointer: string): Record<string, string> {
     if (type === "web") return { wurl: pointer, wicon: this.webIcons.get(pointer) ?? GLOBE_ICON };
     if (type === "freeform") return { fboard: pointer };
-    if (type === "vault") return { vfolder: pointer };
     if (type === "notion") return { nurl: pointer };
     if (type === "granola") return { gmeet: pointer };
     if (type === "slack") return { sthread: pointer };
@@ -3314,9 +3292,172 @@ export class GraphView {
 
   /* ---------------------------------------------------------------- leaves --- */
 
-  /** What a layout may move or pull on: everything but the half-drawn draft. */
+  /**
+   * Puts a meeting's dots round its tile: a ring, spread evenly, starting from the top.
+   * The ring steps round the meeting's own arrows — where a line already leaves the tile
+   * towards a note, no dot sits in its way; the dots share out what is left of the circle
+   * equally. Far enough out to clear the tile, and further when the dots would touch.
+   * Locked in place: only this moves them, and it runs again whenever the meeting or one
+   * of the notes it points at moves.
+   */
+  private placeLeaves(parent: NodeSingular): void {
+    const cy = this.cy;
+    if (!cy) return;
+    const id = parent.id();
+    const leaves = cy
+      .nodes()
+      .filter((node) => node.data("lof") === id)
+      .sort((a, b) => Number(a.data("lidx")) - Number(b.data("lidx")));
+    const count = leaves.length;
+    if (!count) return;
+    const centre = parent.position();
+    const TAU = Math.PI * 2;
+    // A leaf is a fraction of its tile, whatever the vault's sizing rule made of the tile.
+    const size = Math.max(LEAF_SIZE, Math.min(18, Math.round(parent.width() * 0.26)));
+    const gap = size * 2.4;
+    let radius = parent.width() / 2 + size * 2 + 8;
+
+    // Where the meeting's arrows leave (or reach) it, measured from the top, clockwise.
+    const top = -Math.PI / 2;
+    const fromTop = (angle: number): number => (((angle - top) % TAU) + TAU) % TAU;
+    const blocked: number[] = [];
+    parent.connectedEdges().forEach((edge) => {
+      if (edge.id() === DRAFT_EDGE || isLeafLine(edge)) return;
+      const other = edge.source().id() === id ? edge.target() : edge.source();
+      if (other.data("kind") !== "file") return;
+      const at = other.position();
+      blocked.push(fromTop(Math.atan2(at.y - centre.y, at.x - centre.x)));
+    });
+    blocked.sort((a, b) => a - b);
+
+    // The free arcs between the arrows, each arrow keeping a clearance either side.
+    const clearance = Math.max(0.35, gap / radius);
+    let arcs: Array<[number, number]> = [];
+    for (let k = 0; k < blocked.length; k++) {
+      const from = blocked[k] + clearance;
+      const to = (k + 1 < blocked.length ? blocked[k + 1] : blocked[0] + TAU) - clearance;
+      if (to > from) arcs.push([from, to]);
+    }
+    let free = arcs.reduce((sum, [from, to]) => sum + (to - from), 0);
+    // Arrows in every direction leave nothing to step round: the plain ring, then.
+    if (!blocked.length || free < TAU * 0.4) {
+      arcs = [[0, TAU]];
+      free = TAU;
+    }
+    radius = Math.max(radius, (count * gap) / free);
+
+    const step = free / count;
+    let arc = 0;
+    let before = 0; // the length of the arcs already walked past
+    cy.batch(() => {
+      leaves.forEach((leaf, i) => {
+        const want = step * (i + 0.5);
+        while (arc < arcs.length - 1 && want > before + (arcs[arc][1] - arcs[arc][0])) {
+          before += arcs[arc][1] - arcs[arc][0];
+          arc++;
+        }
+        const angle = top + arcs[arc][0] + (want - before);
+        leaf.position({ x: centre.x + Math.cos(angle) * radius, y: centre.y + Math.sin(angle) * radius });
+        leaf.data({ lside: Math.cos(angle) >= 0 ? "right" : "left", lsize: size, lhot: size + 4 });
+      });
+    });
+  }
+
+  /** What the leaf for section `index` of a meeting is titled, or "" when it is not on the canvas. */
+  leafTitle(path: string, index: number): string {
+    const node = this.cy?.getElementById(leafId(path, index));
+    return node && node.nonempty() ? String(node.data("ltitle") || "") : "";
+  }
+
+  private placeAllLeaves(): void {
+    this.cy?.nodes().forEach((node) => {
+      if (node.data("ntype") === "granola") this.placeLeaves(node as NodeSingular);
+    });
+  }
+
+  /** What a layout may move or pull on: everything but the half-drawn draft and the leaves, which follow their meeting. */
   private solvable(cy: Core) {
-    return cy.elements().filter((ele) => ele.id() !== DRAFT_NODE && ele.id() !== DRAFT_EDGE);
+    return cy.elements().filter(
+      (ele) =>
+        ele.id() !== DRAFT_NODE &&
+        ele.id() !== DRAFT_EDGE &&
+        ele.data("kind") !== "leaf" &&
+        !(ele.isEdge() && isLeafLine(ele as EdgeSingular)),
+    );
+  }
+
+  /** The leaf the pointer is on, saying its heading (`.hot`); one at a time. */
+  private hotLeafId: string | null = null;
+
+  private hotLeaf(leaf: NodeSingular): void {
+    this.coolLeaf();
+    leaf.addClass("hot");
+    this.hotLeafId = leaf.id();
+  }
+
+  private coolLeaf(): void {
+    if (!this.hotLeafId) return;
+    this.cy?.getElementById(this.hotLeafId).removeClass("hot");
+    this.hotLeafId = null;
+  }
+
+  /** The leaf being dragged, and where it left the ring from. */
+  private leafDrag: { id: string; from: cytoscape.Position } | null = null;
+
+  /**
+   * A leaf let go of. On a note: the section is pointed at it, exactly as if the note had
+   * been picked from the leaf's menu. On empty canvas: a note named after the heading is
+   * made there and pointed at. Barely moved, or dropped back on its own meeting: nothing,
+   * and the ring takes it back. The dot goes at once either way it links — the rebuild that
+   * follows the write is what takes it away for good, the meeting's arrow in its place.
+   */
+  private dropLeaf(drag: { id: string; from: cytoscape.Position }): void {
+    const cy = this.cy;
+    if (!cy) return;
+    const leaf = cy.getElementById(drag.id) as NodeSingular;
+    if (leaf.empty()) return;
+    const at = { ...leaf.position() };
+    const meeting = cy.getElementById(String(leaf.data("lof")));
+    const back = (): void => {
+      if (meeting.nonempty()) this.placeLeaves(meeting as NodeSingular);
+      else leaf.position(drag.from);
+    };
+    // A click that wobbled is not a drag; the tap that follows opens the menu.
+    if (Math.hypot(at.x - drag.from.x, at.y - drag.from.y) * cy.zoom() < 8) {
+      back();
+      return;
+    }
+    const target = this.noteUnder(at, meeting.id());
+    if (!target && this.noteBoxUnder(at) === meeting.id()) {
+      back();
+      return;
+    }
+    leaf.addClass("gone");
+    back();
+    if (target) this.handlers.onLinkExisting(drag.id, target.id());
+    else this.handlers.onLeafDrop(drag.id, String(leaf.data("ltitle") || ""), at);
+  }
+
+  /** The note whose circle or tile is under `at`, other than `except`; null over bare canvas. */
+  private noteUnder(at: cytoscape.Position, except: string): NodeSingular | null {
+    let hit: NodeSingular | null = null;
+    this.cy?.nodes().forEach((node) => {
+      if (node.data("kind") !== "file" || node.id() === except || node.hasClass("gone")) return;
+      const box = node.boundingBox({ includeLabels: false, includeOverlays: false });
+      if (at.x >= box.x1 && at.x <= box.x2 && at.y >= box.y1 && at.y <= box.y2) hit = node as NodeSingular;
+    });
+    return hit;
+  }
+
+  /** The id of whichever note's box is under `at`, its own meeting included; null for none. */
+  private noteBoxUnder(at: cytoscape.Position): string | null {
+    let hit: string | null = null;
+    this.cy?.nodes().forEach((node) => {
+      if (node.data("kind") !== "file") return;
+      const box = node.boundingBox({ includeLabels: false, includeOverlays: false });
+      if (at.x >= box.x1 && at.x <= box.x2 && at.y >= box.y1 && at.y <= box.y2) hit = node.id();
+    });
+    return hit;
   }
 
   /* ---------------------------------------------------------- inline rename --- */
@@ -3397,11 +3538,20 @@ export class GraphView {
   ): void {
     if (!this.cy) return;
     this.clearSpotlight();
+    this.coolLeaf();
     this.draftSource = source.id();
     this.draftKind = kind;
     this.draftRow = row;
     this.draftRelease = release;
-    const anchor = source;
+    // A draft from a leaf is the meeting's arrow in the making: the dot goes at once, and
+    // the line comes out of the tile — where it will be drawn from once the link is written.
+    // Esc brings the dot back (`clearDraft`); a finished link leaves it gone for the rebuild.
+    let anchor = source;
+    if (source.data("kind") === "leaf") {
+      source.addClass("gone");
+      const meeting = this.cy.getElementById(String(source.data("lof")));
+      if (meeting.nonempty()) anchor = meeting as NodeSingular;
+    }
     anchor.addClass("draft-source");
     this.cy.add([
       {
@@ -3487,9 +3637,9 @@ export class GraphView {
       return;
     }
     const source = this.draftSource;
-    // Not a valid target: folder boxes and self-links. The draft stays armed.
+    // Not a valid target: folder boxes, self-links, and a leaf. The draft stays armed.
     if (node.data("kind") !== "file" || node.id() === source) return;
-    this.clearDraft();
+    this.clearDraft(false);
     if (!source) return;
     this.handlers.onLinkExisting(source, node.id());
   }
@@ -3499,8 +3649,11 @@ export class GraphView {
     this.handlers.onHint(null);
   }
 
-  private clearDraft(): void {
+  /** `reveal`: a dot hidden for a draft from a leaf comes back — a cancelled draft; a
+      finished one leaves it hidden, the rebuild that follows the write takes it away. */
+  private clearDraft(reveal = true): void {
     if (!this.cy) return;
+    if (reveal) this.cy.nodes(".gone").removeClass("gone");
     this.cy.nodes(".draft-source").removeClass("draft-source");
     this.cy.getElementById(DRAFT_EDGE).remove();
     this.cy.getElementById(DRAFT_NODE).remove();
@@ -3528,7 +3681,7 @@ export class GraphView {
       return;
     }
     const release = this.draftRelease;
-    this.clearDraft();
+    this.clearDraft(false);
     if (release) release(at, source);
     else this.handlers.onLinkNew(source, at, kind);
   }
@@ -3623,16 +3776,6 @@ export class GraphView {
     if (!node || node.empty()) return;
     node.data("rpath", target);
     node.data("rtype", type ?? "");
-  }
-
-  /** The vault node standing for `folder` (this vault's own, root-relative) on this canvas, or null when none does. */
-  vaultNode(folder: string): string | null {
-    const cy = this.cy;
-    if (!cy) return null;
-    const hit = cy
-      .nodes()
-      .filter((node) => node.data("ntype") === "vault" && ((node.data("vfolder") as string) || noteName(node.id())) === folder);
-    return hit.nonempty() ? hit[0].id() : null;
   }
 
   /** And for a thread started after its note. */
@@ -3869,6 +4012,83 @@ export class GraphView {
     }
   }
 
+  /**
+   * Which notes here are pointed at from other vaults, and by how many references. Read off
+   * the disk by main.ts (`refs-into`); the marks are redrawn from it.
+   */
+  setIncoming(counts: Map<string, number>): void {
+    this.incoming = counts;
+    this.drawOverlay();
+  }
+
+  /**
+   * The references on this canvas a note is connected with, either way along the line —
+   * its links out to notes in other vaults, and the links a reference standing here carries
+   * to it. Each is a connection that leaves this vault.
+   */
+  externalLinks(path: string): Array<{ node: string; target: string | null }> {
+    const node = this.cy?.getElementById(path);
+    if (!node || node.empty()) return [];
+    const out: Array<{ node: string; target: string | null }> = [];
+    node.connectedEdges().forEach((edge) => {
+      if (isLeafLine(edge)) return;
+      const other = edge.source().id() === path ? edge.target() : edge.source();
+      if (other.data("ntype") !== "ref") return;
+      out.push({ node: other.id(), target: (other.data("rpath") as string) || null });
+    });
+    return out;
+  }
+
+  /**
+   * The chain on the top-right corner of a note with a connection that leaves this vault:
+   * references in OTHER vaults pointing at it, or its own lines to references standing
+   * here. The mark is the way along those connections — a click opens the vault at the
+   * other end, landed on the note there (or asks which, when there are several). The mirror
+   * of a reference's own notch (bottom-right); drawn in the overlay and sized off the node
+   * like the other badges, so it rides the zoom. Right, not left: the session dot has the
+   * left corner, and this is a doorway, which the label side reads as.
+   */
+  private drawIncomingBadges(): void {
+    const cy = this.cy;
+    if (!cy) return;
+    const alive = new Set<string>();
+    cy.nodes().forEach((node) => {
+      if (node.data("kind") !== "file" || node.data("ntype") === "ref") return; // a reference IS the connection
+      const id = node.id();
+      const count = (this.incoming.get(id) ?? 0) + this.externalLinks(id).length;
+      if (!count) return;
+      alive.add(id);
+      let el = this.incomingEls.get(id);
+      if (!el) {
+        el = document.createElement("div");
+        el.className = "incoming-badge";
+        el.dataset.note = id; // which note the mark belongs to — for anyone reading the overlay
+        el.addEventListener("click", (event) => {
+          event.stopPropagation();
+          this.handlers.onOpenIncoming(id);
+        });
+        this.overlay.appendChild(el);
+        this.incomingEls.set(id, el);
+      }
+      el.title = count === 1 ? "a connection to another vault — click to go there" : `${count} connections to other vaults — click to go there`;
+      // The reference notch's own geometry, mirrored to the top-right: the same fraction of
+      // the node's width, its centre the same way out along the diagonal (see `REF_MARK_AT`).
+      const at = node.renderedPosition();
+      const out = REF_MARK_AT * node.renderedWidth();
+      const size = REF_MARK_SIZE * node.width();
+      el.style.left = `${at.x + out}px`;
+      el.style.top = `${at.y - out}px`;
+      el.style.width = `${size}px`;
+      el.style.height = `${size}px`;
+      el.style.transform = `translate(-50%, -50%) scale(${cy.zoom()})`;
+    });
+    for (const [id, el] of this.incomingEls) {
+      if (alive.has(id)) continue;
+      el.remove();
+      this.incomingEls.delete(id);
+    }
+  }
+
   /** Writes a relation name onto the live edge, so it shows without a rebuild. */
   setEdgeLabel(source: string, target: string, label: string | null): void {
     const edge = this.cy?.getElementById(edgeId(source, target));
@@ -3982,14 +4202,22 @@ export class GraphView {
         position: this.freeSpot(newNode.at),
       });
     }
-    const id = edgeId(source, target);
-    if (this.cy.getElementById(id).empty() && this.cy.getElementById(source).nonempty()) {
-      this.cy.add({ group: "edges", data: { id, source, target } });
+    // A leaf's arrow is the meeting's: drawn from the tile, unnamed, exactly as the rebuild
+    // will draw it once the link is in the file.
+    const leaf = leafOf(source);
+    const from = leaf ? leaf.path : source;
+    const id = edgeId(from, target);
+    if (this.cy.getElementById(id).empty() && this.cy.getElementById(from).nonempty()) {
+      this.cy.add({ group: "edges", data: { id, source: from, target } });
     }
     // Both ends have one more connection than they did a moment ago, and both have to
-    // say so now — see `resizeNode`.
+    // say so now — see `resizeNode`. A meeting's dots step round the new line as well.
     this.resizeNode(source);
     this.resizeNode(target);
+    for (const end of [source, target]) {
+      const node = this.cy.getElementById(end);
+      if (node.nonempty() && node.data("ntype") === "granola") this.placeLeaves(node as NodeSingular);
+    }
     this.handlers.onHint(null);
   }
 
@@ -4021,19 +4249,14 @@ export class GraphView {
     if (!cy) return;
     const { sizing, sizeMin, sizeMax } = this.settings.layout();
     const notes = cy.nodes().filter((node) => node.data("kind") === "file" && node.id() !== DRAFT_NODE);
-    // The half-drawn draft edge is not a link anybody made.
-    const edges = cy.edges().filter((edge) => edge.id() !== DRAFT_EDGE);
+    // The half-drawn draft edge is not a link anybody made, and neither is a spoke.
+    const edges = cy.edges().filter((edge) => edge.id() !== DRAFT_EDGE && !isLeafLine(edge));
     const scores = scoreNodes(notes, edges, sizing);
     let top = 0;
     for (const score of scores.values()) top = Math.max(top, score);
     cy.batch(() => {
       notes.forEach((node) => {
-        let size = sizeFor(scores.get(node.id()) ?? 0, top, sizing, sizeMin, sizeMax);
-        // A vault is at least as big as what it holds says: a square standing for twenty
-        // notes must not read as one more leaf. The connections rule, on the count inside.
-        const holds = node.data("vholds") as number | undefined;
-        if (node.data("ntype") === "vault" && holds) size = Math.max(size, sizeFor(holds, top, "degree", sizeMin, sizeMax));
-        node.data("size", size);
+        node.data("size", sizeFor(scores.get(node.id()) ?? 0, top, sizing, sizeMin, sizeMax));
       });
     });
     this.drawOverlay(); // rings and badges sit on the rim, and the rim moved
@@ -4047,7 +4270,7 @@ export class GraphView {
    * settles around, and never the other way round. Esc, or a hand on the canvas, stops it
    * where it is; nothing is ever thrown back.
    */
-  runLayout(paths: Iterable<string>): void {
+  runLayout(paths: Iterable<string>, hint?: string): void {
     const cy = this.cy;
     if (!cy) return;
     this.stopLayout();
@@ -4065,7 +4288,7 @@ export class GraphView {
     const held = notes.difference(moving).filter((node) => !(node as NodeSingular).locked());
     held.lock();
     const things = moving.length === 1 ? "1 note" : `${moving.length} notes`;
-    this.handlers.onHint(`Laying out ${things} — Esc stops it where it is`);
+    this.handlers.onHint(hint ?? `Laying out ${things} — Esc stops it where it is`);
     const layout = cy.layout(
       colaOptions(this.settings.layout(), {
         // Every note and every link: what is fixed still shapes what moves. The half-drawn
@@ -4076,17 +4299,6 @@ export class GraphView {
     this.layoutRun = { layout, held };
     layout.one("layoutstop", () => this.finishLayout(layout));
     layout.run();
-  }
-
-  /** The whole canvas at once. */
-  runLayoutAll(): void {
-    const cy = this.cy;
-    if (!cy) return;
-    const all: string[] = [];
-    cy.nodes().forEach((node) => {
-      if (node.data("kind") === "file") all.push(node.id());
-    });
-    this.runLayout(all);
   }
 
   /** Stops the run and keeps whatever it had reached. */
