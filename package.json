@@ -67,6 +67,7 @@
     "@codemirror/view": "^6.43.7",
     "cytoscape": "^3.30.2",
     "cytoscape-cola": "^2.5.1",
+    "cytoscape-fcose": "^2.2.0",
     "electron-updater": "^6.8.9",
     "katex": "^0.18.4"
   },

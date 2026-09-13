@@ -5,6 +5,7 @@
 import cytoscape from "cytoscape";
 import type { Core, EdgeSingular, ElementDefinition, LayoutOptions, Layouts, NodeCollection, NodeSingular } from "cytoscape";
 import cola from "cytoscape-cola";
+import fcose from "cytoscape-fcose";
 import { edgeNotePath, edgeTitle, isEdgeNote } from "./edges";
 import { inlineEdit, type InlineEditor } from "./inline";
 import { scoreNodes, sizeFor } from "./scoring";
@@ -42,6 +43,7 @@ import {
 export type Doc = { path: string; text: string; holds?: number; branches?: string[]; external?: string[] };
 
 cytoscape.use(cola);
+cytoscape.use(fcose);
 
 /** A note with no tags. */
 const UNTAGGED = "#f92411";
@@ -1531,6 +1533,96 @@ type DragState = {
 
 /** A rectangle in rendered (screen) coordinates, relative to the canvas. */
 type Area = { x1: number; y1: number; x2: number; y2: number };
+
+/* ------------------------------------------------------------ crossings --- */
+/*
+ * What a layout is judged by here: how many pairs of connections cross. A force layout
+ * optimises stress — drawn distance against graph distance — and crossings only fall out of
+ * that by luck. So the whole-graph layout runs the solver several times from different
+ * seeds, counts the crossings of each answer, keeps the best, and then works on that one
+ * directly: for every pair of lines that cross, trading the places of a note from one with
+ * a note from the other, and keeping the trade whenever fewer lines cross afterwards.
+ */
+
+type Pt = { x: number; y: number };
+type Seg = [string, string];
+
+const orient = (a: Pt, b: Pt, c: Pt): number => (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+
+/** Whether two connections, drawn straight between their notes' centres, cross — sharing a note is not crossing. */
+function segmentsCross(e: Seg, f: Seg, at: Map<string, Pt>): boolean {
+  if (e[0] === f[0] || e[0] === f[1] || e[1] === f[0] || e[1] === f[1]) return false;
+  const a = at.get(e[0]);
+  const b = at.get(e[1]);
+  const c = at.get(f[0]);
+  const d = at.get(f[1]);
+  if (!a || !b || !c || !d) return false;
+  return orient(a, b, c) * orient(a, b, d) < 0 && orient(c, d, a) * orient(c, d, b) < 0;
+}
+
+function countCrossings(edges: Seg[], at: Map<string, Pt>): number {
+  let n = 0;
+  for (let i = 0; i < edges.length; i++) for (let j = i + 1; j < edges.length; j++) if (segmentsCross(edges[i], edges[j], at)) n++;
+  return n;
+}
+
+/**
+ * Fewer crossings by trading places. For every crossing pair of lines, each note of one is
+ * tried in the place of each note of the other; a trade stands when the lines touching
+ * those two notes cross fewer others than before. Only the lines at the two notes are
+ * recounted, so a pass is cheap, and passes run until one changes nothing. Positions are
+ * exchanged whole, so the arrangement keeps exactly the set of places the solver made.
+ */
+function reduceCrossings(edges: Seg[], at: Map<string, Pt>, maxPasses = 6): number {
+  const touching = new Map<string, Seg[]>();
+  for (const edge of edges) {
+    for (const end of edge) {
+      const list = touching.get(end) ?? [];
+      list.push(edge);
+      touching.set(end, list);
+    }
+  }
+  const around = (u: string, v: string): number => {
+    const mine = new Set<Seg>([...(touching.get(u) ?? []), ...(touching.get(v) ?? [])]);
+    let n = 0;
+    for (const edge of mine) {
+      for (const other of edges) {
+        // Each pair once: a pair with both lines at the two notes is counted from its first.
+        if (mine.has(other) && edges.indexOf(other) <= edges.indexOf(edge)) continue;
+        if (segmentsCross(edge, other, at)) n++;
+      }
+    }
+    return n;
+  };
+  const swap = (u: string, v: string): void => {
+    const pu = at.get(u)!;
+    at.set(u, at.get(v)!);
+    at.set(v, pu);
+  };
+  let total = countCrossings(edges, at);
+  for (let pass = 0; pass < maxPasses && total > 0; pass++) {
+    let improved = false;
+    for (let i = 0; i < edges.length; i++) {
+      for (let j = i + 1; j < edges.length; j++) {
+        if (!segmentsCross(edges[i], edges[j], at)) continue;
+        for (const u of edges[i]) {
+          for (const v of edges[j]) {
+            if (u === v) continue;
+            const before = around(u, v);
+            swap(u, v);
+            const after = around(u, v);
+            if (after < before) {
+              total -= before - after;
+              improved = true;
+            } else swap(u, v); // undone
+          }
+        }
+      }
+    }
+    if (!improved) break;
+  }
+  return total;
+}
 
 export class GraphView {
   private cy: Core | null = null;
@@ -4078,15 +4170,90 @@ export class GraphView {
     layout.run();
   }
 
-  /** The whole canvas at once. */
+  /**
+   * The whole canvas laid out AFRESH, judged by crossings. Where the notes stand now is
+   * only where the animation starts from: the solver (fcose, the vault's Pull and Spread
+   * as its ideal edge length and node separation) runs from random seeds several times,
+   * as many as fit in about a second, each answer is counted for crossing lines, the best
+   * is kept and then improved by trading places (`reduceCrossings`), and every note glides
+   * to where it ends up. Run on every branch opened and from the settings' button.
+   */
   runLayoutAll(): void {
     const cy = this.cy;
     if (!cy) return;
-    const all: string[] = [];
-    cy.nodes().forEach((node) => {
-      if (node.data("kind") === "file") all.push(node.id());
+    this.stopLayout();
+    this.clearPicked();
+    if (this.draftSource) this.cancelDraft();
+    const eles = this.solvable(cy);
+    const notes = eles.nodes().filter((node) => node.data("kind") === "file");
+    if (notes.length < 2) return;
+    const edges: Seg[] = [];
+    eles.edges().forEach((edge) => {
+      edges.push([edge.source().id(), edge.target().id()]);
     });
-    this.runLayout(all);
+    const start = new Map<string, Pt>();
+    notes.forEach((node) => {
+      start.set(node.id(), { ...node.position() });
+    });
+    const prefs = this.settings.layout();
+    const options = {
+      name: "fcose",
+      quality: "proof",
+      randomize: true,
+      animate: false,
+      fit: false,
+      nodeDimensionsIncludeLabels: true,
+      packComponents: true,
+      idealEdgeLength: () => prefs.edgeLength,
+      nodeSeparation: Math.max(20, prefs.nodeSpacing * 3),
+      nodeRepulsion: () => 6000,
+      edgeElasticity: () => 0.45,
+      numIter: 2500,
+      eles,
+    } as unknown as cytoscape.LayoutOptions;
+    const snapshot = (): Map<string, Pt> => {
+      const at = new Map<string, Pt>();
+      notes.forEach((node) => {
+        at.set(node.id(), { ...node.position() });
+      });
+      return at;
+    };
+    const put = (at: Map<string, Pt>): void => {
+      cy.batch(() => {
+        notes.forEach((node) => {
+          node.position(at.get(node.id()) ?? node.position());
+        });
+      });
+    };
+    this.handlers.onHint("Laying out — fewest crossings wins");
+    // Candidates, as many as about a second allows; the first tells how long one takes.
+    let best: { at: Map<string, Pt>; crossings: number } | null = null;
+    const began = performance.now();
+    let runs = 0;
+    do {
+      cy.layout(options).run();
+      const at = snapshot();
+      const crossings = countCrossings(edges, at);
+      if (!best || crossings < best.crossings) best = { at, crossings };
+      runs++;
+    } while (best.crossings > 0 && runs < 12 && (performance.now() - began) * (runs + 1) < runs * 1200);
+    const crossings = reduceCrossings(edges, best.at);
+    // Notes traded places may sit on one another now: settle that on the real positions.
+    put(best.at);
+    this.unstackAll();
+    const final = snapshot();
+    put(start);
+    // And glide there.
+    this.ready = true;
+    notes.forEach((node) => {
+      node.animate({ position: final.get(node.id())!, duration: 700, easing: "ease-in-out-cubic" });
+    });
+    window.setTimeout(() => {
+      this.fit();
+      this.drawOverlay();
+      this.capture();
+      this.handlers.onHint(`laid out — ${runs} tr${runs === 1 ? "y" : "ies"}, ${crossings} crossing${crossings === 1 ? "" : "s"} left`);
+    }, 750);
   }
 
   /** Stops the run and keeps whatever it had reached. */

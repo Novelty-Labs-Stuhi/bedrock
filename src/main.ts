@@ -970,22 +970,20 @@ function foldRows(path: string): MenuItem[] {
 }
 
 /**
- * Makes a note that is folded away visible: opens every branch on the way to it. Nothing
- * happens for a note already shown. The branches open without a cola run — the caller is
- * about to place or link the note and has its own idea of where things go.
- */
-/** Brings a note into view, opening the branches folded over it first. */
+/** Brings a note into view, spanning it out of its folded branch first if it has to. */
 async function goToNote(path: string): Promise<void> {
   await revealPath(path);
   graphView.focusNode(path);
 }
 
+/**
+ * Makes a folded-away note visible ON ITS OWN: spanned out of its branch, wearing the
+ * branch mark, the branch itself left folded — one note asked for is one note shown, not
+ * the whole folder it happens to live in. Nothing happens for a note already shown.
+ */
 async function revealPath(path: string): Promise<boolean> {
-  const folded = foldedBranchOf(path);
-  if (!folded) return false;
-  await seedBranch(folded, null); // before the branch stands open — see `openBranch`
-  openBranches.add(folded);
-  knownBranches.add(folded);
+  if (!foldedBranchOf(path)) return false;
+  spanned.add(path);
   graphStale = true;
   await showAll();
   return true;

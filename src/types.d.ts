@@ -429,6 +429,13 @@ type GitStatus = {
   behind: number;
 };
 
+/** cytoscape-fcose ships no typings either; the same plain extension shape. */
+declare module "cytoscape-fcose" {
+  import type { Ext } from "cytoscape";
+  const fcose: Ext;
+  export default fcose;
+}
+
 /** cytoscape-cola ships no typings; it is a plain cytoscape extension. */
 declare module "cytoscape-cola" {
   import type { Ext } from "cytoscape";
