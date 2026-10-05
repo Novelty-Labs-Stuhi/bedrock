@@ -2651,7 +2651,8 @@ export class GraphView {
   }
 
   /**
-   * Merging, in a vault of attachments: a lone note dragged into another. Reaching the other
+   * Merging, in a vault of attachments: a lone note (never a reference — what it holds lives
+   * in another vault) dragged into another, a reference included. Reaching the other
    * note's rim, it is held off — it stops against the rim and goes no further while the
    * cursor pushes on — until the cursor is well inside; then it gives way, the dragged note
    * slips in under the cursor, and the other lights up as the one it will merge into. Back
@@ -2673,7 +2674,9 @@ export class GraphView {
     let gap = Infinity;
     cy.nodes().forEach((other) => {
       const one = other as NodeSingular;
-      if (one.id() === node.id() || one.data("kind") !== "file" || one.data("ntype") === "ref") return;
+      // A reference takes a merge like any note — what it gains is written into the reference
+      // here, and the note it stands for, in its own vault, is left alone.
+      if (one.id() === node.id() || one.data("kind") !== "file") return;
       const at = one.position();
       const d = Math.hypot(free.x - at.x, free.y - at.y) - one.width() / 2;
       if (d < gap) {
