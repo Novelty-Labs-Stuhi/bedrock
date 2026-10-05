@@ -2060,3 +2060,120 @@ button.issue-id:hover {
   display: block;
   color: var(--muted);
 }
+
+/* ------------------------------------------------------------- attachments --- */
+
+/* A note's attachments, folded: small tiles on its rim. Sized in model units and scaled
+   with the zoom by graph.ts, like the other badges. */
+.att-badge {
+  position: absolute;
+  border-radius: 22%;
+  background-size: 100% 100%;
+  background-position: center;
+  background-repeat: no-repeat;
+  box-sizing: border-box;
+  /* No cut-out: a soft shade under each tile lifts it off the note and off the one behind. */
+  box-shadow: 0 0 0.25em 0.02em rgba(0, 0, 0, 0.55);
+  transform: translate(-50%, -50%);
+  /* Folded, a tile is only a sign of what is on the note: a click goes through to the note,
+     which opens it, and the tiles are clicked there. */
+  pointer-events: none;
+}
+
+/* What a session is doing, as a dot on the attachment's corner — the session badge's colours. */
+.att-badge[data-state]:not([data-state=""])::after {
+  content: "";
+  position: absolute;
+  right: -12%;
+  top: -12%;
+  width: 38%;
+  height: 38%;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px var(--bg);
+}
+
+.att-badge[data-state="running"]::after {
+  background: #9198a1;
+  animation: session-blink 1.2s ease-in-out infinite;
+}
+
+.att-badge[data-state="waiting"]::after {
+  background: #e3b341;
+}
+
+.att-badge[data-state="unseen"]::after {
+  background: #58a6ff;
+}
+
+.att-badge.done {
+  opacity: 0.45;
+}
+
+/* An open note: its tiles full size round it, on a plate so they read over anything. */
+.att-badge.open {
+  pointer-events: auto;
+  cursor: pointer;
+  background-color: var(--bg-side);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.14), 0 3px 10px rgba(0, 0, 0, 0.35);
+}
+
+.att-badge.open:hover {
+  filter: brightness(1.15);
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.7), 0 3px 10px rgba(0, 0, 0, 0.35);
+}
+
+
+/* Opening and folding: the tiles glide between the corner and the ring. Only for that
+   moment — during a pan or a drag they must stick to the note, not trail it. */
+.att-morph .att-badge {
+  transition: left 0.22s ease, top 0.22s ease, width 0.22s ease, height 0.22s ease, transform 0.22s ease,
+    opacity 0.22s ease;
+}
+
+/* The + on an open note's bottom-right. */
+.att-plus {
+  position: absolute;
+  padding: 0;
+  border-radius: 50%;
+  border: 0.08em solid rgba(255, 255, 255, 0.55);
+  background: var(--bg-side);
+  color: rgba(255, 255, 255, 0.85);
+  line-height: 1;
+  cursor: pointer;
+  pointer-events: auto;
+  transform: translate(-50%, -50%); /* the zoom's scale is added inline by graph.ts */
+  z-index: 300;
+  animation: att-pop 0.22s ease-out;
+}
+
+.att-plus:hover {
+  border-color: #fff;
+  color: #fff;
+}
+
+@keyframes att-pop {
+  from {
+    opacity: 0;
+  }
+}
+
+/* What an attachment is, said beside it while pointed at. */
+.att-tip {
+  position: absolute;
+  transform: translateY(-50%);
+  padding: 3px 7px;
+  border-radius: 5px;
+  background: var(--bg-side);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: #e6e6e6;
+  font-size: 12px;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+  z-index: 400;
+}
+
+.att-tip.on {
+  opacity: 1;
+}

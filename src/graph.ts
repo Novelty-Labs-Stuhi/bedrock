@@ -610,7 +610,7 @@ const URL_RE = /https?:\/\/[^\s)\]>]+/;
  * `.named` on whatever should speak, and the two rules at the foot of the sheet are what
  * lets it.
  */
-function styleSheet(look: Look): cytoscape.StylesheetJson {
+function styleSheet(look: Look, attachments = false): cytoscape.StylesheetJson {
   const ground = canvasHex(look.bg);
   const ink = inkOn(ground);
   /** What a node or edge is labelled with when nothing is hovering it. */
@@ -714,8 +714,11 @@ function styleSheet(look: Look): cytoscape.StylesheetJson {
       },
     },
     { selector: 'node[kind = "leaf"][lside = "left"].hot', style: { "text-halign": "left", "text-margin-x": -4 } },
-    // A reference wears what it points at, with the notch cut from its corner.
-    ...refLookStyles(ground),
+    // A reference wears what it points at, with the notch cut from its corner — except in a
+    // vault of attachments, where a note from elsewhere is just the note, attachments and all.
+    ...(attachments
+      ? ([{ selector: 'node[ntype = "ref"]', style: { "background-image": "none" } }] as unknown as cytoscape.StylesheetJson)
+      : refLookStyles(ground)),
     /*
      * A note's own look, chosen on the canvas (right-click → "Style…") and kept in its
      * markdown. After the type styles, so a chosen colour or sign beats the one a type
@@ -824,6 +827,21 @@ function styleSheet(look: Look): cytoscape.StylesheetJson {
     // The note whose file is the open tab, and the connection whose note is. After the
     // spotlight, so a pointer passing over the thing you are editing does not thin its ring.
     { selector: "node.active", style: { "border-width": 3, "border-color": ink } },
+    // A note a dragged note has been pushed into, in a vault of attachments: let go and the
+    // dragged one merges into it. A halo, so it reads as "this one takes it" at any size.
+    {
+      selector: "node.merge-target",
+      style: {
+        "border-width": 4,
+        "border-color": ink,
+        "border-opacity": 1,
+        "underlay-color": ink,
+        "underlay-opacity": 0.22,
+        "underlay-padding": 10,
+        "underlay-shape": "ellipse",
+      },
+    },
+    { selector: "node.merging", style: { opacity: 0.55 } },
     {
       selector: "edge.active",
       style: { "line-color": ink, "target-arrow-color": ink, width: 3, "arrow-scale": 1.1 },
@@ -1077,6 +1095,78 @@ function colaOptions(prefs: LayoutPrefs, patch: Record<string, unknown>): Layout
 }
 
 /**
+ * What a typed note carries on the canvas beyond its name: the handle a click opens it by,
+ * filed on the key its type looks under. A typed NODE spreads this into its data; in a
+ * vault of attachments an attachment carries the very same keys (see `AttNode`), so every
+ * click, poll and badge reads one shape either way.
+ */
+export function typeData(type: string | null, text: string): Record<string, unknown> {
+  return {
+    // A session node opens its conversation directly, so the id rides on the node —
+    // a click must not wait on a file read to know which session it is.
+    ...(type === "antigravity" ? { aconv: parseField(text, "conversation") ?? "" } : {}),
+    // A file/folder node opens what its `path::` points at, riding along the same way.
+    ...(type === "file" || type === "folder" ? { fspath: parseField(text, "path") ?? "" } : {}),
+    // A webpage node opens its address the same way. The ICON is not in the file and
+    // never will be: a scraped logo is cache, and what a vault of plain files keeps
+    // is facts. It comes back on the node afterwards — see `paintWebIcons`.
+    ...(type === "web"
+      ? {
+          wurl: parseField(text, "url") ?? URL_RE.exec(text)?.[0] ?? "",
+          wicon: GLOBE_ICON,
+        }
+      : {}),
+    // A board node opens its board the same way: the uuid rides the node. Empty is
+    // a note whose board has not been made yet — a click makes it (see main.ts).
+    ...(type === "freeform" ? { fboard: parseField(text, "board") ?? "" } : {}),
+    // A page node opens its page the same way: the address rides the node. Empty is
+    // a note whose page has not been made yet — a click makes it (see main.ts).
+    ...(type === "notion" ? { nurl: parseField(text, "page") ?? "" } : {}),
+    // A thread node opens its thread off the permalink riding here; empty is a note
+    // whose thread has not been started yet — a click starts it (see main.ts).
+    ...(type === "slack" ? { sthread: parseField(text, "thread") ?? "" } : {}),
+    // A task node carries its handle (what the poll asks Google about), its address
+    // (what a click opens), and the poll's own word that it is finished — a note with
+    // a `done::` line is never asked about again.
+    ...(type === "gtask"
+      ? {
+          gtask: parseField(text, "task") ?? "",
+          gurl: parseField(text, "url") ?? "",
+          gdone: parseField(text, "done") ?? "",
+        }
+      : {}),
+    // And an Apple note node its note, over the id Apple minted for it.
+    ...(type === "applenote" ? { anote: parseField(text, "note") ?? "" } : {}),
+    // And a Granola meeting node its meeting, over the id Granola minted for it.
+    ...(type === "granola" ? { gmeet: parseField(text, "meeting") ?? "" } : {}),
+    // A Word node opens its document off the path riding here; empty means the
+    // document has not been made yet — a click makes it (see main.ts).
+    ...(type === "word" ? { wdoc: parseField(text, "doc") ?? "" } : {}),
+    // A reference node reveals the note it stands for, off the path riding here.
+    ...(type === "ref" ? { rpath: parseField(text, "ref") ?? "", rtype: parseField(text, "target") ?? "" } : {}),
+    // Same bargain for a session note: its id rides the node, so a click can go
+    // straight to `claude://resume` without a read first. Empty until the Claude app
+    // has minted one — that is a note that has never been run.
+    ...(type === "claude"
+      ? {
+          csession: parseField(text, "session") ?? "",
+          // How much of the session has been looked at (`seen::`), so a turn that
+          // finished while the graph was closed still reads as unseen when it opens.
+          // What the session is DOING is deliberately NOT here: `sync` patches the
+          // keys a definition carries, and a rebuild must not blank a live badge
+          // back to nothing until the next poll comes round.
+          cseen: Date.parse(parseField(text, "seen") ?? "") || 0,
+          // Where it runs, and when it was last sent to Claude with no id to show for
+          // it: between them a note can find its own session on disk afterwards, which
+          // is what makes catching the id survive a second click or a restart.
+          cfolder: parseField(text, "folder") ?? "",
+          cstarted: parseField(text, "started") ?? "",
+        }
+      : {}),
+  };
+}
+
+/**
  * Builds the elements: one node per note, one edge per link.
  *
  * `described` is the set of connection-note paths that exist on disk (see `edges.ts`); an
@@ -1175,67 +1265,7 @@ export function buildElements(docs: Doc[], described: ReadonlySet<string> = new 
         // Likewise always present: `sync` patches the keys a definition carries, so an
         // empty string is what takes a sign back off a note that has just lost one.
         ...styleData(parseStyle(doc.text)),
-        // A session node opens its conversation directly, so the id rides on the node —
-        // a click must not wait on a file read to know which session it is.
-        ...(type === "antigravity" ? { aconv: parseField(doc.text, "conversation") ?? "" } : {}),
-        // A file/folder node opens what its `path::` points at, riding along the same way.
-        ...(type === "file" || type === "folder" ? { fspath: parseField(doc.text, "path") ?? "" } : {}),
-        // A webpage node opens its address the same way. The ICON is not in the file and
-        // never will be: a scraped logo is cache, and what a vault of plain files keeps
-        // is facts. It comes back on the node afterwards — see `paintWebIcons`.
-        ...(type === "web"
-          ? {
-              wurl: parseField(doc.text, "url") ?? URL_RE.exec(doc.text)?.[0] ?? "",
-              wicon: GLOBE_ICON,
-            }
-          : {}),
-        // A board node opens its board the same way: the uuid rides the node. Empty is
-        // a note whose board has not been made yet — a click makes it (see main.ts).
-        ...(type === "freeform" ? { fboard: parseField(doc.text, "board") ?? "" } : {}),
-        // A page node opens its page the same way: the address rides the node. Empty is
-        // a note whose page has not been made yet — a click makes it (see main.ts).
-        ...(type === "notion" ? { nurl: parseField(doc.text, "page") ?? "" } : {}),
-        // A thread node opens its thread off the permalink riding here; empty is a note
-        // whose thread has not been started yet — a click starts it (see main.ts).
-        ...(type === "slack" ? { sthread: parseField(doc.text, "thread") ?? "" } : {}),
-        // A task node carries its handle (what the poll asks Google about), its address
-        // (what a click opens), and the poll's own word that it is finished — a note with
-        // a `done::` line is never asked about again.
-        ...(type === "gtask"
-          ? {
-              gtask: parseField(doc.text, "task") ?? "",
-              gurl: parseField(doc.text, "url") ?? "",
-              gdone: parseField(doc.text, "done") ?? "",
-            }
-          : {}),
-        // And an Apple note node its note, over the id Apple minted for it.
-        ...(type === "applenote" ? { anote: parseField(doc.text, "note") ?? "" } : {}),
-        // And a Granola meeting node its meeting, over the id Granola minted for it.
-        ...(type === "granola" ? { gmeet: parseField(doc.text, "meeting") ?? "" } : {}),
-        // A Word node opens its document off the path riding here; empty means the
-        // document has not been made yet — a click makes it (see main.ts).
-        ...(type === "word" ? { wdoc: parseField(doc.text, "doc") ?? "" } : {}),
-        // A reference node reveals the note it stands for, off the path riding here.
-        ...(type === "ref" ? { rpath: parseField(doc.text, "ref") ?? "", rtype: parseField(doc.text, "target") ?? "" } : {}),
-        // Same bargain for a session note: its id rides the node, so a click can go
-        // straight to `claude://resume` without a read first. Empty until the Claude app
-        // has minted one — that is a note that has never been run.
-        ...(type === "claude"
-          ? {
-              csession: parseField(doc.text, "session") ?? "",
-              // How much of the session has been looked at (`seen::`), so a turn that
-              // finished while the graph was closed still reads as unseen when it opens.
-              // What the session is DOING is deliberately NOT here: `sync` patches the
-              // keys a definition carries, and a rebuild must not blank a live badge
-              // back to nothing until the next poll comes round.
-              cseen: Date.parse(parseField(doc.text, "seen") ?? "") || 0,
-              // Where it runs, and when it was last sent to Claude with no id to show for
-              // it: between them a note can find its own session on disk afterwards, which
-              // is what makes catching the id survive a second click or a restart.
-              cfolder: parseField(doc.text, "folder") ?? "",
-              cstarted: parseField(doc.text, "started") ?? "",
-            }
-          : {}),
+        ...typeData(type, doc.text),
         ...pieData(parseTags(doc.text)),
       },
     });
@@ -1477,6 +1507,17 @@ export type GraphHandlers = {
   onDeleteSelection: (picked: string[]) => void;
   /** Transient instruction for the status bar (null clears it). */
   onHint: (hint: string | null) => void;
+  /** A note dragged into another and let go there: `source` merges into `target`. */
+  onMergeNodes: (source: string, target: string) => void;
+  /** The + beside a clicked note: what can be attached to it, as a menu at `client`. */
+  onAttachMenu: (host: string, client: Client) => void;
+  /** Right-click on one of a note's attachments. */
+  onAttachmentMenu: (att: string, host: string, client: Client) => void;
+  /**
+   * Click on an attachment of a note in ANOTHER vault (shown on its reference here): open
+   * the thing by the handle it carries — its file is not this vault's to heal or write.
+   */
+  onOpenForeign: (type: string, data: Record<string, unknown>) => void;
 };
 
 /**
@@ -1488,10 +1529,83 @@ type DragState = {
   path: string;
   from: cytoscape.Position;
   group: Array<{ node: NodeSingular; at: cytoscape.Position }>;
+  /** Where the cursor holds the note, from its centre — read on the first move of the drag. */
+  hold?: cytoscape.Position;
+  /** The note it will merge into if let go now (a vault of attachments only). */
+  merge?: string | null;
 };
 
 /** A rectangle in rendered (screen) coordinates, relative to the canvas. */
 type Area = { x1: number; y1: number; x2: number; y2: number };
+
+/**
+ * An attachment as the graph holds it: no element on the canvas, but the same face a typed
+ * node shows the code that reads one — an id, and a bag of data under the keys its type
+ * opens by (`typeData`). So a click, the session poll, the task poll and every `setX(path)`
+ * that writes a freshly minted handle back reach an attachment exactly as they reach a node.
+ *
+ * `foreign` is one that belongs to a note in ANOTHER vault, shown on the reference standing
+ * for it here: it can be opened, but its file is not this vault's to write.
+ */
+class AttNode {
+  constructor(
+    readonly path: string,
+    readonly host: string,
+    private bag: Record<string, unknown>,
+    readonly foreign: boolean,
+  ) {}
+
+  id(): string {
+    return this.path;
+  }
+
+  // The overloads cytoscape's own `data` has, as far as anything here calls them.
+  data(): Record<string, unknown>;
+  data(key: string): unknown;
+  data(key: string, value: unknown): this;
+  data(key?: string, value?: unknown): unknown {
+    if (key === undefined) return this.bag;
+    if (value === undefined) return this.bag[key];
+    this.bag[key] = value;
+    return this;
+  }
+
+  empty(): boolean {
+    return false;
+  }
+
+  nonempty(): boolean {
+    return true;
+  }
+}
+
+/**
+ * How big an open note's tiles are, as a share of the note's own width: one alone nearly
+ * as big as the note, each one more a little smaller, never under a fraction that still
+ * reads at a glance. In model units, so the note and its ring zoom as one picture.
+ */
+const attOpenShare = (count: number): number => Math.max(0.36, 0.76 - 0.08 * (count - 1));
+/** How many tiles a folded note stacks on its corner; the rest are only seen when it is open. */
+const ATT_STACK = 3;
+/** And never smaller than this, in model units, however small the note. */
+const ATT_OPEN_MIN = 14;
+
+/** What an attachment is called where it is listed. */
+const ATT_NAMES: Record<string, string> = {
+  antigravity: "Antigravity session",
+  claude: "Claude session",
+  file: "File",
+  folder: "Folder",
+  web: "Webpage",
+  freeform: "Freeform board",
+  notion: "Notion page",
+  slack: "Slack thread",
+  gtask: "Google task",
+  applenote: "Apple note",
+  granola: "Granola meeting",
+  word: "Word document",
+  linear: "Linear issue",
+};
 
 export class GraphView {
   private cy: Core | null = null;
@@ -1524,6 +1638,12 @@ export class GraphView {
   private sessionEls = new Map<string, HTMLElement>();
   /** Note path -> the incoming mark on its corner, for the notes that references elsewhere point at. */
   private incomingEls = new Map<string, HTMLElement>();
+  /** Attachment path -> the attachment, in a vault of attachments; empty in any other. */
+  private atts = new Map<string, AttNode>();
+  /** Attachment path -> its small icon on the rim of its note. */
+  private attEls = new Map<string, HTMLElement>();
+  /** The strip a clicked note opens beside itself: its attachments and the + box. */
+  private strip: { host: string; el: HTMLElement } | null = null; // `el` is the +
   /** What arrives from outside: note path -> how many references elsewhere point at it. */
   private incoming = new Map<string, number>();
   /**
@@ -1623,6 +1743,10 @@ export class GraphView {
     });
     document.addEventListener("keydown", (event) => {
       if (event.key !== "Escape") return;
+      if (this.strip && !this.draftSource) {
+        this.closeStrip();
+        return;
+      }
       if (this.layoutRun) {
         this.stopLayout(); // where it got to is where it stays
         return;
@@ -1828,7 +1952,7 @@ export class GraphView {
     this.cy = cytoscape({
       container: this.container,
       elements: buildElements(docs, described),
-      style: styleSheet(this.settings.look()),
+      style: styleSheet(this.settings.look(), this.settings.attachMode()),
       layout: LAYOUT,
       /*
        * Neither gesture is cytoscape's to read any more — see the wheel and mousedown
@@ -2083,6 +2207,93 @@ export class GraphView {
     return moved;
   }
 
+  /**
+   * What a click on a TYPED thing does: hands its handle to whoever opens that kind —
+   * a typed node on the canvas, or (in a vault of attachments) an attachment on a note.
+   * False when it is not a type any switched-on integration answers for.
+   */
+  private openTyped(node: NodeSingular, at: cytoscape.Position | null): boolean {
+    // A session node is where the work is happening, not a page about it: clicking it
+    // opens the session in a terminal. With the integration off it opens like any note.
+    if (node.data("ntype") === "antigravity" && this.settings.enabled("antigravity")) {
+      this.handlers.onOpenAntigravity(node.id(), (node.data("aconv") as string) || null);
+      return true;
+    }
+    // A session node is where the work is happening, not a page about it: clicking it
+    // opens the session in the Claude app.
+    if (node.data("ntype") === "claude" && this.settings.enabled("claude")) {
+      this.handlers.onOpenClaude(node.id(), (node.data("csession") as string) || null);
+      return true;
+    }
+    const ntype = node.data("ntype") as string;
+    // A file/folder node stands for something on the disk: clicking it opens THAT —
+    // the note behind it is only the pointer, and stays reachable from the tree.
+    if ((ntype === "file" || ntype === "folder") && this.settings.enabled("files")) {
+      this.handlers.onOpenPath(node.id(), (node.data("fspath") as string) || null, ntype);
+      return true;
+    }
+    // A webpage node is a bookmark wearing the site's face: clicking it goes to the
+    // page. Whatever you have to say about the page goes in the note behind it, which
+    // stays reachable from the tree.
+    if (ntype === "web" && this.settings.enabled("web")) {
+      this.handlers.onOpenWeb(node.id(), (node.data("wurl") as string) || null);
+      return true;
+    }
+    // A board node is a whiteboard's doorway: clicking it opens the board in Freeform.
+    // The note behind it is only the pointer, and stays reachable from the tree.
+    if (ntype === "freeform" && this.settings.enabled("freeform")) {
+      this.handlers.onOpenFreeform(node.id(), (node.data("fboard") as string) || null);
+      return true;
+    }
+    // A page node is a Notion page's doorway, on exactly the same bargain.
+    if (ntype === "notion" && this.settings.enabled("notion")) {
+      this.handlers.onOpenNotion(node.id(), (node.data("nurl") as string) || null);
+      return true;
+    }
+    // A meeting node is a Granola meeting's doorway: clicking it opens the meeting there.
+    if (ntype === "granola" && this.settings.enabled("granola")) {
+      this.handlers.onOpenGranola(node.id(), (node.data("gmeet") as string) || null);
+      return true;
+    }
+    // A thread node is a Slack thread's doorway: clicking it opens the thread in Slack.
+    if (ntype === "slack" && this.settings.enabled("slack")) {
+      this.handlers.onOpenSlack(node.id(), (node.data("sthread") as string) || null);
+      return true;
+    }
+    // A task node is a Google task's doorway: clicking it opens the task in Google Tasks.
+    if (ntype === "gtask" && this.settings.enabled("google")) {
+      this.handlers.onOpenGoogleTask(
+        node.id(),
+        (node.data("gtask") as string) || null,
+        (node.data("gurl") as string) || null,
+      );
+      return true;
+    }
+    // And an Apple note node its note's, in Notes itself.
+    if (ntype === "applenote" && this.settings.enabled("applenotes")) {
+      this.handlers.onOpenAppleNote(node.id(), (node.data("anote") as string) || null);
+      return true;
+    }
+    // A reference is another vault's note standing here: clicking it goes to where the
+    // note lives. No integration to switch on — it is this app's own files.
+    if (ntype === "ref") {
+      this.handlers.onOpenRef(node.id(), (node.data("rpath") as string) || null, !!at && isRefCorner(node, at));
+      return true;
+    }
+    // A Word node is a document's doorway: clicking it opens the file in Word.
+    if (ntype === "word" && this.settings.enabled("word")) {
+      this.handlers.onOpenWord(node.id(), (node.data("wdoc") as string) || null);
+      return true;
+    }
+    // An issue node is a folded checklist: clicking unfolds it over the canvas
+    // rather than opening the file, which is where the ticks live anyway.
+    if (node.data("ntype") === "linear" && this.settings.enabled("linear")) {
+      this.toggleIssue(node.id());
+      return true;
+    }
+    return false;
+  }
+
   private wire(cy: Core): void {
     cy.on("tap", "node", (event) => {
       const node = event.target as NodeSingular;
@@ -2105,84 +2316,13 @@ export class GraphView {
         return;
       }
       if (node.data("kind") !== "file") return;
-      // A session node is where the work is happening, not a page about it: clicking it
-      // opens the session in a terminal. With the integration off it opens like any note.
-      if (node.data("ntype") === "antigravity" && this.settings.enabled("antigravity")) {
-        this.handlers.onOpenAntigravity(node.id(), (node.data("aconv") as string) || null);
+      // In a vault of attachments every note is a plain note: a click opens the strip of
+      // what is attached to it, and the + to attach more.
+      if (this.settings.attachMode()) {
+        this.toggleStrip(node.id());
         return;
       }
-      // A session node is where the work is happening, not a page about it: clicking it
-      // opens the session in the Claude app.
-      if (node.data("ntype") === "claude" && this.settings.enabled("claude")) {
-        this.handlers.onOpenClaude(node.id(), (node.data("csession") as string) || null);
-        return;
-      }
-      const ntype = node.data("ntype") as string;
-      // A file/folder node stands for something on the disk: clicking it opens THAT —
-      // the note behind it is only the pointer, and stays reachable from the tree.
-      if ((ntype === "file" || ntype === "folder") && this.settings.enabled("files")) {
-        this.handlers.onOpenPath(node.id(), (node.data("fspath") as string) || null, ntype);
-        return;
-      }
-      // A webpage node is a bookmark wearing the site's face: clicking it goes to the
-      // page. Whatever you have to say about the page goes in the note behind it, which
-      // stays reachable from the tree.
-      if (ntype === "web" && this.settings.enabled("web")) {
-        this.handlers.onOpenWeb(node.id(), (node.data("wurl") as string) || null);
-        return;
-      }
-      // A board node is a whiteboard's doorway: clicking it opens the board in Freeform.
-      // The note behind it is only the pointer, and stays reachable from the tree.
-      if (ntype === "freeform" && this.settings.enabled("freeform")) {
-        this.handlers.onOpenFreeform(node.id(), (node.data("fboard") as string) || null);
-        return;
-      }
-      // A page node is a Notion page's doorway, on exactly the same bargain.
-      if (ntype === "notion" && this.settings.enabled("notion")) {
-        this.handlers.onOpenNotion(node.id(), (node.data("nurl") as string) || null);
-        return;
-      }
-      // A meeting node is a Granola meeting's doorway: clicking it opens the meeting there.
-      if (ntype === "granola" && this.settings.enabled("granola")) {
-        this.handlers.onOpenGranola(node.id(), (node.data("gmeet") as string) || null);
-        return;
-      }
-      // A thread node is a Slack thread's doorway: clicking it opens the thread in Slack.
-      if (ntype === "slack" && this.settings.enabled("slack")) {
-        this.handlers.onOpenSlack(node.id(), (node.data("sthread") as string) || null);
-        return;
-      }
-      // A task node is a Google task's doorway: clicking it opens the task in Google Tasks.
-      if (ntype === "gtask" && this.settings.enabled("google")) {
-        this.handlers.onOpenGoogleTask(
-          node.id(),
-          (node.data("gtask") as string) || null,
-          (node.data("gurl") as string) || null,
-        );
-        return;
-      }
-      // And an Apple note node its note's, in Notes itself.
-      if (ntype === "applenote" && this.settings.enabled("applenotes")) {
-        this.handlers.onOpenAppleNote(node.id(), (node.data("anote") as string) || null);
-        return;
-      }
-      // A reference is another vault's note standing here: clicking it goes to where the
-      // note lives. No integration to switch on — it is this app's own files.
-      if (ntype === "ref") {
-        this.handlers.onOpenRef(node.id(), (node.data("rpath") as string) || null, isRefCorner(node, event.position));
-        return;
-      }
-      // A Word node is a document's doorway: clicking it opens the file in Word.
-      if (ntype === "word" && this.settings.enabled("word")) {
-        this.handlers.onOpenWord(node.id(), (node.data("wdoc") as string) || null);
-        return;
-      }
-      // An issue node is a folded checklist: clicking unfolds it over the canvas
-      // rather than opening the file, which is where the ticks live anyway.
-      if (node.data("ntype") === "linear" && this.settings.enabled("linear")) {
-        this.toggleIssue(node.id());
-        return;
-      }
+      if (this.openTyped(node, event.position)) return;
       this.handlers.onOpen(node.id());
     });
 
@@ -2201,6 +2341,7 @@ export class GraphView {
 
     cy.on("tap", (event) => {
       if (event.target !== cy) return; // background only
+      this.closeStrip();
       // "Until you click somewhere": a click on bare canvas is that somewhere. Cytoscape
       // does not call a drag a tap, so letting go of a dragged group never lands here.
       this.clearPicked();
@@ -2272,8 +2413,10 @@ export class GraphView {
         return;
       }
       if (this.draftSource || node.data("kind") !== "file") return;
+      if (this.strip) return; // a note is open: its dimming is the only spotlight
       const neighborhood = node.closedNeighborhood();
       cy.elements().difference(neighborhood).addClass("faded");
+      if (this.atts.size) this.drawOverlay(); // the tiles on faded notes fade with them
       // Both halves of the spotlight: the notes themselves as well as the links between them.
       // A meeting's leaves and the lines to them keep their green rather than take the ink.
       const lit = neighborhood.filter((ele) => ele.data("kind") !== "leaf" && !(ele.isEdge() && isLeafLine(ele as EdgeSingular)));
@@ -2337,13 +2480,16 @@ export class GraphView {
       this.drag = { path: node.id(), from: { ...node.position() }, group };
     });
 
-    cy.on("drag", "node", () => {
+    cy.on("drag", "node", (event) => {
+      this.mergeStep(event.target as NodeSingular, event.position);
       this.carryGroup();
       this.drawPulses(); // a note's own ring stays under the cursor with it
       this.placeIssueCard(); // as does an open card, if this is its node
       this.drawIssueBadges(); // and the badges on the corners — every kind, the same frame
       this.drawSessionBadges();
       this.drawIncomingBadges();
+      this.drawAttachments(); // attachment tiles, folded or round an open note
+      this.placeStrip();
     });
 
     cy.on("free", "node", () => {
@@ -2355,6 +2501,13 @@ export class GraphView {
       }
       const drag = this.drag;
       this.drag = null;
+      // Let go inside another note: it merges into that one. Nothing to settle — it is going.
+      if (drag?.merge) {
+        cy.getElementById(drag.merge).removeClass("merge-target");
+        cy.getElementById(drag.path).removeClass("merging");
+        this.handlers.onMergeNodes(drag.path, drag.merge);
+        return;
+      }
       if (drag && !drag.group.length) {
         // Only a lone note slides clear of what it landed on. A selection was arranged by
         // hand or by a layout run, and nudging each of its notes apart on release would
@@ -2498,6 +2651,62 @@ export class GraphView {
   }
 
   /**
+   * Merging, in a vault of attachments: a lone note dragged into another. Reaching the other
+   * note's rim, it is held off — it stops against the rim and goes no further while the
+   * cursor pushes on — until the cursor is well inside; then it gives way, the dragged note
+   * slips in under the cursor, and the other lights up as the one it will merge into. Back
+   * out again, and it is an ordinary drag. Positions are worked out from the cursor every
+   * move, never from where the last move left the note, so the hold-off never drifts.
+   */
+  private mergeStep(node: NodeSingular, cursor: cytoscape.Position | undefined): void {
+    const cy = this.cy;
+    const drag = this.drag;
+    if (!cy || !drag || drag.path !== node.id() || drag.group.length || !cursor) return;
+    if (!this.settings.attachMode() || node.data("ntype") === "ref") return;
+    if (!drag.hold) {
+      const at = node.position();
+      drag.hold = { x: cursor.x - at.x, y: cursor.y - at.y };
+    }
+    const free = { x: cursor.x - drag.hold.x, y: cursor.y - drag.hold.y };
+    const mine = node.width() / 2;
+    let target: NodeSingular | null = null;
+    let gap = Infinity;
+    cy.nodes().forEach((other) => {
+      const one = other as NodeSingular;
+      if (one.id() === node.id() || one.data("kind") !== "file" || one.data("ntype") === "ref") return;
+      const at = one.position();
+      const d = Math.hypot(free.x - at.x, free.y - at.y) - one.width() / 2;
+      if (d < gap) {
+        gap = d;
+        target = one;
+      }
+    });
+    let next = free;
+    let merge: string | null = null;
+    if (target) {
+      const into = target as NodeSingular;
+      const at = into.position();
+      const theirs = into.width() / 2;
+      const d = Math.hypot(free.x - at.x, free.y - at.y);
+      const deep = theirs * 0.55; // the centre this far inside: it gives way
+      const rim = (mine + theirs) * 0.8; // closer than this and it pushes back
+      if (d <= deep) merge = into.id();
+      else if (d < rim) {
+        const ux = d ? (free.x - at.x) / d : 1;
+        const uy = d ? (free.y - at.y) / d : 0;
+        next = { x: at.x + ux * rim, y: at.y + uy * rim };
+      }
+    }
+    if (drag.merge !== merge) {
+      if (drag.merge) cy.getElementById(drag.merge).removeClass("merge-target");
+      if (merge) cy.getElementById(merge).addClass("merge-target");
+      node.toggleClass("merging", !!merge);
+      drag.merge = merge;
+    }
+    node.position(next);
+  }
+
+  /**
    * Where a note ends up once it is let go of.
    *
    * A drag itself is completely free — the note goes wherever the cursor does, straight
@@ -2630,6 +2839,8 @@ export class GraphView {
       this.drawIssueBadges();
       this.drawSessionBadges();
       this.drawIncomingBadges();
+      this.drawAttachments();
+      this.placeStrip();
     });
   }
 
@@ -2660,6 +2871,8 @@ export class GraphView {
       .removeClass("faded")
       .removeClass("highlight")
       .removeClass("named");
+    this.dimForStrip(); // an open note keeps everything else dimmed
+    if (this.atts.size) this.drawOverlay();
   }
 
   /**
@@ -2670,7 +2883,7 @@ export class GraphView {
   applyLook(): void {
     const look = this.settings.look();
     this.container.style.background = canvasHex(look.bg);
-    this.cy?.style(styleSheet(look));
+    this.cy?.style(styleSheet(look, this.settings.attachMode()));
     // A hover interrupted by the settings window never got its mouseout, so whatever it
     // left lit or speaking is cleared here — otherwise it would still be lit, unpointed-at.
     this.clearSpotlight();
@@ -2757,11 +2970,12 @@ export class GraphView {
    * the canvas answering it.
    */
   setNodeType(path: string, type: string, pointer?: string): void {
-    const node = this.cy?.getElementById(path);
+    const node = this.lookup(path);
     if (!node || node.empty()) return;
     node.data("ntype", type);
     if (pointer) for (const [key, value] of Object.entries(this.pointerData(type, pointer))) node.data(key, value);
     this.drawPulses();
+    this.drawOverlay(); // an attachment's tile changes with it
   }
 
   /**
@@ -3537,6 +3751,7 @@ export class GraphView {
     release: DraftRelease | null = null,
   ): void {
     if (!this.cy) return;
+    this.closeStrip(); // the arrow leaves from the note; the strip would sit in its way
     this.clearSpotlight();
     this.coolLeaf();
     this.draftSource = source.id();
@@ -3734,26 +3949,51 @@ export class GraphView {
 
   /** Writes a freshly minted conversation id onto the live node — no rebuild needed. */
   setAntigravityConversation(path: string, conversation: string): void {
-    const node = this.cy?.getElementById(path);
+    const node = this.lookup(path);
     if (node && node.nonempty()) node.data("aconv", conversation);
   }
 
   /** Likewise for a re-picked disk path — the node opens the new location at once. */
   setFsPath(path: string, target: string): void {
-    const node = this.cy?.getElementById(path);
+    const node = this.lookup(path);
     if (node && node.nonempty()) node.data("fspath", target);
   }
 
   /** Likewise for a board made after its note — the node opens it at once. */
   setFreeformBoard(path: string, board: string): void {
-    const node = this.cy?.getElementById(path);
+    const node = this.lookup(path);
     if (node && node.nonempty()) node.data("fboard", board);
   }
 
   /** Likewise for a page made after its note. */
   setNotionPage(path: string, url: string): void {
-    const node = this.cy?.getElementById(path);
+    const node = this.lookup(path);
     if (node && node.nonempty()) node.data("nurl", url);
+  }
+
+  /**
+   * The node at `path`, or — in a vault of attachments — the attachment there, which answers
+   * `data` the way a node does. What every setter below writes a fresh handle through.
+   */
+  private lookup(path: string): NodeSingular | undefined {
+    const node = this.cy?.getElementById(path);
+    if (node && node.nonempty()) return node;
+    const att = this.atts.get(path);
+    return att && !att.foreign ? (att as unknown as NodeSingular) : node;
+  }
+
+  /** Every node on the canvas, then every attachment of this vault's own — what the polls walk. */
+  private typedNodes(): NodeSingular[] {
+    const out: NodeSingular[] = this.cy ? this.cy.nodes().toArray() as NodeSingular[] : [];
+    for (const att of this.atts.values()) if (!att.foreign) out.push(att as unknown as NodeSingular);
+    return out;
+  }
+
+  /** Where a reference points ("" when it carries no `ref::`), or null when the node is not one. */
+  refTarget(path: string): string | null {
+    const node = this.cy?.getElementById(path);
+    if (!node || node.empty() || node.data("ntype") !== "ref") return null;
+    return (node.data("rpath") as string) || "";
   }
 
   /** Whether a note is drawn on this canvas at all — not every file in the vault is (cards, nested vaults). */
@@ -3780,13 +4020,13 @@ export class GraphView {
 
   /** And for a thread started after its note. */
   setSlackThread(path: string, url: string): void {
-    const node = this.cy?.getElementById(path);
+    const node = this.lookup(path);
     if (node && node.nonempty()) node.data("sthread", url);
   }
 
   /** And for a task made (or attached) after its note: its handle and its address. */
   setGoogleTask(path: string, task: string, url: string): void {
-    const node = this.cy?.getElementById(path);
+    const node = this.lookup(path);
     if (!node || node.empty()) return;
     node.data("gtask", task);
     node.data("gurl", url);
@@ -3794,10 +4034,11 @@ export class GraphView {
 
   /** The poll's word that a task is finished, onto the live node and its badge. */
   setTaskDone(path: string, done: string): void {
-    const node = this.cy?.getElementById(path);
+    const node = this.lookup(path);
     if (!node || node.empty() || node.data("gdone") === done) return;
     node.data("gdone", done);
     this.drawIssueBadges();
+    this.drawOverlay();
   }
 
   /** Every task note on the canvas: its handle, and whether the poll has closed it. */
@@ -3805,7 +4046,7 @@ export class GraphView {
     const cy = this.cy;
     if (!cy) return [];
     const out: Array<{ path: string; task: string; done: string }> = [];
-    cy.nodes().forEach((node) => {
+    this.typedNodes().forEach((node) => {
       if (node.data("ntype") !== "gtask") return;
       out.push({
         path: node.id(),
@@ -3818,19 +4059,19 @@ export class GraphView {
 
   /** And for an Apple note made after its note here. */
   setAppleNote(path: string, note: string): void {
-    const node = this.cy?.getElementById(path);
+    const node = this.lookup(path);
     if (node && node.nonempty()) node.data("anote", note);
   }
 
   /** And for a document made after its note. */
   setWordDoc(path: string, doc: string): void {
-    const node = this.cy?.getElementById(path);
+    const node = this.lookup(path);
     if (node && node.nonempty()) node.data("wdoc", doc);
   }
 
   /** Likewise for a re-typed address, when the note was left without one. */
   setWebUrl(path: string, url: string): void {
-    const node = this.cy?.getElementById(path);
+    const node = this.lookup(path);
     if (!node || node.empty()) return;
     node.data("wurl", url);
     node.data("wicon", this.webIcons.get(url) ?? GLOBE_ICON);
@@ -3851,7 +4092,7 @@ export class GraphView {
     const cy = this.cy;
     if (!cy) return [];
     const out: ReturnType<GraphView["webNodes"]> = [];
-    cy.nodes().forEach((node) => {
+    this.typedNodes().forEach((node) => {
       if (node.data("ntype") !== "web") return;
       const url = (node.data("wurl") as string) || "";
       out.push({ path: node.id(), url, fetched: this.webIcons.has(url) });
@@ -3867,7 +4108,7 @@ export class GraphView {
   private paintWebIcons(): void {
     const cy = this.cy;
     if (!cy || !this.webIcons.size) return;
-    cy.nodes().forEach((node) => {
+    this.typedNodes().forEach((node) => {
       if (node.data("ntype") !== "web") return;
       const icon = this.webIcons.get((node.data("wurl") as string) || "");
       if (icon && node.data("wicon") !== icon) node.data("wicon", icon);
@@ -3876,7 +4117,7 @@ export class GraphView {
 
   /** Likewise for the session id the Claude app has just minted — it is no longer pending. */
   setClaudeSession(path: string, session: string, folder?: string): void {
-    const node = this.cy?.getElementById(path);
+    const node = this.lookup(path);
     if (!node || node.empty()) return;
     node.data("csession", session);
     node.data("cstarted", "");
@@ -3885,7 +4126,7 @@ export class GraphView {
 
   /** A note that has just been sent to Claude and has no id to show for it yet. */
   setClaudePending(path: string, folder: string, started: string): void {
-    const node = this.cy?.getElementById(path);
+    const node = this.lookup(path);
     if (!node || node.empty()) return;
     node.data("cfolder", folder);
     node.data("cstarted", started);
@@ -3897,7 +4138,7 @@ export class GraphView {
    * note that can be plugged into an existing conversation and one that already has its own.
    */
   antigravityNote(path: string): { path: string; conversation: string } | null {
-    const node = this.cy?.getElementById(path);
+    const node = this.lookup(path);
     if (!node || node.empty() || node.data("ntype") !== "antigravity") return null;
     return { path, conversation: (node.data("aconv") as string) || "" };
   }
@@ -3906,7 +4147,7 @@ export class GraphView {
 
   /** The session note at `path`, or null when that node is not one. */
   sessionNote(path: string): ReturnType<GraphView["sessionNodes"]>[number] | null {
-    const node = this.cy?.getElementById(path);
+    const node = this.lookup(path);
     if (!node || node.empty() || node.data("ntype") !== "claude") return null;
     return {
       path,
@@ -3928,7 +4169,7 @@ export class GraphView {
     const cy = this.cy;
     if (!cy) return [];
     const out: ReturnType<GraphView["sessionNodes"]> = [];
-    cy.nodes().forEach((node) => {
+    this.typedNodes().forEach((node) => {
       if (node.data("ntype") !== "claude") return;
       out.push({
         path: node.id(),
@@ -3943,27 +4184,29 @@ export class GraphView {
 
   /** A polled state, onto the live node and its badge. `at` is the session's last turn. */
   setSessionState(path: string, state: SessionState, at: number): void {
-    const node = this.cy?.getElementById(path);
+    const node = this.lookup(path);
     if (!node || node.empty()) return;
     if (node.data("cstate") === state && node.data("cat") === at) return;
     node.data("cstate", state);
     node.data("cat", at);
     this.drawSessionBadges();
+    this.drawOverlay(); // an attachment wears the same reading on its icon
   }
 
   /** The session's last turn as the last poll had it — what "seen up to here" means. */
   sessionActivity(path: string): number {
-    const node = this.cy?.getElementById(path);
+    const node = this.lookup(path);
     return node && node.nonempty() ? Number(node.data("cat")) || 0 : 0;
   }
 
   /** Opening a session is reading it: the blue dot goes out at once, not at the next poll. */
   setSessionSeen(path: string, at: number): void {
-    const node = this.cy?.getElementById(path);
+    const node = this.lookup(path);
     if (!node || node.empty()) return;
     node.data("cseen", at);
     if (node.data("cstate") === "unseen") node.data("cstate", "idle");
     this.drawSessionBadges();
+    this.drawOverlay();
   }
 
   /**
@@ -4052,7 +4295,10 @@ export class GraphView {
     const cy = this.cy;
     if (!cy) return;
     const alive = new Set<string>();
+    // A vault of attachments draws no chain: a connection is a line, and that is all.
+    const chains = !this.settings.attachMode();
     cy.nodes().forEach((node) => {
+      if (!chains) return;
       if (node.data("kind") !== "file" || node.data("ntype") === "ref") return; // a reference IS the connection
       const id = node.id();
       const count = (this.incoming.get(id) ?? 0) + this.externalLinks(id).length;
@@ -4087,6 +4333,311 @@ export class GraphView {
       el.remove();
       this.incomingEls.delete(id);
     }
+  }
+
+  /* ------------------------------------------------------------- attachments --- */
+
+  /**
+   * What is attached to which note, read off the disk by main.ts: each attachment's own
+   * markdown (a typed note's, kept in `.notes/attachments/`) and the note it rides on.
+   * Readings the files do not hold — what a session is doing right now — carry over from
+   * the attachment of the same path, so a rebuild does not blank a live dot.
+   */
+  setAttachments(list: Array<{ path: string; host: string; text: string; foreign?: boolean }>): void {
+    const next = new Map<string, AttNode>();
+    for (const one of list) {
+      const type = parseType(one.text);
+      const bag: Record<string, unknown> = {
+        ntype: type ?? "",
+        ...typeData(type, one.text),
+        // What the thing is called where it lives, when it was attached by picking it.
+        atitle: parseField(one.text, "title") ?? "",
+      };
+      const was = this.atts.get(one.path);
+      for (const key of ["cstate", "cat"]) if (was && was.data(key) !== undefined) bag[key] = was.data(key);
+      if (type === "web") bag.wicon = this.webIcons.get((bag.wurl as string) || "") ?? GLOBE_ICON;
+      next.set(one.path, new AttNode(one.path, one.host, bag, !!one.foreign));
+    }
+    this.atts = next;
+    this.drawOverlay();
+  }
+
+  /** A note's attachments, in the order its `attach::` lines give them. */
+  private attachmentsOf(host: string): AttNode[] {
+    return [...this.atts.values()].filter((att) => att.host === host);
+  }
+
+  /** The picture an attachment wears: its type's tile, or for a webpage the site's own face. */
+  private attIcon(att: AttNode): string {
+    const type = att.data("ntype") as string;
+    if (type === "web") return (att.data("wicon") as string) || GLOBE_ICON;
+    return TYPE_ICONS[type] ?? "";
+  }
+
+  /** What an attachment says when pointed at: its kind, and what it is doing if it says. */
+  private attTitle(att: AttNode): string {
+    const type = att.data("ntype") as string;
+    const name = ATT_NAMES[type] ?? type;
+    const called = (att.data("atitle") as string) || "";
+    if (called) return `${name} · ${called}${type === "claude" ? ` — ${SESSION_TITLES[((att.data("cstate") as SessionState) || "idle")]}` : ""}`;
+    if (type === "claude") return `${name} — ${SESSION_TITLES[((att.data("cstate") as SessionState) || "idle")]}`;
+    if (type === "gtask" && att.data("gdone")) return `${name} — done`;
+    if (type === "web" && att.data("wurl")) return `${name} — ${att.data("wurl") as string}`;
+    return name;
+  }
+
+  /** One attachment's face — the tile, and the corner reading a session or task gives it. */
+  private dressAtt(el: HTMLElement, att: AttNode): void {
+    const icon = this.attIcon(att);
+    const url = `url("${icon}")`;
+    if (el.style.backgroundImage !== url) el.style.backgroundImage = url;
+    el.dataset.tip = this.attTitle(att);
+    const type = att.data("ntype") as string;
+    const state = type === "claude" ? ((att.data("cstate") as string) || "idle") : "";
+    el.dataset.state = state;
+    el.classList.toggle("done", type === "gtask" && !!att.data("gdone"));
+  }
+
+  /** Opens an attachment the way a click on its typed node used to. */
+  private openAttachment(att: AttNode): void {
+    if (att.foreign) {
+      this.handlers.onOpenForeign(att.data("ntype") as string, { ...att.data() });
+      return;
+    }
+    if (!this.openTyped(att as unknown as NodeSingular, null)) {
+      const type = att.data("ntype") as string;
+      this.handlers.onHint(`${ATT_NAMES[type] ?? type} — switched off in Settings → Features`);
+    }
+  }
+
+  private attEvents(el: HTMLElement, path: string): void {
+    el.addEventListener("mousedown", (event) => event.stopPropagation());
+    el.addEventListener("mouseenter", () => this.showTip(el, el.dataset.tip ?? ""));
+    el.addEventListener("mouseleave", () => this.hideTip());
+    el.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const att = this.atts.get(path);
+      if (att) this.openAttachment(att);
+    });
+    el.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const att = this.atts.get(path);
+      if (att && !att.foreign) this.handlers.onAttachmentMenu(path, att.host, { x: event.clientX, y: event.clientY });
+    });
+  }
+
+  /**
+   * A note's attachments. Folded: a stack of up to three tiles on the top-right corner, half
+   * over the edge — sized off the node and scaled with the zoom like every badge here. Open (the note was
+   * clicked): the same tiles, full size, spaced evenly round the note, with the + taking the
+   * bottom-right slot of the ring. The tiles are the same elements either way, so opening
+   * and folding is one move between the two places (`morph`).
+   */
+  private drawAttachments(): void {
+    const cy = this.cy;
+    const alive = new Set<string>();
+    if (cy && this.atts.size) {
+      const byHost = new Map<string, AttNode[]>();
+      for (const att of this.atts.values()) {
+        const list = byHost.get(att.host) ?? [];
+        list.push(att);
+        byHost.set(att.host, list);
+      }
+      const zoom = cy.zoom();
+      for (const [host, list] of byHost) {
+        const node = cy.getElementById(host);
+        if (node.empty()) continue;
+        const at = node.renderedPosition();
+        const open = this.strip?.host === host;
+        const ring = open ? this.ringOf(node as NodeSingular, list.length) : null;
+        const radius = node.width() / 2;
+        const size = Math.max(9, node.width() * 0.42);
+        list.forEach((att, i) => {
+          alive.add(att.path);
+          let el = this.attEls.get(att.path);
+          if (!el) {
+            el = document.createElement("div");
+            el.className = "att-badge";
+            this.attEvents(el, att.path);
+            this.overlay.appendChild(el);
+            this.attEls.set(att.path, el);
+          }
+          this.dressAtt(el, att);
+          el.classList.toggle("open", open);
+          if (ring) {
+            const angle = ring.slot(i + 1);
+            el.style.left = `${at.x + Math.cos(angle) * ring.reach * zoom}px`;
+            el.style.top = `${at.y + Math.sin(angle) * ring.reach * zoom}px`;
+            el.style.width = `${ring.size}px`;
+            el.style.height = `${ring.size}px`;
+            el.style.zIndex = "300";
+            el.style.opacity = "";
+            el.style.transform = `translate(-50%, -50%) scale(${zoom})`;
+            return;
+          }
+          // Folded, they stack like cards on the corner: the first in front, up to two more
+          // peeking out above and to the left behind it. The rest wait under the first, unseen,
+          // so opening the note sends every one of them out from the same place.
+          const angle = -Math.PI / 4;
+          const back = Math.min(i, ATT_STACK - 1);
+          const cx = at.x + Math.cos(angle) * radius * zoom - back * size * 0.3 * zoom;
+          const cy = at.y + Math.sin(angle) * radius * zoom - back * size * 0.24 * zoom;
+          el.style.left = `${cx}px`;
+          el.style.top = `${cy}px`;
+          el.style.width = `${size}px`;
+          el.style.height = `${size}px`;
+          el.style.zIndex = String(100 - i); // the first in front
+          el.style.opacity = i >= ATT_STACK ? "0" : node.hasClass("faded") ? "0.3" : "";
+          el.style.transform = `translate(-50%, -50%) scale(${zoom})`;
+        });
+      }
+    }
+    for (const [path, el] of this.attEls) {
+      if (alive.has(path)) continue;
+      el.remove();
+      this.attEls.delete(path);
+    }
+  }
+
+  /**
+   * The ring an open note's attachments stand on: `count` tiles and the +, evenly spaced, the
+   * + at the bottom-right (slot 0) and the tiles round from it. Far enough out to clear the
+   * note, and further when there are more tiles than its rim has room for. Everything in
+   * model units — the caller multiplies by the zoom — so zooming never changes the picture.
+   */
+  private ringOf(
+    node: NodeSingular,
+    count: number,
+  ): { reach: number; size: number; plus: number; slot: (i: number) => number } {
+    const slots = count + 1;
+    const width = node.width();
+    const size = Math.max(ATT_OPEN_MIN, width * attOpenShare(Math.max(1, count)));
+    const plus = Math.max(ATT_OPEN_MIN * 0.8, size * 0.6);
+    const gap = width * 0.1 + 3;
+    const reach = Math.max(width / 2 + size / 2 + gap, (slots * (size + gap)) / (2 * Math.PI));
+    return { reach, size, plus, slot: (i) => Math.PI / 4 + (i * 2 * Math.PI) / slots };
+  }
+
+  /** Opens a note's attachments — or folds them, when they are that note's already. */
+  toggleStrip(host: string): void {
+    if (this.strip?.host === host) {
+      this.closeStrip();
+      return;
+    }
+    this.openStrip(host);
+  }
+
+  /** For a moment after opening or folding, the tiles glide between their two places. */
+  private morph(): void {
+    this.overlay.classList.add("att-morph");
+    window.clearTimeout(this.morphTimer);
+    this.morphTimer = window.setTimeout(() => this.overlay.classList.remove("att-morph"), 260);
+  }
+
+  private morphTimer: number | undefined;
+
+  /**
+   * Opens a note: everything else dims, its attachments come out round it, and the + for
+   * another sits on its bottom-right. It rides the note through pans, zooms and drags.
+   */
+  openStrip(host: string): void {
+    if (this.strip) this.dropStrip();
+    const el = document.createElement("button");
+    el.className = "att-plus";
+    el.title = "Attach…";
+    el.textContent = "+";
+    el.addEventListener("mousedown", (event) => event.stopPropagation());
+    el.addEventListener("contextmenu", (event) => event.preventDefault());
+    el.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const box = el.getBoundingClientRect();
+      this.handlers.onAttachMenu(host, { x: box.right + 4, y: box.top });
+    });
+    this.overlay.appendChild(el);
+    this.strip = { host, el };
+    this.morph();
+    this.dimForStrip();
+    this.drawAttachments();
+    this.placeStrip();
+  }
+
+  closeStrip(): void {
+    if (!this.strip) return;
+    this.dropStrip();
+    this.morph();
+    this.clearSpotlight();
+    this.drawOverlay(); // the tiles fold back onto the corner
+  }
+
+  private dropStrip(): void {
+    const node = this.strip ? this.cy?.getElementById(this.strip.host) : null;
+    if (node && node.nonempty()) {
+      node.removeStyle("text-opacity");
+      node.removeData("_mute");
+    }
+    this.strip?.el.remove();
+    this.strip = null;
+    this.hideTip();
+  }
+
+  /** Everything but the open note, dimmed — the note and what is on it are what is being looked at. */
+  private dimForStrip(): void {
+    const node = this.strip ? this.cy?.getElementById(this.strip.host) : null;
+    if (!node || node.empty()) return;
+    this.cy!.elements().difference(node).addClass("faded");
+  }
+
+  /** Which note is open, if any. */
+  stripHost(): string | null {
+    return this.strip?.host ?? null;
+  }
+
+  /** The + rides the bottom-right slot of the open note's ring. */
+  private placeStrip(): void {
+    const strip = this.strip;
+    const node = strip ? this.cy?.getElementById(strip.host) : null;
+    if (!strip || !node || node.empty()) {
+      if (strip) this.closeStrip();
+      return;
+    }
+    const ring = this.ringOf(node as NodeSingular, this.attachmentsOf(strip.host).length);
+    const at = node.renderedPosition();
+    // While open the note says nothing: the ring is what is being read, and its name would
+    // sit under the tiles on the right.
+    if (node.data("_mute") !== 1) {
+      node.data("_mute", 1);
+      node.style("text-opacity", 0);
+    }
+    const angle = ring.slot(0);
+    const zoom = this.cy!.zoom();
+    strip.el.style.left = `${at.x + Math.cos(angle) * ring.reach * zoom}px`;
+    strip.el.style.top = `${at.y + Math.sin(angle) * ring.reach * zoom}px`;
+    strip.el.style.width = `${ring.plus}px`;
+    strip.el.style.height = `${ring.plus}px`;
+    strip.el.style.fontSize = `${ring.plus * 0.7}px`;
+    strip.el.style.transform = `translate(-50%, -50%) scale(${zoom})`;
+  }
+
+  /** The label an attachment shows while pointed at: what it is, and what it is called. */
+  private tipEl: HTMLElement | null = null;
+
+  private showTip(el: HTMLElement, text: string): void {
+    if (!this.tipEl) {
+      this.tipEl = document.createElement("div");
+      this.tipEl.className = "att-tip";
+      this.overlay.appendChild(this.tipEl);
+    }
+    const box = el.getBoundingClientRect();
+    const host = this.overlay.getBoundingClientRect();
+    this.tipEl.textContent = text;
+    this.tipEl.style.left = `${box.right - host.left + 6}px`;
+    this.tipEl.style.top = `${box.top - host.top + box.height / 2}px`;
+    this.tipEl.classList.add("on");
+  }
+
+  private hideTip(): void {
+    this.tipEl?.classList.remove("on");
   }
 
   /** Writes a relation name onto the live edge, so it shows without a rebuild. */
