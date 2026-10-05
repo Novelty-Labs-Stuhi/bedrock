@@ -71,8 +71,30 @@ function openHandler({ url }) {
   return { action: "deny" };
 }
 
-function createWindow(url = "app://-/") {
+/**
+ * A window opened for no vault in particular — the first launch, File > New Window, the
+ * dock icon with nothing open — goes to the most recently opened vault that is not already
+ * in a window: the last one first, then the one before it, and so on down the list. Only
+ * when every vault on the list is on screen (or the list is empty, or its folders are gone)
+ * does it come up empty and ask, the way every window used to.
+ */
+function createWindow(url = null) {
+  let claim = null;
+  if (!url) {
+    const open = new Set(vaultRoots.values());
+    claim = readRecent().find((root) => !open.has(root) && fs.existsSync(root)) ?? null;
+    const address = new URL("app://-/");
+    if (claim) address.searchParams.set("root", claim);
+    url = address.toString();
+  }
   const win = new BrowserWindow(windowOptions());
+  // Claimed at once, before the page has loaded and said so itself: two New Windows in quick
+  // succession must not both go to the same vault.
+  if (claim) {
+    const id = win.webContents.id;
+    vaultRoots.set(id, claim);
+    win.webContents.once("destroyed", () => vaultRoots.delete(id));
+  }
   win.webContents.setWindowOpenHandler(openHandler);
   // A window the renderer opened is a Bedrock window too, and gets the same rules.
   win.webContents.on("did-create-window", (child) => child.webContents.setWindowOpenHandler(openHandler));
@@ -113,11 +135,38 @@ const vaultRoots = new Map(); // webContents id -> the absolute folder that wind
 
 const normalRoot = (root) => (typeof root === "string" && root ? path.resolve(root) : null);
 
+/*
+ * The vaults opened on this machine, most recent first — what a new window opens (see
+ * `createWindow`). In the app's own userData: it describes this machine, not any vault.
+ */
+const recentFile = () => path.join(app.getPath("userData"), "recent-vaults.json");
+const RECENT_MAX = 30;
+
+function readRecent() {
+  try {
+    const list = JSON.parse(fs.readFileSync(recentFile(), "utf8"));
+    return Array.isArray(list) ? list.filter((one) => typeof one === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function noteRecent(root) {
+  const list = [root, ...readRecent().filter((one) => one !== root)].slice(0, RECENT_MAX);
+  try {
+    fs.writeFileSync(recentFile(), JSON.stringify(list, null, 1) + "\n");
+  } catch {
+    /* the list is a convenience; a disk that will not take it costs only the next launch's guess */
+  }
+}
+
 ipcMain.handle("window-root", (event, root) => {
   const id = event.sender.id;
   const at = normalRoot(root);
-  if (at) vaultRoots.set(id, at);
-  else vaultRoots.delete(id);
+  if (at) {
+    vaultRoots.set(id, at);
+    noteRecent(at); // the vault just opened is now the last one
+  } else vaultRoots.delete(id);
   // A window that has gone takes its claim with it, or a closed vault goes on looking open.
   event.sender.once("destroyed", () => vaultRoots.delete(id));
   return true;

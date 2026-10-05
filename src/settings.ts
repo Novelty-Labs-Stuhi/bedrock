@@ -405,6 +405,12 @@ export class SettingsStore {
   private over: Prefs = emptyPrefs();
   /** This vault's connections — never inherited. */
   private setups: Setup = { ...SETUP_DEFAULT };
+  /**
+   * `"mode": "attachments"` in this vault's config: every node is a plain note, and what
+   * used to be a typed note rides on one as an attachment. Never inherited — a vault is
+   * one or the other from the day it is made, and the folder above it cannot change that.
+   */
+  private attachments = false;
   private writeScope: Scope = "vault";
   private timer: number | undefined;
   private dirtyRoot = false;
@@ -428,6 +434,7 @@ export class SettingsStore {
     this.root = emptyPrefs();
     this.over = emptyPrefs();
     this.setups = { ...SETUP_DEFAULT };
+    this.attachments = false;
     this.writeScope = "vault";
     if (root) {
       const parsed = await readConfig(root);
@@ -436,6 +443,7 @@ export class SettingsStore {
     const parsed = await readConfig(vault);
     if (!parsed) return;
     this.over = parsePrefs(parsed as never);
+    this.attachments = parsed.mode === "attachments";
     const setup = (parsed.setup ?? {}) as Record<string, unknown>;
     for (const key of Object.keys(SETUP_DEFAULT) as Array<keyof Setup>) {
       const value = setup[key];
@@ -585,6 +593,11 @@ export class SettingsStore {
     return this.setups.antigravityFolder || null;
   }
 
+  /** Whether this vault puts integrations on its notes as attachments rather than as typed notes. */
+  attachMode(): boolean {
+    return this.attachments;
+  }
+
   /** The vault's default folder for new Claude sessions, or null when it has none. */
   claudeFolder(): string | null {
     return this.setups.claudeFolder || null;
@@ -605,7 +618,14 @@ export class SettingsStore {
   snapshot(): string {
     return (
       JSON.stringify(
-        { version: 4, features: this.over.features, look: this.over.look, layout: this.over.layout, setup: this.setups },
+        {
+          version: 4,
+          ...(this.attachments ? { mode: "attachments" } : {}),
+          features: this.over.features,
+          look: this.over.look,
+          layout: this.over.layout,
+          setup: this.setups,
+        },
         null,
         1,
       ) + "\n"

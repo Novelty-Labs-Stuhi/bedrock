@@ -34,7 +34,7 @@ import { imageFiles, resetAssets, saveImage } from "./images";
 import { createEditor, type Editor } from "./editor";
 import { linkTargets } from "./markdown";
 import { Sidebar } from "./sidebar";
-import { SpatialStore, LAYOUT_FILE } from "./spatial";
+import { SpatialStore, LAYOUT_FILE, NOTES_DIR } from "./spatial";
 import { STICKY_DIR, StickyStore, isCardPath, stamp } from "./sticky";
 import {
   IdStore,
@@ -273,6 +273,10 @@ const graphView = new GraphView(ui.cy, {
      * The same two branches, in the same order, as the canvas menu. A right-click should
      * not be a different vocabulary depending on what happened to be under it.
      */
+    if (settings.attachMode()) {
+      showMenu(client, attachNodeMenu(path, client));
+      return;
+    }
     const items: MenuItem[] = linkBranches(path);
 
     // A holder is a node waiting to be something: this is where it becomes one, keeping
@@ -340,6 +344,10 @@ const graphView = new GraphView(ui.cy, {
      * What is made lands at the vault root: the graph knows nothing of folders.
      */
     const folder = null;
+    if (settings.attachMode()) {
+      showMenu(client, attachCanvasMenu(at));
+      return;
+    }
     // The holder leads: it needs no integration and is what everything else can grow from.
     const create: MenuItem[] = [
       { label: "Holder", icon: NOTE_DOT, run: () => void createHolderAt(at, folder) },
@@ -406,6 +414,10 @@ const graphView = new GraphView(ui.cy, {
   onHint: (hint) => {
     ui.status.textContent = hint ?? statusText();
   },
+  onAttachMenu: (host, client) => showMenu(client, attachItems(host)),
+  onAttachmentMenu: (att, host, client) => showAttachmentMenu(att, host, client),
+  onOpenForeign: (type, data) => void openForeign(type, data),
+  onMergeNodes: (source, target) => void mergeNotes(source, target),
 }, spatial, stickies, settings);
 
 /* -------------------------------------------------------------- reading --- */
@@ -644,7 +656,9 @@ async function renderPage(index: number): Promise<void> {
 /** Only call with the graph tab already rendered — the layout needs a sized container. */
 async function drawGraph(): Promise<void> {
   graphStale = false;
-  graphView.render(await readDocs(), lastFile, await describedEdges());
+  const docs = await readDocs();
+  graphView.setAttachments(settings.attachMode() ? await readAttachments(docs) : []);
+  graphView.render(docs, lastFile, await describedEdges());
   void paintIncoming(); // and the chains on the notes other vaults point at
   void pollSessions(); // the dots belong to the graph that has just gone up
   void pollTasks(); // and the ticks
@@ -1049,6 +1063,7 @@ async function deleteEntry(path: string, kind: "file" | "dir"): Promise<void> {
       : entries.filter((e) => e.kind === "file" && e.path.startsWith(path + "/")).map((e) => e.path),
   );
   const before = filePaths();
+  await dropAttachmentsOf([...gone]);
   await vault.remove(path, kind);
   entries = await vault.entries();
   // A deleted note takes its incoming links with it, or they lie in wait for the next note
@@ -1077,6 +1092,7 @@ async function deleteNotes(paths: string[]): Promise<void> {
   graphView.clearPicked(); // whatever happens next, the selection has been answered
   await flushAll(); // an open buffer would write the links back over the pass below
   const before = filePaths();
+  await dropAttachmentsOf([...gone]);
   for (const path of gone) await vault.remove(path, "file");
   entries = await vault.entries();
   const unlinked = await unlinkVault(gone, before);
@@ -1731,7 +1747,9 @@ async function createHolderAt(
   if (source) graphView.commitLink(source, path, { label: noteName(path), at });
   else graphView.commitNode(path, noteName(path), at);
   graphStale = true;
-  ui.status.textContent = `created ${path} — name it; right-click → Turn into makes it something`;
+  ui.status.textContent = settings.attachMode()
+    ? `created ${path} — name it; click it to attach things`
+    : `created ${path} — name it; right-click → Turn into makes it something`;
   graphView.renameNode(path, (name) => {
     void (async () => {
       const finalPath = name ? ((await applyRename(path, "file", name)) ?? path) : path;
@@ -1807,7 +1825,11 @@ function turnIntoMenu(path: string): MenuItem[] {
  * was: whatever the integration needs to exist (the app, the shortcut, the sign-in), and
  * the one question a pointer type asks (an address, a pick in the OS dialog).
  */
-async function turnHolderInto(path: string, kind: HolderKind, label: string): Promise<void> {
+async function turnHolderInto(
+  holder: string | (() => Promise<string>),
+  kind: HolderKind,
+  label: string,
+): Promise<void> {
   const ready =
     kind === "applenote"
       ? await appleNotesReady()
@@ -1845,6 +1867,8 @@ async function turnHolderInto(path: string, kind: HolderKind, label: string): Pr
     if (!pointer) return; // the picker was dismissed — still a holder
   }
 
+  // An attachment's file is made only now: a question dismissed above leaves nothing behind.
+  const path = typeof holder === "string" ? holder : await holder();
   await flushAll(); // the note may be open and mid-edit — don't write behind its own buffer
   const text = await vault.read(path);
   const already = parseType(text);
@@ -6374,6 +6398,15 @@ async function attachNodeAt(
   folder: string | null,
   source: string | null,
 ): Promise<void> {
+  // Picked from a note's + rather than placed on the canvas: it rides on that note instead.
+  if (attachTarget) {
+    const host = attachTarget;
+    // The name it has where it lives — what the tile says when pointed at.
+    const path = await newAttachment(host, spec.title ? setField(spec.text, "title", spec.title) : spec.text);
+    spec.paint?.(path);
+    ui.status.textContent = `${spec.done} — on ${noteName(host)}`;
+    return;
+  }
   const dir = folder ?? "";
   const path = uniquePath(filePaths(), dir, asFileName(spec.title || "Untitled"), ".md");
   await vault.createFile(path, spec.text);
@@ -6661,6 +6694,365 @@ function attachMenu(release: (option: AttachOption, kind: DraftKind) => () => vo
       }));
     },
   }));
+}
+
+/* ------------------------------------------------------------- attachments --- */
+/*
+ * A vault of attachments (`"mode": "attachments"` in its config) has one kind of node: the
+ * plain note. A Notion page, a Claude session, an Apple note is not a node of its own but
+ * something ON a note — as many as it likes. Each one is the very typed note every other
+ * vault draws as a node, kept in `.notes/attachments/` where neither the tree nor the graph
+ * lists it, and the note it rides on says so with a line per attachment:
+ *
+ *     attach:: Pricing model
+ *     attach:: Pricing model 2
+ *
+ * Because an attachment IS a typed note, everything that makes, opens, polls and heals one
+ * works on it unchanged; the graph keeps it beside the canvas rather than on it (`AttNode`).
+ */
+
+const ATT_DIR = `${NOTES_DIR}/attachments`;
+const ATTACH_RE = /^[ \t]*attach::[ \t]*(.+?)[ \t]*$/gim;
+
+/** The attachments a note names, in its own order. */
+const attachNames = (text: string): string[] => [...text.matchAll(ATTACH_RE)].map((match) => match[1]);
+const attFile = (name: string): string => `${ATT_DIR}/${name}.md`;
+
+/** A note's markdown with one more `attach::` line — under the last one, or at the foot. */
+function withAttachLine(text: string, name: string): string {
+  const lines = text.split("\n");
+  let last = -1;
+  lines.forEach((line, i) => {
+    if (/^[ \t]*attach::/i.test(line)) last = i;
+  });
+  if (last >= 0) {
+    lines.splice(last + 1, 0, `attach:: ${name}`);
+    return lines.join("\n");
+  }
+  const gap = text === "" || text.endsWith("\n\n") ? "" : text.endsWith("\n") ? "\n" : "\n\n";
+  return `${text}${gap}attach:: ${name}\n`;
+}
+
+/** And with that line gone — nothing else of the note touched. */
+const withoutAttachLine = (text: string, name: string): string =>
+  text
+    .split("\n")
+    .filter((line) => !new RegExp(`^[ \\t]*attach::[ \\t]*${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[ \\t]*$`, "i").test(line))
+    .join("\n");
+
+type AttSpec = { path: string; host: string; text: string; foreign?: boolean };
+
+/** Every attachment of every note drawn, read off the disk — and those of the notes references stand for. */
+async function readAttachments(docs: Doc[]): Promise<AttSpec[]> {
+  const want = docs.flatMap((doc) => attachNames(doc.text).map((name) => ({ host: doc.path, path: attFile(name) })));
+  const texts = await readTexts(want.map((one) => one.path));
+  const out: AttSpec[] = want.flatMap((one) => (texts.has(one.path) ? [{ ...one, text: texts.get(one.path)! }] : []));
+  out.push(...(await foreignAttachments(docs)));
+  return out;
+}
+
+/**
+ * A note linked in from another vault stands here with what is attached to it THERE: read
+ * from that vault, never copied. A note from a vault of typed notes is its own one
+ * attachment — a Notion page note there is a note with a Notion page here.
+ */
+async function foreignAttachments(docs: Doc[]): Promise<AttSpec[]> {
+  const bridge = window.bedrock;
+  const root = knownVaultRoot();
+  if (!bridge || !root) return [];
+  const out: AttSpec[] = [];
+  await Promise.all(
+    docs.map(async (doc) => {
+      if (parseType(doc.text) !== "ref") return;
+      const target = parseField(doc.text, "ref");
+      if (!target) return;
+      try {
+        const peek = await bridge.peekNote(target, root);
+        if (!peek?.vault || !peek.inside) return;
+        const there = new ShellVault(peek.vault);
+        const text = await there.read(peek.inside);
+        const type = parseType(text);
+        if (type && type !== "ref") {
+          out.push({ path: `${doc.path}#${type}`, host: doc.path, text, foreign: true });
+          return;
+        }
+        for (const name of attachNames(text)) {
+          const one = await there.read(attFile(name)).catch(() => null);
+          if (one !== null) out.push({ path: `${doc.path}#${name}`, host: doc.path, text: one, foreign: true });
+        }
+      } catch {
+        /* the note over there could not be read; the reference stands bare */
+      }
+    }),
+  );
+  return out;
+}
+
+/**
+ * Makes an attachment file on `host` — named after the note, numbered when the note has
+ * more than one — and the `attach::` line that hangs it there, then tells the graph, so the
+ * writes that follow (an id minted, a page made) land on something it knows.
+ */
+async function newAttachment(host: string, text: string): Promise<string> {
+  const taken = await vault.listFiles(ATT_DIR).catch(() => [] as string[]);
+  const path = uniquePath(
+    // The shell lists absolute paths, a browser vault relative ones: the name is what counts.
+    taken.map((one) => `${ATT_DIR}/${one.split("/").pop()}`),
+    ATT_DIR,
+    asFileName(noteName(host)) || "Attachment",
+    ".md",
+  );
+  await vault.createFile(path, text);
+  await flushAll(); // the host may be open and mid-edit
+  const next = withAttachLine(await vault.read(host), noteName(path));
+  await vault.write(host, next);
+  syncOpenPanes(host, next);
+  await drawGraph();
+  return path;
+}
+
+/** The note an "existing thing" picked from a +'s menu is to ride on, while it is being placed. */
+let attachTarget: string | null = null;
+
+async function withAttachTarget(host: string, run: () => Promise<void>): Promise<void> {
+  attachTarget = host;
+  try {
+    await run();
+  } catch (err) {
+    ui.status.textContent = `could not attach it — ${shellError(err)}`;
+  } finally {
+    attachTarget = null;
+  }
+}
+
+/** What can ride on a note, in the order the + offers it. `make`: whether one can be made from here. */
+const ATT_KINDS: Array<{ feature: Feature; kind: HolderKind; label: string; make: boolean }> = [
+  { feature: "notion", kind: "notion", label: "Notion page", make: true },
+  { feature: "applenotes", kind: "applenote", label: "Apple note", make: true },
+  { feature: "claude", kind: "claude", label: "Claude session", make: true },
+  { feature: "antigravity", kind: "antigravity", label: "Antigravity session", make: true },
+  { feature: "granola", kind: "granola", label: "Granola meeting", make: false },
+  { feature: "slack", kind: "slack", label: "Slack thread", make: true },
+  { feature: "google", kind: "gtask", label: "Google task", make: true },
+  { feature: "word", kind: "word", label: "Word document", make: true },
+  { feature: "freeform", kind: "freeform", label: "Freeform board", make: true },
+  { feature: "web", kind: "web", label: "Webpage", make: true },
+  { feature: "files", kind: "file", label: "File on disk", make: true },
+];
+
+/**
+ * The + beside a note: a new node or an existing one at the end of a line from it, then
+ * each switched-on integration — a new one made under the note's name, or one that already
+ * exists, picked from what the integration can see.
+ */
+function attachItems(host: string): MenuItem[] {
+  const items: MenuItem[] = [
+    { label: "New node", icon: NOTE_DOT, run: () => graphView.startLink(host) },
+    {
+      label: "Existing node",
+      icon: NOTE_DOT,
+      run: () => graphView.startLink(host, "link"),
+      search: { placeholder: "Type a note's name…" },
+      children: () => existingNodeRows(host, null, null),
+    },
+  ];
+  for (const row of ATT_KINDS) {
+    if (!settings.enabled(row.feature)) continue;
+    const make = (): void => {
+      graphView.closeStrip();
+      void turnHolderInto(() => newAttachment(host, ""), row.kind, row.label).then(() => graphView.openStrip(host));
+    };
+    const listing = ATTACHABLES.find((one) => one.kind === row.kind);
+    if (!listing) {
+      items.push({ label: `${row.label}…`, icon: TYPE_ICONS[row.kind], run: make });
+      continue;
+    }
+    items.push({
+      label: row.label,
+      icon: TYPE_ICONS[row.kind],
+      children: async () => [
+        ...(row.make ? [{ label: `New ${row.label}`, run: make }] : []),
+        ...(await listing.options()).map((option) => ({
+          label: option.label,
+          hint: option.hint,
+          run: () =>
+            void withAttachTarget(host, () => option.place({ x: 0, y: 0 }, null, null)).then(() =>
+              graphView.openStrip(host),
+            ),
+        })),
+      ],
+    });
+  }
+  return items;
+}
+
+/** Right-click on an attachment: what can be done to it — retargeting it, or taking it off. */
+function showAttachmentMenu(att: string, host: string, client: Client): void {
+  const items: MenuItem[] = [];
+  if (settings.enabled("claude") && graphView.sessionNote(att)) {
+    items.push({ label: "Plug in a session…", run: () => void plugInSession(att) });
+  }
+  if (settings.enabled("antigravity") && graphView.antigravityNote(att)) {
+    items.push({ label: "Plug in a conversation…", run: () => void plugInAntigravitySession(att) });
+  }
+  items.push({ label: `Remove from ${noteName(host)}`, run: () => void removeAttachment(att, host) });
+  showMenu(client, items);
+}
+
+/** Takes an attachment off its note. The thing itself — the page, the session — is left where it lives. */
+async function removeAttachment(att: string, host: string): Promise<void> {
+  if (!(await askConfirm(`Remove this from ${noteName(host)}? What it points at is left where it lives.`, "Remove"))) return;
+  await flushAll();
+  const next = withoutAttachLine(await vault.read(host), noteName(att));
+  await vault.write(host, next);
+  syncOpenPanes(host, next);
+  await vault.remove(att, "file").catch(() => undefined);
+  await drawGraph();
+  ui.status.textContent = `removed from ${noteName(host)}`;
+}
+
+/** A note deleted takes its attachment files with it; nothing else names them. */
+async function dropAttachmentsOf(paths: string[]): Promise<void> {
+  if (!settings.attachMode()) return;
+  for (const path of paths) {
+    const text = await vault.read(path).catch(() => "");
+    for (const name of attachNames(text)) await vault.remove(attFile(name), "file").catch(() => undefined);
+  }
+}
+
+/**
+ * A note dragged into another and let go there: the one it was dropped into takes
+ * everything it had — its attachments, whatever it said, and every link that pointed at it —
+ * and the dragged note goes. Its attachment files stay exactly as they are; only the
+ * `attach::` lines that hang them move.
+ */
+const LINK_ONLY_RE = /^[\s>*+-]*(?:[^:\n]{1,60}::\s*)?\[\[[^\]]+\]\]\s*$/;
+
+/** A note with the same link-only line twice keeps the first; any blank left doubled closes up. */
+function dropRepeatedLinkLines(text: string): string {
+  const seen = new Set<string>();
+  const kept = text.split("\n").filter((line) => {
+    if (!LINK_ONLY_RE.test(line)) return true;
+    const key = line.trim().toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  return kept.join("\n").replace(/\n{3,}/g, "\n\n");
+}
+
+async function mergeNotes(source: string, target: string): Promise<void> {
+  await flushAll(); // either may be open and mid-edit
+  const before = filePaths();
+  const from = await vault.read(source);
+  const names = attachNames(from);
+  const prose = from
+    .split("\n")
+    .filter((line) => !/^[ \t]*attach::/i.test(line))
+    .join("\n")
+    .trim();
+  // The target's own words, then the dragged note's, then every attachment line at the foot.
+  const into = await vault.read(target);
+  const own = into
+    .split("\n")
+    .filter((line) => !/^[ \t]*attach::/i.test(line))
+    .join("\n")
+    .replace(/\s+$/, "");
+  const words = [own, prose].filter(Boolean).join("\n\n");
+  const lines = [...attachNames(into), ...names].map((name) => `attach:: ${name}`).join("\n");
+  await vault.write(target, `${words}${words && lines ? "\n\n" : ""}${lines}\n`);
+  await vault.remove(source, "file");
+  entries = await vault.entries();
+  // Every link to the dragged note now means the note it went into. A link the target had
+  // to it — and one it had to the target — would now point at itself, and goes.
+  const resolver = new LinkResolver(before);
+  const moves = new Map([[source, target]]);
+  for (const path of filePaths()) {
+    const text = await vault.read(path);
+    let out = relinkText(text, moves, (link) => resolver.resolve(link));
+    if (path === target) out = unlinkText(out, (link) => [source, target].includes(resolver.resolve(link) ?? ""));
+    // A note that linked to both now links to one twice: the second line of it goes.
+    if (out !== text) out = dropRepeatedLinkLines(out);
+    if (out !== text) await vault.write(path, out);
+  }
+  syncOpenPanes(target, await vault.read(target));
+  await refresh();
+  await showAll();
+  graphView.openStrip(target); // what it holds now, shown
+  const carried = names.length === 1 ? "1 attachment" : `${names.length} attachments`;
+  ui.status.textContent = `merged ${noteName(source)} into ${noteName(target)} — ${carried}${prose ? " and its text" : ""}`;
+}
+
+/** A note's right-click, in a vault of attachments: no types to make or turn into — only attaching. */
+function attachNodeMenu(path: string, client: Client): MenuItem[] {
+  const items: MenuItem[] = [{ label: "Attach", children: attachItems(path) }];
+  const target = graphView.refTarget(path);
+  // The way to the other vault, now that the reference wears no doorway on its corner.
+  if (target !== null) items.push({ label: "Open in its vault", run: () => void openRefNode(path, target || null, true) });
+  if (settings.enabled("active")) items.push({ label: "Style…", run: () => void styleNode(path, client) });
+  items.push(
+    { label: "Copy path", run: () => void copyNotePath(path) },
+    { label: "Rename", run: () => renameOnGraph(path) },
+    { label: "Delete", run: () => void deleteEntry(path, "file") },
+  );
+  return items;
+}
+
+/** Empty canvas, in a vault of attachments: a new node, or one that already exists. */
+function attachCanvasMenu(at: { x: number; y: number }): MenuItem[] {
+  const items: MenuItem[] = [{ label: "New node", icon: NOTE_DOT, run: () => void createHolderAt(at, null) }];
+  if (settings.enabled("stickies")) items.push({ label: "Sticky", run: () => graphView.addSticky(at) });
+  items.push({
+    label: "Existing node",
+    icon: NOTE_DOT,
+    search: { placeholder: "Type a note's name…" },
+    children: () => existingNodeRows(null, at, null),
+  });
+  return items;
+}
+
+/**
+ * Click on an attachment of a note in another vault: open the thing by its handle. Its
+ * file is that vault's, so one never made over there is not made from here either.
+ */
+async function openForeign(type: string, data: Record<string, unknown>): Promise<void> {
+  const say = (message: string): void => {
+    window.setTimeout(() => {
+      ui.status.textContent = message;
+    }, 0);
+  };
+  const bridge = window.bedrock;
+  if (!bridge) {
+    say("needs the desktop app — npm start");
+    return;
+  }
+  const handle = (key: string): string => (data[key] as string) || "";
+  const open: Record<string, [string, (value: string) => Promise<unknown>]> = {
+    claude: ["csession", (id) => bridge.claudeOpen(id)],
+    antigravity: ["aconv", (id) => bridge.agyOpen({ id })],
+    notion: ["nurl", (url) => bridge.notionOpen(url)],
+    web: ["wurl", async (url) => window.open(url, "_blank", "noopener")],
+    freeform: ["fboard", (id) => bridge.freeformOpen(id)],
+    slack: ["sthread", (url) => bridge.slackOpen(url)],
+    gtask: ["gurl", (url) => bridge.googleOpen(url)],
+    applenote: ["anote", (id) => bridge.notesOpen(id)],
+    granola: ["gmeet", (id) => bridge.granolaOpen(id)],
+    word: ["wdoc", (path) => bridge.wordOpen(path)],
+    file: ["fspath", (path) => bridge.openPath(path)],
+    folder: ["fspath", (path) => bridge.openPath(path)],
+  };
+  const how = open[type];
+  const value = how ? handle(how[0]) : "";
+  if (!how || !value) {
+    say(`that ${type} has not been made yet — open the note in its own vault to make it`);
+    return;
+  }
+  try {
+    await how[1](value);
+    say(`→ ${type === "web" ? value : type}`);
+  } catch (err) {
+    say(`could not open it — ${shellError(err)}`);
+  }
 }
 
 /* --------------------------------------------------- plugging in a session --- */
