@@ -1005,14 +1005,14 @@ button.twisty:hover {
   display: none;
 }
 
-/* The front door: the vault picker — a list of the vaults under the Bedrock folder. */
+/* The front door: the vault picker — mark, two cards, and the vaults under the Bedrock folder. */
 #welcome {
   position: absolute;
   inset: 0;
   z-index: 40;
   display: flex;
   justify-content: center;
-  padding: 16vh 16px 24px;
+  padding: 20vh 16px 24px;
   background: var(--bg);
 }
 
@@ -1021,30 +1021,88 @@ button.twisty:hover {
 }
 
 .picker {
-  width: min(480px, 100%);
+  width: min(440px, 100%);
   display: flex;
   flex-direction: column;
-  min-height: 0;
+}
+
+.picker-brand {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 26px;
+}
+
+.picker-mark {
+  width: 52px;
+  height: 52px;
+  flex: none;
 }
 
 .picker-title {
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--text-strong);
+  line-height: 1.2;
+}
+
+.picker-base {
   color: var(--muted);
   font-size: 12px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  margin: 0 10px 14px;
+  margin-top: 2px;
+}
+
+.picker-cards {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-bottom: 28px;
+}
+
+.picker-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px 14px 12px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  text-align: left;
+  background: var(--btn);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.picker-card:hover {
+  background: var(--btn-hover);
+}
+
+.picker-card svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.picker-label {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 0 0 8px;
 }
 
 .picker-search {
   font: inherit;
-  font-size: 15px;
+  font-size: 13px;
   color: var(--text);
   background: transparent;
-  border: 0;
-  border-bottom: 1px solid var(--line);
-  border-radius: 0;
-  padding: 8px 10px 10px;
-  margin-bottom: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 9px;
+  margin-bottom: 6px;
   outline: none;
 }
 
@@ -1053,20 +1111,23 @@ button.twisty:hover {
 }
 
 .picker-search:focus {
-  border-bottom-color: var(--muted);
+  border-color: var(--muted);
 }
 
+/* Five rows, then it scrolls. */
 .picker-list {
   overflow-y: auto;
-  min-height: 0;
+  max-height: calc(5 * 29px);
+  font-size: 13px;
 }
 
 .picker-row {
   display: flex;
   align-items: baseline;
   gap: 12px;
-  padding: 7px 10px;
-  border-radius: 6px;
+  height: 29px;
+  padding: 6px 9px;
+  border-radius: 5px;
   cursor: default;
 }
 
@@ -1103,21 +1164,14 @@ button.twisty:hover {
 
 .picker-empty {
   color: var(--muted);
-  padding: 7px 10px;
-}
-
-.picker-foot {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  color: var(--muted);
-  font-size: 12px;
-  margin: 14px 10px 0;
+  padding: 6px 9px;
 }
 
 .picker-note {
   color: var(--accent);
-  text-align: right;
+  font-size: 12px;
+  margin: 8px 9px 0;
+  min-height: 1em;
 }
 
 #float-controls button {
