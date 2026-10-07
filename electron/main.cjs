@@ -244,7 +244,9 @@ function buildMenu() {
         label: "File",
         submenu: [
           { label: "Open Vault…", accelerator: "CmdOrCtrl+O", click: tell("open-vault") },
-          { label: "New Window", accelerator: "CmdOrCtrl+N", click: () => createWindow() },
+          // A new window asks which vault, in the window itself; only a launch (or the dock with
+          // nothing open) goes straight to the last one.
+          { label: "New Window", accelerator: "CmdOrCtrl+N", click: () => createWindow("app://-/") },
           ...(process.platform === "darwin" ? [] : [{ type: "separator" }, settingsItem, updatesItem]),
           { type: "separator" },
           { role: process.platform === "darwin" ? "close" : "quit" },
@@ -614,6 +616,52 @@ ipcMain.handle("base-set", (_event, chosen) => {
   fs.writeFileSync(baseFile(), JSON.stringify({ version: 1, base }));
   return baseDir();
 });
+/*
+ * The vaults the picker offers: every folder directly under the Bedrock folder that is one
+ * (it has `.notes/`). Most recently opened first, the rest by name; `edited` is the newest
+ * thing at the vault's top level, and `open` says another window has it.
+ */
+ipcMain.handle("vaults-list", (event) => {
+  const base = baseDir();
+  const recent = readRecent();
+  const elsewhere = new Set([...vaultRoots.entries()].filter(([id]) => id !== event.sender.id).map(([, root]) => root));
+  let entries = [];
+  try {
+    entries = fs.readdirSync(base, { withFileTypes: true });
+  } catch {
+    return { base, vaults: [] };
+  }
+  const vaults = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+    const root = path.join(base, entry.name);
+    if (!fs.existsSync(path.join(root, ".notes"))) continue;
+    let edited = 0;
+    try {
+      for (const name of fs.readdirSync(root)) {
+        if (name.startsWith(".") && name !== ".notes") continue;
+        edited = Math.max(edited, fs.statSync(path.join(root, name)).mtimeMs);
+      }
+    } catch {
+      /* unreadable: no date */
+    }
+    const rank = recent.indexOf(root);
+    vaults.push({ name: entry.name, root, edited, open: elsewhere.has(root), rank: rank < 0 ? Infinity : rank });
+  }
+  vaults.sort((a, b) => a.rank - b.rank || a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
+  return { base, vaults: vaults.map(({ rank, ...one }) => one) };
+});
+
+/** A new vault under the Bedrock folder: the folder and its `.notes/`. Rejects on a bad or taken name. */
+ipcMain.handle("vault-create", (_event, rawName) => {
+  const name = String(rawName ?? "").trim();
+  if (!name || name.startsWith(".") || /[\\/:]/.test(name)) throw new Error(`"${name}" cannot be a folder name`);
+  const root = path.join(baseDir(), name);
+  if (fs.existsSync(root)) throw new Error(`${name} already exists`);
+  fs.mkdirSync(path.join(root, ".notes"), { recursive: true });
+  return root;
+});
+
 ipcMain.handle("base-ref", (_event, full) => refForm(path.resolve(expandHome(String(full)))));
 
 ipcMain.handle("fs-pick", async (event, kind, options = {}) => {

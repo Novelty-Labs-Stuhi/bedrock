@@ -1005,14 +1005,14 @@ button.twisty:hover {
   display: none;
 }
 
-/* The front door: two big answers, splitting the window between them. */
+/* The front door: the vault picker — a list of the vaults under the Bedrock folder. */
 #welcome {
   position: absolute;
   inset: 0;
   z-index: 40;
   display: flex;
-  gap: 24px;
-  padding: 18vh 10vw;
+  justify-content: center;
+  padding: 16vh 16px 24px;
   background: var(--bg);
 }
 
@@ -1020,32 +1020,104 @@ button.twisty:hover {
   display: none;
 }
 
-.welcome-btn {
-  flex: 1;
+.picker {
+  width: min(480px, 100%);
   display: flex;
   flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  background: var(--bg-side);
+  min-height: 0;
 }
 
-.welcome-btn b {
-  font-size: 22px;
-  font-weight: 600;
-}
-
-.welcome-btn small {
+.picker-title {
   color: var(--muted);
-  font-size: 13px;
-  max-width: 26em;
-  line-height: 1.4;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin: 0 10px 14px;
 }
 
-.welcome-btn:hover {
+.picker-search {
+  font: inherit;
+  font-size: 15px;
+  color: var(--text);
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  border-radius: 0;
+  padding: 8px 10px 10px;
+  margin-bottom: 8px;
+  outline: none;
+}
+
+.picker-search::placeholder {
+  color: var(--muted);
+}
+
+.picker-search:focus {
+  border-bottom-color: var(--muted);
+}
+
+.picker-list {
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.picker-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  cursor: default;
+}
+
+.picker-row.on {
   background: var(--bg-hover);
+}
+
+.picker-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.picker-row.on .picker-name {
+  color: var(--text-strong);
+}
+
+.picker-side {
+  color: var(--muted);
+  font-size: 12px;
+  flex: none;
+}
+
+.picker-new .picker-name {
+  color: var(--muted);
+}
+
+.picker-new b {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.picker-empty {
+  color: var(--muted);
+  padding: 7px 10px;
+}
+
+.picker-foot {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 12px;
+  margin: 14px 10px 0;
+}
+
+.picker-note {
+  color: var(--accent);
+  text-align: right;
 }
 
 #float-controls button {

@@ -16,6 +16,7 @@ import {
   type NodeStyle,
 } from "./links";
 import { showStylePicker } from "./node-style";
+import { mountPicker } from "./picker";
 import { askChoice, askConfirm, askPick, askText } from "./dialog";
 import { ARROW, EDGE_DIR, edgeNotePath, isEdgeNote, renamedEdgeNote } from "./edges";
 import { showMenu, type MenuItem } from "./menu";
@@ -2008,8 +2009,7 @@ function adoptVaultFromPath(): void {
     })
     .catch((err) => {
       console.error(err);
-      ui.welcome.hidden = false;
-      ui.status.textContent = `${next.name} could not be opened — ${shellError(err)}`;
+      void picker.show(`${next.name} could not be opened — ${shellError(err)}`);
     });
 }
 
@@ -7318,10 +7318,8 @@ ui.settings.addEventListener("click", () => {
 ui.floatControls.hidden = !!window.bedrock;
 window.bedrock?.onMenu((what) => {
   if (what === "settings") ui.settings.click();
-  // Straight to the OS's own folder sheet. It is the shell that opens it, so unlike the
-  // browser's `showDirectoryPicker` it needs no click of its own to be allowed; the front
-  // door stands behind it as the way out, and Esc backs out of that over an open vault.
-  else void pickFolder();
+  // The vault picker, over the vault on screen; Esc goes back to it.
+  else void picker.show();
 });
 settings.onChange = applyFeatures;
 settings.onLook = applyLook;
@@ -7477,8 +7475,8 @@ window.addEventListener("beforeunload", () => {
 const escapeHtml = (s: string): string => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 const escapeAttr = (s: string): string => escapeHtml(s).replace(/"/g, "&quot;");
 
-// No vault opens by itself — not the demo, not even the last one. The app starts at
-// the front door, and everything attaches when a real folder is picked (`pickFolder`).
+// A launch opens the last vault (the shell puts it in the address); anything else starts at
+// the picker, and everything attaches when a vault is chosen there.
 void adoptLinearKey(); // a key stored on a previous run connects itself
 void window.bedrock?.baseGet().then((base) => {
   baseRoot = base; // where vaults live — for the Create menu, the pickers and the settings window
@@ -7489,22 +7487,56 @@ void refreshGoogle(); // and a Google account
 /** Whether any real vault has been opened this run — what lets Esc close the door. */
 let vaultOpen = false;
 
-el("welcome-open").addEventListener("click", () => void pickFolder());
-el("welcome-new").addEventListener("click", () => void pickFolder());
+const picker = mountPicker(ui.welcome, {
+  open: (root, listing) => void openPicked(root, listing),
+  browse: () => void pickFolder(),
+  canClose: () => vaultOpen,
+});
 adoptVaultFromPath(); // and one opened from a reference is told its path
 
-/*
- * A window that was not opened FOR a vault asks which one straight away: the OS's folder
- * sheet, not a door with an "Open a vault" button on it to press first. The shell opens
- * that sheet, so it needs no click to be allowed one — which is the only reason the door
- * ever came first (a browser tab's `showDirectoryPicker` does need one, and there the door
- * stays the way in). Cancelling the sheet leaves the door standing behind it, so a window
- * whose picker was dismissed is not a dead one.
+// A window not opened FOR a vault — ⌘N, or a launch with no vault to come back to — asks
+// which one, in the window itself.
+if (!new URL(location.href).searchParams.get("root")) void picker.show();
+
+/**
+ * A vault chosen in the picker. One another window already has is brought forward there
+ * (and an empty window that only asked goes away); anything else opens in this window.
  */
-if (window.bedrock) {
-  const opened = new URL(location.href).searchParams;
-  if (!opened.get("root")) void pickFolder();
+async function openPicked(root: string, listing: VaultListing | null): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  const here = knownVaultRoot();
+  if (vaultOpen && here && samePath(here, root)) {
+    picker.hide();
+    return;
+  }
+  if (listing?.open) {
+    const state = await bridge.windowState().catch(() => null);
+    const there = state?.windows.find((win) => !win.self && win.root && samePath(win.root, root));
+    if (there && (await bridge.windowShow(there.id, null).catch(() => false))) {
+      if (!vaultOpen) window.close();
+      else picker.hide();
+      return;
+    }
+  }
+  if (vaultOpen) {
+    await flushAll();
+    await spatial.flush();
+    await settings.flush();
+  }
+  const next = new ShellVault(root);
+  localStorage.setItem(ROOT_KEY + next.name, root);
+  picker.hide();
+  ui.status.textContent = `opening ${next.name}…`;
+  try {
+    await openVault(next);
+    ui.status.textContent = "";
+  } catch (err) {
+    console.error(err);
+    void picker.show(`${next.name} could not be opened — ${shellError(err)}`);
+  }
 }
+
 // A window that was raised instead of opened is told which note it was raised for.
 window.bedrock?.onGoto((focus) => graphView.focusNode(focus));
 // The disk under this vault changed, and not by this app: re-read, keeping what a move would lose.
@@ -7520,7 +7552,4 @@ window.bedrock?.onRefsChanged((roots) => {
   else void paintIncoming(); // references elsewhere changed: what points here may have too
 
 });
-document.addEventListener("keydown", (event) => {
-  // The door can be closed over an open vault; before one is open there is nothing behind it.
-  if (event.key === "Escape" && vaultOpen && !ui.welcome.hidden) ui.welcome.hidden = true;
-});
+
