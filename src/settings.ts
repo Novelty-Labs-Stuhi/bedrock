@@ -407,8 +407,9 @@ export class SettingsStore {
   private setups: Setup = { ...SETUP_DEFAULT };
   /**
    * `"mode": "attachments"` in this vault's config: every node is a plain note, and what
-   * used to be a typed note rides on one as an attachment. Never inherited — a vault is
-   * one or the other from the day it is made, and the folder above it cannot change that.
+   * used to be a typed note rides on one as an attachment. A vault that does not say
+   * either way follows the Bedrock folder — so a vault made inside a converted Bedrock is
+   * born with attachments — and one that says `"mode"` itself keeps its own answer.
    */
   private attachments = false;
   private writeScope: Scope = "vault";
@@ -436,14 +437,17 @@ export class SettingsStore {
     this.setups = { ...SETUP_DEFAULT };
     this.attachments = false;
     this.writeScope = "vault";
+    let rootAttachments = false;
     if (root) {
       const parsed = await readConfig(root);
       if (parsed) this.root = parsePrefs(parsed as never);
+      rootAttachments = parsed?.mode === "attachments";
     }
+    this.attachments = rootAttachments;
     const parsed = await readConfig(vault);
     if (!parsed) return;
     this.over = parsePrefs(parsed as never);
-    this.attachments = parsed.mode === "attachments";
+    if (typeof parsed.mode === "string") this.attachments = parsed.mode === "attachments";
     const setup = (parsed.setup ?? {}) as Record<string, unknown>;
     for (const key of Object.keys(SETUP_DEFAULT) as Array<keyof Setup>) {
       const value = setup[key];
