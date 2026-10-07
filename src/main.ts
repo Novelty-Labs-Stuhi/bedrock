@@ -15,7 +15,7 @@ import {
   unlinkText,
   type NodeStyle,
 } from "./links";
-import { showStylePicker } from "./node-style";
+import { showEdgeStylePicker, showStylePicker } from "./node-style";
 import { mountPicker } from "./picker";
 import { askChoice, askConfirm, askPick, askText } from "./dialog";
 import { ARROW, EDGE_DIR, edgeNotePath, isEdgeNote, renamedEdgeNote } from "./edges";
@@ -322,11 +322,12 @@ const graphView = new GraphView(ui.cy, {
       items.push({ label: "Name this connection…", run: () => relabelEdge(source, target) });
     }
     if (settings.enabled("active")) {
-      const mark = graphView.edgeMark(source, target);
+      const look = graphView.edgeLook(source, target);
       items.push({
-        label: mark === "radiate" ? "Stop radiating" : "Make it radiate",
-        run: () => graphView.setEdgeMark(source, target, mark === "radiate" ? null : "radiate"),
+        label: look.radiate ? "Stop radiating" : "Make it radiate",
+        run: () => graphView.setEdgeLook(source, target, { ...look, radiate: !look.radiate }),
       });
+      items.push({ label: "Style…", run: () => styleEdge(source, target, client) });
     }
     // Cutting the line means taking the link out of the note that draws it — there is
     // nothing else holding the connection up. Last, and it asks first.
@@ -416,6 +417,9 @@ const graphView = new GraphView(ui.cy, {
     ui.status.textContent = hint ?? statusText();
   },
   onAttachMenu: (host, client) => showMenu(client, attachItems(host)),
+  onNodeEdit: (path, client) => showMenu(client, nodeEditItems(path, client)),
+  onEdgeDelete: (source, target) => void deleteEdge(source, target),
+  onEdgeStyle: (source, target, client) => styleEdge(source, target, client),
   onAttachmentMenu: (att, host, client) => showAttachmentMenu(att, host, client),
   onOpenForeign: (type, data) => void openForeign(type, data),
   onMergeNodes: (source, target) => void mergeNotes(source, target),
@@ -3737,6 +3741,11 @@ async function styleNode(path: string, at: Client): Promise<void> {
   showStylePicker(at, parseStyle(text), (style) => writeStyle(path, style));
 }
 
+/** A connection's look, in the same kind of panel — kept in this window, not in a file. */
+function styleEdge(source: string, target: string, at: Client): void {
+  showEdgeStylePicker(at, graphView.edgeLook(source, target), (look) => graphView.setEdgeLook(source, target, look));
+}
+
 /**
  * The same panel for a drawn selection: one pick, every note in it. The panel starts from
  * the first note's look, since it has to start from something; a pick then applies to all
@@ -6995,6 +7004,17 @@ function attachNodeMenu(path: string, client: Client): MenuItem[] {
     { label: "Rename", run: () => renameOnGraph(path) },
     { label: "Delete", run: () => void deleteEntry(path, "file") },
   );
+  return items;
+}
+
+/** A click on an open note — its pencil — in a vault of attachments: what can be changed about it. */
+function nodeEditItems(path: string, client: Client): MenuItem[] {
+  const items: MenuItem[] = [];
+  if (settings.enabled("active")) items.push({ label: "Style…", run: () => void styleNode(path, client) });
+  items.push({ label: "Rename", run: () => renameOnGraph(path) });
+  const target = graphView.refTarget(path);
+  if (target !== null) items.push({ label: "Open in its vault", run: () => void openRefNode(path, target || null, true) });
+  items.push({ label: "Delete", run: () => void deleteEntry(path, "file") });
   return items;
 }
 

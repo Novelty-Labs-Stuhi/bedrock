@@ -610,11 +610,51 @@ const URL_RE = /https?:\/\/[^\s)\]>]+/;
  * `.named` on whatever should speak, and the two rules at the foot of the sheet are what
  * lets it.
  */
+/**
+ * A node's name as it is drawn: wrapped to a measure and balanced, the way CSS's
+ * `text-wrap: balance` sets a heading — as few lines as the measure allows, each about as
+ * long as the others, so no line is left holding one stray word. The block sits beside the
+ * node with its middle level with the node's. A webpage's note can be named by a whole
+ * paragraph, so it stops at NAME_LINES and the last line says there was more; the tree and
+ * the tab still say it in full.
+ */
+const NAME_MEASURE = 18; // characters to a line, at most
+const NAME_LINES = 3;
+function stackedName(ele: cytoscape.NodeSingular): string {
+  const label = String(ele.data("label") ?? "").trim();
+  if (label.length <= NAME_MEASURE) return label;
+  const words = label.split(/\s+/).map((w) => (w.length > NAME_MEASURE ? `${w.slice(0, NAME_MEASURE - 1)}…` : w));
+  // Greedy wrap at `width`: the lines a measure of that many characters gives.
+  const wrap = (width: number): string[] => {
+    const lines: string[] = [];
+    for (const word of words) {
+      const last = lines[lines.length - 1];
+      if (last !== undefined && last.length + 1 + word.length <= width) lines[lines.length - 1] = `${last} ${word}`;
+      else lines.push(word);
+    }
+    return lines;
+  };
+  // Balance: the narrowest measure that still needs no more lines than the full one does.
+  const most = wrap(NAME_MEASURE);
+  let lines = most;
+  for (let width = NAME_MEASURE - 1; width > 0; width--) {
+    const tried = wrap(width);
+    if (tried.length > most.length) break;
+    lines = tried;
+  }
+  if (lines.length > NAME_LINES) {
+    lines = lines.slice(0, NAME_LINES);
+    lines[NAME_LINES - 1] = `${lines[NAME_LINES - 1]}…`;
+  }
+  return lines.join("\n");
+}
+
 function styleSheet(look: Look, attachments = false): cytoscape.StylesheetJson {
   const ground = canvasHex(look.bg);
   const ink = inkOn(ground);
   /** What a node or edge is labelled with when nothing is hovering it. */
   const name = look.captions ? "data(label)" : "";
+  const nodeName = look.captions ? stackedName : "";
   /**
    * A label the pointer asked for lands wherever the graph already is — over edges, over
    * other notes — so it is backed by the ground it sits on, the way edge labels always are.
@@ -634,17 +674,15 @@ function styleSheet(look: Look, attachments = false): cytoscape.StylesheetJson {
       selector: "node",
       style: {
         "background-color": nodeHex,
-        label: name,
+        label: nodeName,
         color: ink,
         "font-size": 10,
         "text-valign": "center",
         "text-halign": "right",
         "text-margin-x": 4,
-        // A note named after a webpage carries whatever that page calls itself, and a post
-        // calls itself by its first paragraph. Left to run, the name is a line of text laid
-        // across the canvas over everything behind it; the tree and the tab still say it in
-        // full, so the node says as much of it as a node has room for.
-        "text-wrap": "ellipsis",
+        // A long name is wrapped and balanced (`stackedName`), the block centred on the node.
+        "text-wrap": "wrap",
+        "text-justification": "left",
         "text-max-width": "150px",
         "min-zoomed-font-size": 8,
         width: 20,
@@ -802,6 +840,9 @@ function styleSheet(look: Look, attachments = false): cytoscape.StylesheetJson {
         "target-arrow-color": "#3fb950",
       },
     },
+    // A connection's own look (`applyMarks`): after the radiating green, so a colour chosen wins.
+    { selector: "edge.dashed", style: { "line-style": "dashed", "line-dash-pattern": [6, 4] } },
+    { selector: "edge[ecol]", style: { "line-color": "data(ecol)", "target-arrow-color": "data(ecol)" } },
     { selector: ".faded", style: { opacity: 0.25 } },
     /*
      * The spotlight the pointer carries: what a hovered note is joined to, and what it is
@@ -883,6 +924,9 @@ function styleSheet(look: Look, attachments = false): cytoscape.StylesheetJson {
     { selector: "node.draft-source", style: { "border-width": 3, "border-color": ink } },
     // A leaf a draft has taken: out of sight until the draft ends one way or the other.
     { selector: ".gone", style: { display: "none" } },
+    // Cytoscape shades whatever is under a press; a click here opens things, and the shade
+    // was a grey square left standing round the note.
+    { selector: "node:active, edge:active", style: { "overlay-opacity": 0 } },
     // What a drawn rectangle took in, lit until something puts it out: a click on the
     // canvas, a click on a note, Esc, or the selection being acted on.
     {
@@ -899,7 +943,7 @@ function styleSheet(look: Look, attachments = false): cytoscape.StylesheetJson {
     ...(look.captions
       ? []
       : [
-          { selector: "node.named", style: { label: "data(label)", ...plate } },
+          { selector: "node.named", style: { label: stackedName, ...plate } },
           { selector: "edge.named[label]", style: { label: "data(label)" } },
         ]),
   ];
@@ -908,27 +952,46 @@ function styleSheet(look: Look, attachments = false): cytoscape.StylesheetJson {
 /* ------------------------------------------------------------------- marks --- */
 
 /**
- * The one status a right-click can set on a connection: radiating, the line counterpart of
- * a radiating note. A note keeps what it looks like in its own markdown (`sign::`,
- * `anim::` and the rest — see `parseStyle`), but an edge has no file of its own unless it
- * has been described, so edge marks live in this window's own storage, keyed by edge id.
+ * A connection's look: a colour (a palette key or a hex, as a note's), a dashed line, and
+ * radiating — the line counterpart of a radiating note. A note keeps what it looks like in
+ * its own markdown (`sign::`, `anim::` and the rest — see `parseStyle`), but an edge has no
+ * file of its own unless it has been described, so edge looks live in this window's own
+ * storage, keyed by edge id. The old store held the bare word "radiate"; it still reads.
  */
-export type Mark = "radiate";
+export type EdgeLook = { colour?: string; dash?: boolean; radiate?: boolean };
 
 const MARKS_KEY = "obsidian-lite:edge-marks";
 
-function readEdgeMarks(): Record<string, Mark> {
+function readEdgeLooks(): Record<string, EdgeLook> {
   try {
     const kept = JSON.parse(localStorage.getItem(MARKS_KEY) ?? "{}") as Record<string, unknown>;
-    const out: Record<string, Mark> = {};
-    for (const [id, mark] of Object.entries(kept)) {
-      if (mark === "radiate") out[id] = mark;
+    const out: Record<string, EdgeLook> = {};
+    for (const [id, look] of Object.entries(kept)) {
+      if (look === "radiate") out[id] = { radiate: true };
+      else if (look && typeof look === "object") {
+        const { colour, dash, radiate } = look as EdgeLook;
+        out[id] = {
+          ...(typeof colour === "string" && colour ? { colour } : {}),
+          ...(dash ? { dash: true } : {}),
+          ...(radiate ? { radiate: true } : {}),
+        };
+      }
     }
     return out;
   } catch {
     return {};
   }
 }
+
+/** The bin and the pencil the tools around a clicked note or connection wear. */
+const ICON_BIN =
+  `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 4.5h11M6 4.5V3h4v1.5M4 4.5l.7 9h6.6l.7-9M6.7 7v4.5M9.3 7v4.5"/></svg>`;
+const ICON_ROTATE =
+  `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M12.8 6.2A5 5 0 1 0 13 9.5 M13 3v3.4H9.6"/></svg>`;
+// Drawn, not typed: a font's "+" sits on its baseline, below the middle of the circle.
+const ICON_PLUS = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3.5v9M3.5 8h9"/></svg>`;
+const ICON_PENCIL =
+  `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10.5 2.5l3 3-8 8H2.5v-3z M9 4l3 3"/></svg>`;
 
 const DRAFT_NODE = "__draft_target__";
 const DRAFT_EDGE = "__draft_edge__";
@@ -971,6 +1034,12 @@ export type IssueChange = {
  * for most of the cycle, and a canvas with a dozen active notes still reads as a canvas.
  */
 const PULSE_MS = 3000;
+
+/** Where a panel opened from a tool chip goes: just right of the chip, level with its top. */
+const toolPoint = (chip: HTMLElement): { x: number; y: number } => {
+  const box = chip.getBoundingClientRect();
+  return { x: box.right + 6, y: box.top };
+};
 
 const clientPoint = (event: cytoscape.EventObject): { x: number; y: number } => {
   const original = event.originalEvent as MouseEvent | undefined;
@@ -1511,6 +1580,11 @@ export type GraphHandlers = {
   onMergeNodes: (source: string, target: string) => void;
   /** The + beside a clicked note: what can be attached to it, as a menu at `client`. */
   onAttachMenu: (host: string, client: Client) => void;
+  /** A click on the open note (its pencil): its menu — Style, Rename, Delete — at `client`. */
+  onNodeEdit: (path: string, client: Client) => void;
+  /** The same two along a clicked connection; its Rename is `onOpenEdge`. */
+  onEdgeDelete: (source: string, target: string) => void;
+  onEdgeStyle: (source: string, target: string, client: Client) => void;
   /** Right-click on one of a note's attachments. */
   onAttachmentMenu: (att: string, host: string, client: Client) => void;
   /**
@@ -1585,6 +1659,12 @@ class AttNode {
  * reads at a glance. In model units, so the note and its ring zoom as one picture.
  */
 const attOpenShare = (count: number): number => Math.max(0.36, 0.76 - 0.08 * (count - 1));
+/**
+ * How many attachments an open note's ring shows at once. Up to this many the ring opens
+ * out a little with each one; past it the next place on the ring is taken by a tile that
+ * turns it (as does a scroll over a tile), bringing the rest round.
+ */
+const ATT_RING_MAX = 4;
 /** How many tiles a folded note stacks on its corner; the rest are only seen when it is open. */
 const ATT_STACK = 3;
 /** And never smaller than this, in model units, however small the note. */
@@ -1629,7 +1709,7 @@ export class GraphView {
   /** Note path -> the ring that pulses over it, for the notes marked active. */
   private pulseEls = new Map<string, HTMLElement>();
   /** Edge id -> its mark. Nodes keep theirs in their own markdown; edges keep them here. */
-  private edgeMarks: Record<string, Mark> = readEdgeMarks();
+  private edgeLooks: Record<string, EdgeLook> = readEdgeLooks();
   /** The timer walking the dashes along radiating edges, while there are any to walk. */
   private edgeBeat: number | undefined;
   /** Note path -> the "done" badge on its icon, for the issues that are finished. */
@@ -1643,7 +1723,12 @@ export class GraphView {
   /** Attachment path -> its small icon on the rim of its note. */
   private attEls = new Map<string, HTMLElement>();
   /** The strip a clicked note opens beside itself: its attachments and the + box. */
-  private strip: { host: string; el: HTMLElement } | null = null; // `el` is the +
+  private strip: { host: string; el: HTMLElement } | null = null; // `el` is the row of tools, + first
+  /** How far an open note's ring has been turned, in tiles (only past ATT_RING_MAX). */
+  private ringTurn = 0;
+  private ringWheel = 0;
+  /** A clicked connection: everything else dims, and its bin and pencil sit along it. */
+  private edgeTools: { source: string; target: string; el: HTMLElement } | null = null;
   /** What arrives from outside: note path -> how many references elsewhere point at it. */
   private incoming = new Map<string, number>();
   /**
@@ -1745,6 +1830,10 @@ export class GraphView {
       if (event.key !== "Escape") return;
       if (this.strip && !this.draftSource) {
         this.closeStrip();
+        return;
+      }
+      if (this.edgeTools && !this.draftSource) {
+        this.closeEdgeTools();
         return;
       }
       if (this.layoutRun) {
@@ -2319,7 +2408,17 @@ export class GraphView {
       // In a vault of attachments every note is a plain note: a click opens the strip of
       // what is attached to it, and the + to attach more.
       if (this.settings.attachMode()) {
-        this.toggleStrip(node.id());
+        this.closeEdgeTools();
+        // A click opens the note: its attachments round it and the +. A click on the open
+        // note is its pencil — the ring folds away and the note's menu opens beside it. The
+        // right button draws an arrow out of the note instead (see `cxttap`).
+        if (this.strip?.host === node.id()) {
+          const at = node.renderedPosition();
+          const box = this.container.getBoundingClientRect();
+          const client = { x: box.left + at.x + (node.renderedWidth() / 2) + 8, y: box.top + at.y - 10 };
+          this.closeStrip();
+          this.handlers.onNodeEdit(node.id(), client);
+        } else this.openStrip(node.id());
         return;
       }
       if (this.openTyped(node, event.position)) return;
@@ -2335,6 +2434,12 @@ export class GraphView {
         this.handlers.onHint("A meeting's arrow — right-click it to name it, or to cut it");
         return;
       }
+      // In a vault of attachments a click on a line opens it as a click on a note does:
+      // everything else dims, and its bin and pencil sit along it.
+      if (this.settings.attachMode()) {
+        this.toggleEdgeTools(edge);
+        return;
+      }
       const label = (edge.data("label") as string | undefined) ?? null;
       this.handlers.onOpenEdge(edge.source().id(), edge.target().id(), label);
     });
@@ -2342,6 +2447,7 @@ export class GraphView {
     cy.on("tap", (event) => {
       if (event.target !== cy) return; // background only
       this.closeStrip();
+      this.closeEdgeTools();
       // "Until you click somewhere": a click on bare canvas is that somewhere. Cytoscape
       // does not call a drag a tap, so letting go of a dragged group never lands here.
       this.clearPicked();
@@ -2397,8 +2503,15 @@ export class GraphView {
       // opens a menu of its own, so this is where a selection's actions are asked for.
       if (node && node.hasClass("picked")) this.handlers.onSelect(this.pickedPaths(), client);
       else if (node && node.data("kind") === "leaf") this.handlers.onLeafMenu(node.id(), client);
-      else if (node && node.data("kind") === "file") this.handlers.onNodeMenu(node.id(), client);
-      else this.handlers.onCanvasMenu({ ...event.position }, client);
+      else if (node && node.data("kind") === "file") {
+        // In a vault of attachments the right button draws an arrow out of the note: click
+        // another note to link the two, empty space to grow a new one there, the note itself
+        // again (or Esc, or the right button) to drop it.
+        if (this.settings.attachMode()) {
+          this.closeEdgeTools();
+          this.startDraft(node);
+        } else this.handlers.onNodeMenu(node.id(), client);
+      } else this.handlers.onCanvasMenu({ ...event.position }, client);
     });
 
     // Keep the arrow's tip under the cursor while a link is being drawn.
@@ -2413,7 +2526,7 @@ export class GraphView {
         return;
       }
       if (this.draftSource || node.data("kind") !== "file") return;
-      if (this.strip) return; // a note is open: its dimming is the only spotlight
+      if (this.strip || this.edgeTools) return; // something is open: its dimming is the only spotlight
       const neighborhood = node.closedNeighborhood();
       cy.elements().difference(neighborhood).addClass("faded");
       if (this.atts.size) this.drawOverlay(); // the tiles on faded notes fade with them
@@ -2490,6 +2603,7 @@ export class GraphView {
       this.drawIncomingBadges();
       this.drawAttachments(); // attachment tiles, folded or round an open note
       this.placeStrip();
+      this.placeEdgeTools();
     });
 
     cy.on("free", "node", () => {
@@ -2844,6 +2958,7 @@ export class GraphView {
       this.drawIncomingBadges();
       this.drawAttachments();
       this.placeStrip();
+      this.placeEdgeTools();
     });
   }
 
@@ -3000,17 +3115,17 @@ export class GraphView {
     return { aconv: pointer };
   }
 
-  /** The mark a connection wears. */
-  edgeMark(source: string, target: string): Mark | null {
-    return this.edgeMarks[edgeId(source, target)] ?? null;
+  /** The look a connection wears — empty when it has none of its own. */
+  edgeLook(source: string, target: string): EdgeLook {
+    return { ...(this.edgeLooks[edgeId(source, target)] ?? {}) };
   }
 
-  /** Sets (or clears) a connection's mark, and keeps it for the next session. */
-  setEdgeMark(source: string, target: string, mark: Mark | null): void {
+  /** Sets a connection's look (an empty one clears it), and keeps it for the next session. */
+  setEdgeLook(source: string, target: string, look: EdgeLook): void {
     const id = edgeId(source, target);
-    if (mark) this.edgeMarks[id] = mark;
-    else delete this.edgeMarks[id];
-    localStorage.setItem(MARKS_KEY, JSON.stringify(this.edgeMarks));
+    if (look.colour || look.dash || look.radiate) this.edgeLooks[id] = { ...look };
+    else delete this.edgeLooks[id];
+    localStorage.setItem(MARKS_KEY, JSON.stringify(this.edgeLooks));
     this.applyMarks();
   }
 
@@ -3025,7 +3140,12 @@ export class GraphView {
     const on = this.settings.enabled("active");
     cy.batch(() => {
       cy.edges().forEach((edge) => {
-        edge.toggleClass("radiate", on && this.edgeMarks[edge.id()] === "radiate");
+        const look = on ? this.edgeLooks[edge.id()] : undefined;
+        edge.toggleClass("radiate", !!look?.radiate);
+        edge.toggleClass("dashed", !!look?.dash && !look.radiate);
+        const colour = look?.colour ? paint(look.colour) : "";
+        if (colour) edge.data("ecol", colour);
+        else edge.removeData("ecol");
       });
     });
     this.syncEdgeBeat();
@@ -3855,8 +3975,13 @@ export class GraphView {
       return;
     }
     const source = this.draftSource;
-    // Not a valid target: folder boxes, self-links, and a leaf. The draft stays armed.
-    if (node.data("kind") !== "file" || node.id() === source) return;
+    // The note it came out of: a change of mind, as Esc is.
+    if (node.id() === source) {
+      this.cancelDraft();
+      return;
+    }
+    // Not a valid target: folder boxes and a leaf. The draft stays armed.
+    if (node.data("kind") !== "file") return;
     this.clearDraft(false);
     if (!source) return;
     this.handlers.onLinkExisting(source, node.id());
@@ -4415,12 +4540,30 @@ export class GraphView {
 
   private attEvents(el: HTMLElement, path: string): void {
     el.addEventListener("mousedown", (event) => event.stopPropagation());
+    // Scrolling over an open ring of more than ATT_RING_MAX tiles turns it, a tile a notch.
+    el.addEventListener(
+      "wheel",
+      (event) => {
+        const att = this.atts.get(path);
+        if (!att || this.strip?.host !== att.host || this.attachmentsOf(att.host).length <= ATT_RING_MAX) return;
+        event.preventDefault();
+        event.stopPropagation();
+        this.ringWheel += event.deltaY;
+        if (Math.abs(this.ringWheel) < 40) return;
+        this.turnRing(Math.sign(this.ringWheel));
+        this.ringWheel = 0;
+      },
+      { passive: false },
+    );
     el.addEventListener("mouseenter", () => this.showTip(el, el.dataset.tip ?? ""));
     el.addEventListener("mouseleave", () => this.hideTip());
     el.addEventListener("click", (event) => {
       event.stopPropagation();
       const att = this.atts.get(path);
-      if (att) this.openAttachment(att);
+      if (!att) return;
+      this.openAttachment(att);
+      // What was being looked for has been found: the ring folds back onto the note.
+      this.closeStrip();
     });
     el.addEventListener("contextmenu", (event) => {
       event.preventDefault();
@@ -4469,13 +4612,18 @@ export class GraphView {
           this.dressAtt(el, att);
           el.classList.toggle("open", open);
           if (ring) {
-            const angle = ring.slot(i + 1);
+            // Past ATT_RING_MAX the ring turns: the window of tiles shown starts at `ringTurn`,
+            // and the rest wait out of sight at the corner until it comes round to them.
+            const j = (((i - this.ringTurn) % list.length) + list.length) % list.length;
+            const hidden = j >= ring.shown;
+            const angle = hidden ? ring.tile(ring.shown) : ring.tile(j);
+            el.style.pointerEvents = hidden ? "none" : "";
             el.style.left = `${at.x + Math.cos(angle) * ring.reach * zoom}px`;
             el.style.top = `${at.y + Math.sin(angle) * ring.reach * zoom}px`;
             el.style.width = `${ring.size}px`;
             el.style.height = `${ring.size}px`;
             el.style.zIndex = "300";
-            el.style.opacity = "";
+            el.style.opacity = hidden ? "0" : "";
             el.style.transform = `translate(-50%, -50%) scale(${zoom})`;
             return;
           }
@@ -4490,11 +4638,28 @@ export class GraphView {
           el.style.top = `${cy}px`;
           el.style.width = `${size}px`;
           el.style.height = `${size}px`;
+          el.style.pointerEvents = "";
           el.style.zIndex = String(100 - i); // the first in front
           el.style.opacity = i >= ATT_STACK ? "0" : node.hasClass("faded") ? "0.3" : "";
           el.style.transform = `translate(-50%, -50%) scale(${zoom})`;
         });
       }
+    }
+    // The tile that turns an open ring: the place after the last attachment shown.
+    const rotate = this.strip?.el.querySelector<HTMLElement>(".ring-rotate");
+    const node = this.strip ? cy?.getElementById(this.strip.host) : null;
+    if (rotate && node && node.nonempty()) {
+      const count = this.attachmentsOf(this.strip!.host).length;
+      const ring = this.ringOf(node as NodeSingular, count);
+      rotate.hidden = count <= ATT_RING_MAX;
+      const at = node.renderedPosition();
+      const zoom = cy!.zoom();
+      const angle = ring.tile(ring.shown);
+      rotate.style.left = `${at.x + Math.cos(angle) * ring.reach * zoom}px`;
+      rotate.style.top = `${at.y + Math.sin(angle) * ring.reach * zoom}px`;
+      rotate.style.width = `${ring.size}px`;
+      rotate.style.height = `${ring.size}px`;
+      rotate.style.transform = `translate(-50%, -50%) scale(${zoom})`;
     }
     for (const [path, el] of this.attEls) {
       if (alive.has(path)) continue;
@@ -4504,22 +4669,54 @@ export class GraphView {
   }
 
   /**
-   * The ring an open note's attachments stand on: `count` tiles and the +, evenly spaced, the
-   * + at the bottom-right (slot 0) and the tiles round from it. Far enough out to clear the
-   * note, and further when there are more tiles than its rim has room for. Everything in
-   * model units — the caller multiplies by the zoom — so zooming never changes the picture.
+   * The ring an open note's attachments stand on. Its bottom-right corner holds the three
+   * tools on the arc — the + in the middle, the pencil above it towards the right, the bin
+   * below it — and the `count` tiles share the rest of the circle evenly. Far enough out to
+   * clear the note, and further when the rim has no room for everything. Everything in model
+   * units — the caller multiplies by the zoom — so zooming never changes the picture.
    */
   private ringOf(
     node: NodeSingular,
     count: number,
-  ): { reach: number; size: number; plus: number; slot: (i: number) => number } {
-    const slots = count + 1;
+  ): { reach: number; size: number; plus: number; shown: number; places: number; tool: (k: -1 | 0 | 1) => number; tile: (j: number) => number } {
     const width = node.width();
-    const size = Math.max(ATT_OPEN_MIN, width * attOpenShare(Math.max(1, count)));
-    const plus = Math.max(ATT_OPEN_MIN * 0.8, size * 0.6);
-    const gap = width * 0.1 + 3;
-    const reach = Math.max(width / 2 + size / 2 + gap, (slots * (size + gap)) / (2 * Math.PI));
-    return { reach, size, plus, slot: (i) => Math.PI / 4 + (i * 2 * Math.PI) / slots };
+    const shown = Math.min(count, ATT_RING_MAX);
+    // Past ATT_RING_MAX one more place, for the tile that turns the ring.
+    const places = shown + (count > ATT_RING_MAX ? 1 : 0);
+    const size = Math.max(ATT_OPEN_MIN, width * attOpenShare(Math.max(1, places)));
+    // The + is one of the tiles: the same size as they are, in proportion to the note.
+    const plus = size;
+    const gap = width * 0.06 + 2;
+    // ONE ring for the + and the tiles. With nothing attached it hugs the note; each tile
+    // opens it out a little (only up to the most it ever holds), and never less than the
+    // tiles need to clear the note and stand side by side.
+    const hug = width / 2 + plus / 2 + Math.max(3, width * 0.06);
+    const grown = hug + width * 0.07 * places;
+    const clear = places ? width / 2 + size / 2 + gap : 0;
+    // The + is one of the places, so everything on the ring is evenly spaced: the + on
+    // the bottom-right corner, and the tiles round from it at the same interval.
+    const slots = places + 1;
+    const fit = (slots * (size + gap)) / (2 * Math.PI);
+    const reach = Math.max(grown, clear, fit);
+    const corner = Math.PI / 4;
+    const step = (2 * Math.PI) / slots;
+    return {
+      reach,
+      size,
+      plus,
+      shown,
+      places,
+      tool: (k) => corner + k * step,
+      tile: (j) => corner + (j + 1) * step,
+    };
+  }
+
+  /** Turns an open note's ring `by` tiles: the next attachments come round, the first go. */
+  private turnRing(by: number): void {
+    this.ringTurn += by;
+    this.hideTip();
+    this.morph();
+    this.drawAttachments();
   }
 
   /** Opens a note's attachments — or folds them, when they are that note's already. */
@@ -4546,23 +4743,77 @@ export class GraphView {
    */
   openStrip(host: string): void {
     if (this.strip) this.dropStrip();
-    const el = document.createElement("button");
-    el.className = "att-plus";
-    el.title = "Attach…";
-    el.textContent = "+";
-    el.addEventListener("mousedown", (event) => event.stopPropagation());
-    el.addEventListener("contextmenu", (event) => event.preventDefault());
-    el.addEventListener("click", (event) => {
+    this.closeEdgeTools();
+    const el = this.toolRow([
+      {
+        label: ICON_PLUS,
+        title: "Attach…",
+        cls: "tool-plus",
+        run: (button) => {
+          const box = button.getBoundingClientRect();
+          this.handlers.onAttachMenu(host, { x: box.right + 4, y: box.top });
+        },
+      },
+    ], [], false);
+    el.classList.add("node-tools");
+    // No button for editing: the open note itself is one (see the node tap), and says so
+    // with a pencil drawn on it that the click goes straight through.
+    const pencil = document.createElement("div");
+    pencil.className = "node-pencil";
+    pencil.innerHTML = ICON_PENCIL;
+    el.appendChild(pencil);
+    // Past ATT_RING_MAX, the place after the last tile shown: a tile of its own that turns
+    // the ring. Placed with the tiles in `drawAttachments`.
+    const rotate = document.createElement("button");
+    rotate.className = "att-badge open ring-rotate";
+    rotate.title = "More attachments";
+    rotate.innerHTML = ICON_ROTATE;
+    rotate.addEventListener("click", (event) => {
       event.stopPropagation();
-      const box = el.getBoundingClientRect();
-      this.handlers.onAttachMenu(host, { x: box.right + 4, y: box.top });
+      this.turnRing(1);
     });
+    el.appendChild(rotate);
     this.overlay.appendChild(el);
     this.strip = { host, el };
+    this.ringTurn = 0;
     this.morph();
     this.dimForStrip();
     this.drawAttachments();
     this.placeStrip();
+  }
+
+  /**
+   * A row of round tools, and after the last one the pencil: a click on it unfolds `chips`
+   * (Style, Rename…) to its right, a second click folds them away. Nothing in it reaches the
+   * canvas underneath — a press here is not the start of a pan or a marquee.
+   */
+  private toolRow(
+    tools: Array<{ label: string; title: string; cls?: string; run: (button: HTMLElement) => void }>,
+    chips: Array<{ label: string; run: (chip: HTMLElement) => void }>,
+    pencil = true,
+  ): HTMLElement {
+    const row = document.createElement("div");
+    row.className = "tool-row";
+    row.addEventListener("mousedown", (event) => event.stopPropagation());
+    row.addEventListener("contextmenu", (event) => event.preventDefault());
+    const add = (parent: HTMLElement, cls: string, label: string, title: string, run: (el: HTMLElement) => void): void => {
+      const button = document.createElement("button");
+      button.className = cls;
+      button.title = title;
+      button.innerHTML = label;
+      button.addEventListener("click", (event) => {
+        event.stopPropagation();
+        run(button);
+      });
+      parent.appendChild(button);
+    };
+    for (const tool of tools) add(row, `tool${tool.cls ? ` ${tool.cls}` : ""}`, tool.label, tool.title, tool.run);
+    if (pencil) add(row, "tool tool-pencil", ICON_PENCIL, "Edit", () => row.classList.toggle("editing"));
+    const tray = document.createElement("div");
+    tray.className = "tool-chips";
+    for (const chip of chips) add(tray, `tool-chip${chip.label === "Delete" ? " tool-danger" : ""}`, chip.label, chip.label, chip.run);
+    row.appendChild(tray);
+    return row;
   }
 
   closeStrip(): void {
@@ -4584,11 +4835,96 @@ export class GraphView {
     this.hideTip();
   }
 
-  /** Everything but the open note, dimmed — the note and what is on it are what is being looked at. */
+  /**
+   * Everything but the open note, dimmed — the note and what is on it are what is being
+   * looked at. An open connection the same, keeping the two notes it joins.
+   */
   private dimForStrip(): void {
-    const node = this.strip ? this.cy?.getElementById(this.strip.host) : null;
+    const cy = this.cy;
+    if (!cy) return;
+    if (this.edgeTools) {
+      const edge = cy.getElementById(edgeId(this.edgeTools.source, this.edgeTools.target));
+      if (edge.nonempty()) cy.elements().difference(edge.union(edge.connectedNodes())).addClass("faded");
+    }
+    const node = this.strip ? cy.getElementById(this.strip.host) : null;
     if (!node || node.empty()) return;
-    this.cy!.elements().difference(node).addClass("faded");
+    cy.elements().difference(node).addClass("faded");
+  }
+
+  /** Opens a connection's tools — or closes them, when they are that connection's already. */
+  private toggleEdgeTools(edge: EdgeSingular): void {
+    const source = edge.source().id();
+    const target = edge.target().id();
+    const open = this.edgeTools;
+    this.closeEdgeTools();
+    if (open && open.source === source && open.target === target) return;
+    this.closeStrip();
+    const el = this.toolRow(
+      [{ label: ICON_BIN, title: "Delete connection", run: () => { this.closeEdgeTools(); this.handlers.onEdgeDelete(source, target); } }],
+      [
+        ...(this.settings.enabled("active")
+          ? [{ label: "Style", run: (chip: HTMLElement) => this.handlers.onEdgeStyle(source, target, toolPoint(chip)) }]
+          : []),
+        {
+          label: "Rename",
+          run: () => {
+            this.closeEdgeTools();
+            this.handlers.onOpenEdge(source, target, (edge.data("label") as string | undefined) ?? null);
+          },
+        },
+      ],
+    );
+    el.classList.add("edge-tools");
+    this.overlay.appendChild(el);
+    this.edgeTools = { source, target, el };
+    this.dimForStrip();
+    this.placeEdgeTools();
+  }
+
+  closeEdgeTools(): void {
+    if (!this.edgeTools) return;
+    this.edgeTools.el.remove();
+    this.edgeTools = null;
+    this.clearSpotlight();
+  }
+
+  /**
+   * The bin and the pencil sit ON the line, side by side along it, centred on its middle.
+   * They ride it through pans, zooms and drags; a line that has gone takes them with it.
+   */
+  private placeEdgeTools(): void {
+    const tools = this.edgeTools;
+    if (!tools || !this.cy) return;
+    const edge = this.cy.getElementById(edgeId(tools.source, tools.target)) as EdgeSingular;
+    if (edge.empty()) {
+      this.closeEdgeTools();
+      return;
+    }
+    const zoom = this.cy.zoom();
+    const size = ATT_OPEN_MIN * 1.1;
+    const mid = edge.renderedMidpoint();
+    const from = edge.source().renderedPosition();
+    const to = edge.target().renderedPosition();
+    const length = Math.hypot(to.x - from.x, to.y - from.y) || 1;
+    const dx = (to.x - from.x) / length;
+    const dy = (to.y - from.y) / length;
+    const step = size * 0.75 * zoom; // half the distance between the two centres
+    const [bin, pencil] = [...tools.el.querySelectorAll<HTMLElement>(".tool")];
+    const put = (el: HTMLElement, x: number, y: number): void => {
+      el.style.left = `${x}px`;
+      el.style.top = `${y}px`;
+      el.style.width = `${size}px`;
+      el.style.height = `${size}px`;
+      el.style.transform = `translate(-50%, -50%) scale(${zoom})`;
+    };
+    // Bin towards the source, pencil towards the target — read the line left to right
+    // and the pencil is always the one on the right, with its chips beyond it.
+    const flip = dx < 0 ? -1 : 1;
+    put(bin, mid.x - dx * step * flip, mid.y - dy * step * flip);
+    put(pencil, mid.x + dx * step * flip, mid.y + dy * step * flip);
+    const tray = tools.el.querySelector<HTMLElement>(".tool-chips")!;
+    tray.style.left = `${mid.x + dx * step * flip + (size / 2) * zoom + 6}px`;
+    tray.style.top = `${mid.y + dy * step * flip}px`;
   }
 
   /** Which note is open, if any. */
@@ -4612,14 +4948,23 @@ export class GraphView {
       node.data("_mute", 1);
       node.style("text-opacity", 0);
     }
-    const angle = ring.slot(0);
+    // The + on the ring's bottom-right; the only button there is.
     const zoom = this.cy!.zoom();
-    strip.el.style.left = `${at.x + Math.cos(angle) * ring.reach * zoom}px`;
-    strip.el.style.top = `${at.y + Math.sin(angle) * ring.reach * zoom}px`;
-    strip.el.style.width = `${ring.plus}px`;
-    strip.el.style.height = `${ring.plus}px`;
-    strip.el.style.fontSize = `${ring.plus * 0.7}px`;
-    strip.el.style.transform = `translate(-50%, -50%) scale(${zoom})`;
+    const plus = strip.el.querySelector<HTMLElement>(".tool-plus")!;
+    const angle = ring.tool(0);
+    plus.style.left = `${at.x + Math.cos(angle) * ring.reach * zoom}px`;
+    plus.style.top = `${at.y + Math.sin(angle) * ring.reach * zoom}px`;
+    plus.style.width = `${ring.plus}px`;
+    plus.style.height = `${ring.plus}px`;
+    plus.style.transform = `translate(-50%, -50%) scale(${zoom})`;
+    // The pencil drawn on the note, a third of it across.
+    const pencil = strip.el.querySelector<HTMLElement>(".node-pencil")!;
+    const mark = node.width() * 0.34;
+    pencil.style.left = `${at.x}px`;
+    pencil.style.top = `${at.y}px`;
+    pencil.style.width = `${mark}px`;
+    pencil.style.height = `${mark}px`;
+    pencil.style.transform = `translate(-50%, -50%) scale(${zoom})`;
   }
 
   /** The label an attachment shows while pointed at: what it is, and what it is called. */
