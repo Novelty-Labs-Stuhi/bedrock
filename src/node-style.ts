@@ -503,3 +503,41 @@ export function showStylePicker(
     },
   );
 }
+
+/**
+ * The same panel for a connection: its colour, a solid or dashed line, and whether it
+ * radiates. Every click is the change, as in a note's.
+ */
+export function showEdgeStylePicker(
+  at: { x: number; y: number },
+  current: { colour?: string; dash?: boolean; radiate?: boolean },
+  onChange: (look: { colour?: string; dash?: boolean; radiate?: boolean }) => void,
+): void {
+  const look = { ...current };
+  const pick = (field: string, value: string, on: boolean, name: string): string =>
+    `<button class="style-pick${on ? " on" : ""}" data-${field}="${value}">${name}</button>`;
+  popover(
+    at,
+    () =>
+      `<div class="style-row"><h5>Colour</h5>` +
+      colours("colour", look.colour ?? "", { title: "The canvas's own" }) +
+      `</div>` +
+      `<div class="style-row"><h5>Line</h5><div class="style-grid">` +
+      pick("dash", "", !look.dash, "Solid") +
+      pick("dash", "1", !!look.dash, "Dashed") +
+      `</div></div>` +
+      `<div class="style-row"><h5>Animation</h5><div class="style-grid">` +
+      pick("radiate", "", !look.radiate, "None") +
+      pick("radiate", "1", !!look.radiate, "Radiate") +
+      `</div></div>`,
+    (data) => {
+      const { colour, dash, radiate } = data;
+      if (colour !== undefined) look.colour = colour || undefined;
+      else if (dash !== undefined) look.dash = !!dash;
+      else if (radiate !== undefined) look.radiate = !!radiate;
+      else return false;
+      onChange({ ...look });
+      return true;
+    },
+  );
+}

@@ -5,6 +5,9 @@ interface FileSystemDirectoryHandle {
   entries(): AsyncIterableIterator<[string, FileSystemHandle]>;
 }
 
+/** One vault in the picker: `edited` is ms since the epoch (0 when unknown), `open` another window has it. */
+type VaultListing = { name: string; root: string; edited: number; open: boolean };
+
 /** A newer Bedrock the shell has downloaded and is holding until a restart. */
 type UpdateInfo = { version: string };
 
@@ -252,6 +255,10 @@ interface Window {
     baseSet(folder: string): Promise<string>;
     /** A path the way a `ref::` line writes it: relative to the Bedrock folder when under it, absolute otherwise. */
     baseRef(full: string): Promise<string>;
+    /** The vaults under the Bedrock folder, most recently opened first. */
+    vaultsList(): Promise<{ base: string; vaults: VaultListing[] }>;
+    /** Makes a vault of that name under the Bedrock folder; resolves with its path. */
+    vaultCreate(name: string): Promise<string>;
     /** Something moved from `from` to `to` (absolute): every `ref::` in the system of vaults
         that pointed at it, or inside it, is repointed. `scopeRoot` is the vault it happened in
         (the system is found from there). Resolves with how many lines, in which files. */

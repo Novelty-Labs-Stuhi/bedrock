@@ -1005,14 +1005,15 @@ button.twisty:hover {
   display: none;
 }
 
-/* The front door: two big answers, splitting the window between them. */
+/* The front door: the vault picker — mark, two cards, and the vaults under the Bedrock folder. */
 #welcome {
   position: absolute;
   inset: 0;
   z-index: 40;
   display: flex;
-  gap: 24px;
-  padding: 18vh 10vw;
+  align-items: center;
+  justify-content: center;
+  padding: 24px 16px;
   background: var(--bg);
 }
 
@@ -1020,32 +1021,158 @@ button.twisty:hover {
   display: none;
 }
 
-.welcome-btn {
-  flex: 1;
+.picker {
+  width: min(440px, 100%);
   display: flex;
   flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  background: var(--bg-side);
 }
 
-.welcome-btn b {
+.picker-brand {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 26px;
+}
+
+.picker-mark {
+  width: 52px;
+  height: 52px;
+  flex: none;
+}
+
+.picker-title {
   font-size: 22px;
   font-weight: 600;
+  color: var(--text-strong);
+  line-height: 1.2;
 }
 
-.welcome-btn small {
+.picker-base {
   color: var(--muted);
-  font-size: 13px;
-  max-width: 26em;
-  line-height: 1.4;
+  font-size: 12px;
+  margin-top: 2px;
 }
 
-.welcome-btn:hover {
+.picker-cards {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-bottom: 28px;
+}
+
+.picker-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px 14px 12px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  text-align: left;
+  background: var(--btn);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.picker-card:hover {
+  background: var(--btn-hover);
+}
+
+.picker-card svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.picker-label {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 0 0 8px;
+}
+
+.picker-search {
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 9px;
+  margin-bottom: 6px;
+  outline: none;
+}
+
+.picker-search::placeholder {
+  color: var(--muted);
+}
+
+.picker-search:focus {
+  border-color: var(--muted);
+}
+
+/* Five rows, then it scrolls — always that tall, so the centred block never jumps. */
+.picker-list {
+  overflow-y: auto;
+  height: calc(5 * 29px);
+  font-size: 13px;
+}
+
+.picker-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  height: 29px;
+  padding: 6px 9px;
+  border-radius: 5px;
+  cursor: default;
+}
+
+.picker-row.on {
   background: var(--bg-hover);
+}
+
+.picker-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.picker-row.on .picker-name {
+  color: var(--text-strong);
+}
+
+.picker-side {
+  color: var(--muted);
+  font-size: 12px;
+  flex: none;
+}
+
+.picker-new .picker-name {
+  color: var(--muted);
+}
+
+.picker-new b {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.picker-empty {
+  color: var(--muted);
+  padding: 6px 9px;
+}
+
+.picker-note {
+  color: var(--accent);
+  font-size: 12px;
+  margin: 8px 9px 0;
+  min-height: 1em;
 }
 
 #float-controls button {
@@ -2130,25 +2257,145 @@ button.issue-id:hover {
     opacity 0.22s ease;
 }
 
-/* The + on an open note's bottom-right. */
-.att-plus {
+/*
+ * The tools of a clicked note (+, bin, pencil in a row from the ring's bottom-right) and of a
+ * clicked connection (bin and pencil along the line). Round, the size the ring gives them,
+ * scaled with the zoom inline by graph.ts. The pencil unfolds its chips to the right.
+ */
+.tool-row {
   position: absolute;
-  padding: 0;
-  border-radius: 50%;
-  border: 0.08em solid rgba(255, 255, 255, 0.55);
-  background: var(--bg-side);
-  color: rgba(255, 255, 255, 0.85);
-  line-height: 1;
-  cursor: pointer;
-  pointer-events: auto;
-  transform: translate(-50%, -50%); /* the zoom's scale is added inline by graph.ts */
   z-index: 300;
+  pointer-events: none;
   animation: att-pop 0.22s ease-out;
 }
 
-.att-plus:hover {
+.node-tools,
+.edge-tools {
+  left: 0;
+  top: 0;
+}
+
+.tool {
+  width: var(--tool, 14px);
+  height: var(--tool, 14px);
+  flex: none;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.55);
+  background: var(--bg-side);
+  color: rgba(255, 255, 255, 0.85);
+  font-size: calc(var(--tool, 14px) * 0.7);
+  line-height: 1;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.tool-row .tool {
+  position: absolute;
+}
+
+.tool:hover,
+.tool-row.editing .tool-pencil {
   border-color: #fff;
   color: #fff;
+}
+
+.tool svg {
+  width: 58%;
+  height: 58%;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.tool-chips {
+  display: none;
+  gap: 4px;
+  pointer-events: auto;
+}
+
+.tool-row.editing .tool-chips {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.tool[hidden],
+.ring-rotate[hidden] {
+  display: none;
+}
+
+/* The pencil drawn on an open note: a mark, not a button — the note takes the click. */
+.node-pencil {
+  position: absolute;
+  pointer-events: none;
+  color: rgba(255, 255, 255, 0.92);
+  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.35));
+}
+
+.node-pencil svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* The tile that turns a full ring: an attachment's tile, wearing a turning arrow. */
+.ring-rotate {
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  color: rgba(255, 255, 255, 0.85);
+  cursor: pointer;
+  pointer-events: auto;
+  z-index: 300;
+}
+
+.ring-rotate svg {
+  width: 55%;
+  height: 55%;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.tool-row .tool-chips {
+  position: absolute;
+  transform: translateY(-50%);
+}
+
+.tool-chip {
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  background: var(--bg-side);
+  color: #e6e6e6;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.tool-chip:hover {
+  border-color: #fff;
+  color: #fff;
+}
+
+.tool-chip.tool-danger:hover {
+  border-color: #f85149;
+  color: #f85149;
 }
 
 @keyframes att-pop {

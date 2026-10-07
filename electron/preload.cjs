@@ -105,6 +105,9 @@ contextBridge.exposeInMainWorld("bedrock", {
   baseGet: () => ipcRenderer.invoke("base-get"),
   baseSet: (folder) => ipcRenderer.invoke("base-set", folder),
   baseRef: (full) => ipcRenderer.invoke("base-ref", full),
+  // The vault picker's list (the vaults under that folder) and its "New vault".
+  vaultsList: () => ipcRenderer.invoke("vaults-list"),
+  vaultCreate: (name) => ipcRenderer.invoke("vault-create", name),
   // Something moved: repoint every `ref::` in the system of vaults that aimed at `from` (or
   // inside it) to `to`. `onRefsChanged` is the other end, in the windows whose files changed.
   refsRetarget: (from, to, scopeRoot) => ipcRenderer.invoke("refs-retarget", from, to, scopeRoot),
