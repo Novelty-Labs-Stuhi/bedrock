@@ -2660,6 +2660,7 @@ export class GraphView {
     });
 
     cy.on("drag", "node", (event) => {
+      this.endMorph();
       this.mergeStep(event.target as NodeSingular, event.position);
       this.carryGroup();
       this.drawPulses(); // a note's own ring stays under the cursor with it
@@ -2720,6 +2721,7 @@ export class GraphView {
     cy.on("pan zoom", () => {
       // A pan/zoom the app did itself (fit) must not count as the user taking over the view.
       if (!this.fitting) this.userMoved = true;
+      this.endMorph();
       this.drawOverlay();
       this.followRename();
       this.followConnection();
@@ -4833,6 +4835,17 @@ export class GraphView {
   }
 
   private morphTimer: number | undefined;
+
+  /**
+   * The glide is between two places ON SCREEN — so a pan, zoom or drag mid-glide would
+   * leave the tiles chasing where the map was, a beat behind it. The map moving ends the
+   * glide: the tiles take their places at once and ride the map from there.
+   */
+  private endMorph(): void {
+    if (!this.overlay.classList.contains("att-morph")) return;
+    window.clearTimeout(this.morphTimer);
+    this.overlay.classList.remove("att-morph");
+  }
 
   /**
    * Opens a note: its attachments come out round it, the + for another sits on its
