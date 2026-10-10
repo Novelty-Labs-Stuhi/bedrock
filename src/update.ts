@@ -1,9 +1,10 @@
 /**
- * The plaque in the corner when a newer Bedrock has been downloaded. Nothing shows for
- * the check or the download — the shell does both on its own — only for the one moment
- * there is something to do: restart now, or not. "Later" folds the plaque away for this
- * version and the update installs itself when the app next quits anyway, so declining
- * costs nothing and the plaque never has to nag.
+ * The plaque in the bottom-left corner when there is a newer Bedrock. It comes up as soon
+ * as the shell finds one — "downloading", with how far it has got — and turns into the one
+ * moment there is something to do: restart now, or not. "Later" folds the plaque away for
+ * this version and the update installs itself when the app next quits anyway, so declining
+ * costs nothing and the plaque never has to nag. Above the vault picker, which is what a
+ * window opens on, so a launch is where it is seen.
  *
  * Anchored to the window, not the sidebar: the sidebar folds to a rail and is gone in
  * graph mode, and a plaque that moved with it would be a plaque that vanished with it.
@@ -15,14 +16,28 @@ export function mountUpdates(host: HTMLElement): void {
   /** The version whose plaque was closed with "Later" — shown again only for a newer one. */
   let declined: string | null = null;
 
-  const show = (info: UpdateInfo): void => {
-    if (!info || info.version === declined) return;
-    host.innerHTML =
-      `<span class="update-word">Bedrock ${escapeHtml(info.version)} is ready</span>` +
-      `<button type="button" class="update-go">Restart now</button>` +
-      `<button type="button" class="update-later" title="It installs when Bedrock next quits">Later</button>`;
+  const show = (info: UpdateInfo | null): void => {
+    if (!info || info.version === declined) {
+      host.classList.remove("open");
+      return;
+    }
+    const version = escapeHtml(info.version);
     host.dataset.version = info.version;
     host.classList.add("open");
+    if (!info.ready) {
+      host.innerHTML =
+        `<span class="update-dot"></span>` +
+        `<span class="update-word">Bedrock ${version} is downloading… ${info.percent}%</span>`;
+      return;
+    }
+    // Ready: built once, so a click on Restart now is not undone by a repeat of the message.
+    if (host.dataset.ready === info.version) return;
+    host.dataset.ready = info.version;
+    host.innerHTML =
+      `<span class="update-dot ready"></span>` +
+      `<span class="update-word">Bedrock ${version} is ready</span>` +
+      `<button type="button" class="update-go">Restart now</button>` +
+      `<button type="button" class="update-later" title="It installs when Bedrock next quits">Later</button>`;
   };
 
   host.addEventListener("click", (event) => {
@@ -42,9 +57,9 @@ export function mountUpdates(host: HTMLElement): void {
     host.classList.remove("open");
   });
 
-  bridge.onUpdateReady(show);
-  // This window may have opened after the download finished and the message went out.
-  void bridge.updateStatus().then((info) => info && show(info)).catch(() => undefined);
+  bridge.onUpdateState(show);
+  // This window may have opened after the update was found and the message went out.
+  void bridge.updateStatus().then(show).catch(() => undefined);
 }
 
 const escapeHtml = (text: string): string =>
