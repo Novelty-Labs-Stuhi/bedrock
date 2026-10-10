@@ -29,7 +29,18 @@ export type MenuItem = {
    * label or hint. The children are still loaded once, when the row opens — typing only
    * narrows them. Enter takes the highlighted row; ↑↓ move it.
    */
-  search?: { placeholder?: string; limit?: number };
+  search?: {
+    placeholder?: string;
+    limit?: number;
+    /** Rows that stand ABOVE the type box, never searched — "New Notion page", say. */
+    top?: MenuItem[];
+    /**
+     * Asked again as you type, once typing pauses: a service's own best matches for the
+     * words, which replace the local narrowing when they land. The loaded children are
+     * then only what shows before anything is typed — the recent ones.
+     */
+    remote?: (query: string) => Promise<MenuItem[]>;
+  };
   /** Drawn dimmer and to the right — a date, a folder, whatever tells two rows apart. */
   hint?: string;
   /** Unselectable: a heading, a "nothing here" line, or a list still loading. */
@@ -152,7 +163,18 @@ function fillSearch(
   // matches whatever is typed; only the real rows are searched.
   const fixed = items.filter((one) => one.inert);
   const searchable = items.filter((one) => !one.inert);
+  // Filled twice when the rows come from somewhere else — "Loading…", then the rows — and
+  // whatever was typed in between must survive the second filling.
+  const before = box.querySelector<HTMLInputElement>("input.menu-search")?.value ?? "";
   box.innerHTML = "";
+  for (const one of search.top ?? []) {
+    box.appendChild(
+      row(one, () => {
+        closeMenu();
+        one.run?.();
+      }),
+    );
+  }
   const input = document.createElement("input");
   input.className = "menu-search";
   input.type = "text";
@@ -164,22 +186,31 @@ function fillSearch(
 
   let shown: MenuItem[] = [];
   let active = 0;
+  // The service's answer for the words now in the box — null while none has landed for them.
+  let found: { query: string; rows: MenuItem[] } | null = null;
+  let asking = "";
+  let failed = "";
+  let timer = 0;
   // The highlight moves without rebuilding the rows: a rebuilt row under the pointer fires
   // mouseenter again, and that was a loop that ate every click and keystroke.
   const highlight = (): void => {
     [...list.children].forEach((el, index) => el.classList.toggle("branch-open", index === active && index < shown.length));
   };
   const paint = (): void => {
-    const query = input.value.trim().toLowerCase();
+    const typed = input.value.trim();
+    const query = typed.toLowerCase();
     // Names first; a folder only counts once the names have run out, so typing a word
     // that happens to be in every folder does not leave the list standing still.
     const byName = query ? searchable.filter((one) => one.label.toLowerCase().includes(query)) : searchable;
     const byHint = query ? searchable.filter((one) => !byName.includes(one) && (one.hint ?? "").toLowerCase().includes(query)) : [];
-    const matches = byName.concat(byHint);
+    // The service's own matches, once they are in, win over the narrowing of the recent.
+    const remote = query && found?.query === typed ? found.rows : null;
+    const matches = remote ?? byName.concat(byHint);
     shown = matches.slice(0, limit);
     active = Math.min(active, Math.max(0, shown.length - 1));
     list.innerHTML = "";
-    if (!shown.length) {
+    const waiting = !!query && !!search.remote && asking === typed;
+    if (!shown.length && !waiting && (query || !fixed.length)) {
       list.appendChild(row({ label: query ? "nothing matches" : "nothing here", inert: true }, () => {}));
     }
     shown.forEach((item, index) => {
@@ -198,12 +229,39 @@ function fillSearch(
     if (matches.length > shown.length) {
       list.appendChild(row({ label: `${shown.length} of ${matches.length} — keep typing`, inert: true }, () => {}));
     }
+    if (waiting) list.appendChild(row({ label: "searching…", inert: true }, () => {}));
+    if (failed && query) list.appendChild(row({ label: failed, inert: true }, () => {}));
     for (const one of fixed) list.appendChild(row(one, () => {}));
     onPainted();
   };
+  const ask = (typed: string): void => {
+    const remote = search.remote;
+    if (!remote || !typed) return;
+    asking = typed;
+    void remote(typed).then(
+      (rows) => {
+        if (input.value.trim() !== typed) return; // typed past it; a later answer is coming
+        found = { query: typed, rows };
+        asking = "";
+        failed = "";
+        paint();
+      },
+      (err: unknown) => {
+        if (input.value.trim() !== typed) return;
+        asking = "";
+        failed = (err as Error)?.message || String(err);
+        paint();
+      },
+    );
+  };
   input.oninput = () => {
     active = 0;
+    window.clearTimeout(timer);
+    const typed = input.value.trim();
+    asking = search.remote && typed ? typed : "";
     paint();
+    // A pause, not every keystroke: a service is asked about words, not letters.
+    if (asking) timer = window.setTimeout(() => ask(typed), 300);
   };
   input.onkeydown = (event) => {
     event.stopPropagation(); // the graph's own shortcuts stay out of this
@@ -222,6 +280,11 @@ function fillSearch(
       picked.run?.();
     }
   };
+  input.value = before;
+  if (before && search.remote) {
+    asking = before.trim();
+    ask(asking);
+  }
   paint();
   input.focus();
 }
@@ -255,8 +318,10 @@ async function openBranch(
     return;
   }
   // A list from somewhere else: say so, then replace it in place. Sized and positioned
-  // while it says "Loading…" too, so the panel does not jump once the answer lands.
-  fill(box, [{ label: "Loading…", inert: true }], depth + 1, token);
+  // while it says "Loading…" too, so the panel does not jump once the answer lands. A
+  // searched branch is usable at once — its top rows and its box — while the rest loads.
+  if (item.search) fillSearch(box, [{ label: "Loading…", inert: true }], item.search, anchor);
+  else fill(box, [{ label: "Loading…", inert: true }], depth + 1, token);
   anchor();
   let loaded: MenuItem[];
   try {

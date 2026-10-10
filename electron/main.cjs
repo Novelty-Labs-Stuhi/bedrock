@@ -648,11 +648,20 @@ ipcMain.handle("vault-create", (_event, rawName) => {
 
 ipcMain.handle("base-ref", (_event, full) => refForm(path.resolve(expandHome(String(full)))));
 
+/** Whether a picked path is a folder — what decides the tile a pointer to it wears. */
+ipcMain.handle("fs-is-dir", (_event, rawPath) => {
+  try {
+    return fs.statSync(String(rawPath || "")).isDirectory();
+  } catch {
+    return false;
+  }
+});
+
 ipcMain.handle("fs-pick", async (event, kind, options = {}) => {
   // A test hook: with BEDROCK_PICK_FOLDER set, every folder sheet answers with that folder
   // and never opens. The OS's dialog cannot be driven over the debugging port, and the
   // flows behind it (Move into…, Open Vault…) can.
-  if (kind === "folder" && process.env.BEDROCK_PICK_FOLDER) return process.env.BEDROCK_PICK_FOLDER;
+  if ((kind === "folder" || kind === "any") && process.env.BEDROCK_PICK_FOLDER) return process.env.BEDROCK_PICK_FOLDER;
   const win = BrowserWindow.fromWebContents(event.sender);
   const result = await dialog.showOpenDialog(win, {
     properties:
@@ -660,7 +669,10 @@ ipcMain.handle("fs-pick", async (event, kind, options = {}) => {
         ? // `createDirectory` puts the New Folder button in the macOS sheet; Windows'
           // folder picker has one of its own without being asked.
           ["openDirectory", "createDirectory"]
-        : ["openFile"],
+        : kind === "any"
+          ? // A file or a folder, whichever is picked — macOS lets one sheet take both.
+            ["openFile", "openDirectory"]
+          : ["openFile"],
     // Where the sheet opens: where the caller says — and for a folder with no say, the
     // Bedrock folder, so a fresh install's first sheet already stands where vaults go and
     // its New Folder button makes one.
@@ -1582,6 +1594,8 @@ ipcMain.handle("slack-connect", async (_event, rawToken) => {
   if (!token) throw new Error("no token given");
   if (!/^xox[bp]-/.test(token)) throw new Error("that is not a Slack token — one starts with xoxp- (you) or xoxb- (the app)");
   const who = await slackFetch(token, "auth.test", {});
+  slackNoSearch = false; // a new token may be allowed what the old one was not
+  slackHistory = null;
   const account = {
     team: String(who.team || ""),
     teamId: String(who.team_id || ""),
@@ -1657,6 +1671,134 @@ ipcMain.handle("slack-threads", async (_event, rawChannel, rawLimit) => {
     .slice(0, limit)
     .map((message) => slackThreadRow(account, channel, message));
 });
+
+/**
+ * The channel's latest messages, answered or not — any message can be where a thread
+ * starts — by the last thing said under them, newest first.
+ */
+ipcMain.handle("slack-recent", async (_event, rawChannel, rawLimit) => {
+  const account = readSlack();
+  if (!account) throw new Error("Slack is not connected");
+  const channel = String(rawChannel || "");
+  const limit = Math.max(1, Math.min(Number(rawLimit) || 30, 100));
+  const latestIn = async (id, count) => {
+    const page = await slackFetch(account.token, "conversations.history", { channel: id, limit: count });
+    return (page.messages || [])
+      .filter((message) => !message.subtype && slackPlain(message.text))
+      .map((message) => slackThreadRow(account, id, message));
+  };
+  if (/^[CG][A-Z0-9]+$/.test(channel)) {
+    return (await latestIn(channel, 100)).sort((a, b) => b.latest - a.latest).slice(0, limit);
+  }
+  // No channel chosen: the few latest of every channel you are in, merged. Slack says
+  // nothing about which channels are busiest, so each is asked — a few at a time, and
+  // only so many, because history is rate-limited per workspace.
+  const mine = await slackFetch(account.token, "users.conversations", {
+    types: "public_channel,private_channel",
+    exclude_archived: true,
+    limit: 200,
+  });
+  const names = new Map((mine.channels || []).map((one) => [String(one.id), String(one.name || "")]));
+  const ids = [...names.keys()].slice(0, 30);
+  const found = [];
+  for (let i = 0; i < ids.length; i += 6) {
+    const batch = await Promise.all(ids.slice(i, i + 6).map((id) => latestIn(id, 5).catch(() => [])));
+    for (const rows of batch) found.push(...rows.map((row) => ({ ...row, place: `#${names.get(row.channel)}` })));
+  }
+  return found.sort((a, b) => b.latest - a.latest).slice(0, limit);
+});
+
+/**
+ * Slack's own search, best match first, across every channel the person is in. Only a
+ * user token with `search:read` may search — a bot token never can — so that refusal is
+ * worded as what to do. A hit that is a reply stands for its whole thread.
+ */
+ipcMain.handle("slack-search", async (_event, rawQuery) => {
+  const account = readSlack();
+  if (!account) throw new Error("Slack is not connected");
+  const query = String(rawQuery || "").trim();
+  if (!query) return [];
+  let body;
+  if (!slackNoSearch) {
+    try {
+      body = await slackFetch(account.token, "search.messages", { query, count: 20, sort: "score" });
+    } catch (err) {
+      if (!/scope|not_allowed_token_type/.test(String(err.message))) throw err;
+      slackNoSearch = true; // a token that may not search will not be allowed next keystroke either
+    }
+  }
+  if (!body) return slackHistorySearch(account, query);
+  const seen = new Set();
+  const out = [];
+  for (const match of (body.messages && body.messages.matches) || []) {
+    const channel = String((match.channel && match.channel.id) || "");
+    if (!/^[CGD][A-Z0-9]+$/.test(channel)) continue;
+    const link = parseSlackLink(String(match.permalink || ""));
+    const ts = (link && link.ts) || String(match.ts || "");
+    if (!ts || seen.has(`${channel}/${ts}`)) continue;
+    seen.add(`${channel}/${ts}`);
+    out.push({
+      ...slackThreadRow(account, channel, { ...match, ts, reply_count: 0 }),
+      text: slackPlain(match.text),
+      place: match.channel && match.channel.name ? `#${match.channel.name}` : "",
+    });
+  }
+  return out;
+});
+
+/** Set once Slack has refused `search.messages` to this token; cleared by a new token. */
+let slackNoSearch = false;
+/** The channels' recent history, read once for a burst of typing. */
+let slackHistory = null;
+const SLACK_HISTORY_TTL = 2 * 60 * 1000;
+
+/**
+ * Search without Slack's search: the last 200 messages of every channel you are in, read
+ * once and kept for a couple of minutes, matched against every word typed. It cannot see
+ * further back than that — Slack's own search (a user token with search:read) can.
+ */
+async function slackHistorySearch(account, query) {
+  if (!slackHistory || Date.now() - slackHistory.at > SLACK_HISTORY_TTL) {
+    const mine = await slackFetch(account.token, "users.conversations", {
+      types: "public_channel,private_channel",
+      exclude_archived: true,
+      limit: 200,
+    });
+    const names = new Map((mine.channels || []).map((one) => [String(one.id), String(one.name || "")]));
+    const ids = [...names.keys()].slice(0, 40);
+    const rows = [];
+    for (let i = 0; i < ids.length; i += 6) {
+      const batch = await Promise.all(
+        ids.slice(i, i + 6).map((id) =>
+          slackFetch(account.token, "conversations.history", { channel: id, limit: 200 })
+            .then((page) =>
+              (page.messages || [])
+                .filter((message) => !message.subtype && slackPlain(message.text))
+                .map((message) => ({ ...slackThreadRow(account, id, message), place: `#${names.get(id)}` })),
+            )
+            .catch(() => []),
+        ),
+      );
+      for (const found of batch) rows.push(...found);
+    }
+    slackHistory = { at: Date.now(), rows };
+  }
+  const phrase = query.toLowerCase();
+  const words = phrase.split(/\s+/).filter(Boolean);
+  const place = (row) => `${row.text} ${row.place}`.toLowerCase();
+  return slackHistory.rows
+    .filter((row) => words.every((word) => place(row).includes(word)))
+    // The words together, as typed, before the words merely all there; then the busiest
+    // threads; then the latest.
+    .sort(
+      (a, b) =>
+        Number(b.text.toLowerCase().includes(phrase)) - Number(a.text.toLowerCase().includes(phrase)) ||
+        Number(b.text.toLowerCase().startsWith(phrase)) - Number(a.text.toLowerCase().startsWith(phrase)) ||
+        b.replies - a.replies ||
+        b.latest - a.latest,
+    )
+    .slice(0, 20);
+}
 
 /** One thread, by the pair that names it — what a pasted link comes down to. */
 ipcMain.handle("slack-thread", async (_event, rawChannel, rawTs) => {
@@ -2990,6 +3132,228 @@ ipcMain.handle("notes-open", async (_event, rawId) => {
   } catch (err) {
     throw notesError(err);
   }
+});
+
+/*
+ * Reminders and Calendar. Both have scripting dictionaries, so like Notes there is
+ * nothing to install — one Automation Allow per app. Bedrock only MAKES a blank one,
+ * titled after the note, and hands it to the app's own window to be finished there: the
+ * date, the alarm, the invitees are Apple's UI, not ours. What crosses back is the id.
+ */
+const REMINDERS_APP = "/System/Applications/Reminders.app";
+const CALENDAR_APP = "/System/Applications/Calendar.app";
+
+/** The open reminders of every list, latest edit first — three Apple events per list. */
+const REMINDERS_LIST = `
+const R = Application("Reminders");
+const out = [];
+for (const list of R.lists()) {
+  const name = list.name();
+  const open = list.reminders.whose({ completed: false });
+  const ids = open.id(), names = open.name(), dates = open.modificationDate();
+  for (let i = 0; i < ids.length; i++) {
+    out.push({ id: String(ids[i]), title: String(names[i] || ""), list: name, at: dates[i] instanceof Date ? dates[i].getTime() : 0 });
+  }
+}
+out.sort((a, b) => b.at - a.at);
+JSON.stringify(out.slice(0, 200));`;
+
+/** The list and title arrive as argv. "" is Reminders' own default list — where a
+    reminder made anywhere else on the Mac would land; a named list is made if missing. */
+const REMINDERS_CREATE = `
+function run(argv) {
+  const listName = String(argv[0] || "");
+  const title = String(argv[1] || "Untitled");
+  const R = Application("Reminders");
+  let target = listName ? null : R.defaultList();
+  if (!target) {
+    for (const list of R.lists()) {
+      if (list.name() === listName) { target = list; break; }
+    }
+  }
+  if (!target) {
+    target = R.List({ name: listName });
+    R.lists.push(target);
+  }
+  const reminder = R.Reminder({ name: title });
+  target.reminders.push(reminder);
+  return JSON.stringify({ id: String(reminder.id()), title: String(reminder.name()), list: target.name(), at: Date.now() });
+}`;
+
+const REMINDERS_LISTS = `JSON.stringify(Application("Reminders").lists.name());`;
+
+/** Selected in its list with the title ready to type into — Reminders' own edit mode. */
+const REMINDERS_SHOW = `
+function run(argv) {
+  const R = Application("Reminders");
+  const reminder = R.reminders.byId(String(argv[0]));
+  reminder.name(); // throws here, worded, when the reminder is gone
+  R.activate();
+  R.show(reminder);
+  return "ok";
+}`;
+
+/** Calendars nobody writes into by hand, left out of every list Bedrock shows. */
+const CALENDAR_SKIP = ["Birthdays", "Siri Suggestions", "Scheduled Reminders"];
+
+/** The next fortnight, every calendar. Slow (seconds) on a big iCloud account, and a
+    repeating event shows only on its first date — Calendar's dictionary sees masters. */
+const CALENDAR_UPCOMING = `
+function run(argv) {
+  const skip = JSON.parse(argv[0]);
+  const C = Application("Calendar");
+  const now = new Date(), until = new Date(now.getTime() + 14 * 864e5);
+  const out = [];
+  for (const cal of C.calendars()) {
+    const name = cal.name();
+    if (skip.indexOf(name) >= 0) continue;
+    const hit = cal.events.whose({ _and: [{ startDate: { _greaterThan: now } }, { startDate: { _lessThan: until } }] });
+    const uids = hit.uid(), titles = hit.summary(), starts = hit.startDate();
+    for (let i = 0; i < uids.length; i++) {
+      out.push({ id: String(uids[i]), title: String(titles[i] || ""), calendar: name, at: starts[i] instanceof Date ? starts[i].getTime() : 0 });
+    }
+  }
+  out.sort((a, b) => a.at - b.at);
+  return JSON.stringify(out.slice(0, 200));
+}`;
+
+/** The calendars a new event could go in: writable, and not one of the skipped. */
+const CALENDAR_CALENDARS = `
+function run(argv) {
+  const skip = JSON.parse(argv[0]);
+  const names = [];
+  for (const cal of Application("Calendar").calendars()) {
+    let writable = false;
+    try { writable = cal.writable(); } catch (e) {}
+    const name = cal.name();
+    if (writable && skip.indexOf(name) < 0 && names.indexOf(name) < 0) names.push(name);
+  }
+  return JSON.stringify(names);
+}`;
+
+/**
+ * A one-hour event at the next half hour — a placeholder the edit popover opens on, so
+ * the real time is set where times are set. "" means the first writable calendar.
+ */
+const CALENDAR_CREATE = `
+function run(argv) {
+  const calName = String(argv[0] || "");
+  const title = String(argv[1] || "Untitled");
+  const skip = JSON.parse(argv[2]);
+  const C = Application("Calendar");
+  let target = null;
+  let first = null;
+  for (const cal of C.calendars()) {
+    let writable = false;
+    try { writable = cal.writable(); } catch (e) {}
+    if (!writable) continue;
+    const name = cal.name();
+    if (name === calName) { target = cal; break; }
+    if (!first && skip.indexOf(name) < 0) first = cal;
+  }
+  target = target || first;
+  if (!target) throw new Error("no calendar here can be written to");
+  const start = new Date();
+  start.setSeconds(0, 0);
+  start.setMinutes(start.getMinutes() < 30 ? 30 : 60);
+  const end = new Date(start.getTime() + 3600e3);
+  const event = C.Event({ summary: title, startDate: start, endDate: end });
+  target.events.push(event);
+  return JSON.stringify({ id: String(event.uid()), title, calendar: target.name(), at: start.getTime() });
+}`;
+
+/** The same refusal as Notes', addressed to whichever app it was. */
+function automationError(err, app) {
+  const said = String((err && err.message) || err);
+  if (said.includes("-1743") || /not authori[sz]ed/i.test(said)) {
+    return new Error(
+      `macOS is keeping Bedrock away from ${app} — System Settings → Privacy & Security → Automation → Bedrock → ${app}`,
+    );
+  }
+  return new Error(said.replace(/^.*execution error: /, "").trim() || `${app} did not answer`);
+}
+
+const jxa = (script, ...args) => command("osascript", ["-l", "JavaScript", "-e", script, ...args]);
+
+ipcMain.handle("reminders-status", () => ({
+  app: process.platform === "darwin" && fs.existsSync(REMINDERS_APP),
+}));
+
+ipcMain.handle("reminders-list", async (_event, limit = 40) => {
+  try {
+    return JSON.parse((await jxa(REMINDERS_LIST)) || "[]").slice(0, Math.max(1, Number(limit) || 40));
+  } catch (err) {
+    throw automationError(err, "Reminders");
+  }
+});
+
+ipcMain.handle("reminders-create", async (_event, rawList, rawTitle) => {
+  const list = String(rawList ?? "").trim();
+  const title = String(rawTitle ?? "").trim() || "Untitled";
+  try {
+    return JSON.parse(await jxa(REMINDERS_CREATE, list, title));
+  } catch (err) {
+    throw automationError(err, "Reminders");
+  }
+});
+
+ipcMain.handle("reminders-lists", async () => {
+  try {
+    return JSON.parse((await jxa(REMINDERS_LISTS)) || "[]");
+  } catch (err) {
+    throw automationError(err, "Reminders");
+  }
+});
+
+ipcMain.handle("reminders-open", async (_event, rawId) => {
+  const id = String(rawId || "");
+  if (!id.startsWith("x-apple-reminder://")) return false;
+  try {
+    await jxa(REMINDERS_SHOW, id);
+    return true;
+  } catch (err) {
+    throw automationError(err, "Reminders");
+  }
+});
+
+ipcMain.handle("calendar-status", () => ({
+  app: process.platform === "darwin" && fs.existsSync(CALENDAR_APP),
+}));
+
+ipcMain.handle("calendar-upcoming", async (_event, limit = 40) => {
+  try {
+    const raw = await jxa(CALENDAR_UPCOMING, JSON.stringify(CALENDAR_SKIP));
+    return JSON.parse(raw || "[]").slice(0, Math.max(1, Number(limit) || 40));
+  } catch (err) {
+    throw automationError(err, "Calendar");
+  }
+});
+
+ipcMain.handle("calendar-calendars", async () => {
+  try {
+    return JSON.parse((await jxa(CALENDAR_CALENDARS, JSON.stringify(CALENDAR_SKIP))) || "[]");
+  } catch (err) {
+    throw automationError(err, "Calendar");
+  }
+});
+
+ipcMain.handle("calendar-create", async (_event, rawCalendar, rawTitle) => {
+  const calendar = String(rawCalendar ?? "").trim();
+  const title = String(rawTitle ?? "").trim() || "Untitled";
+  try {
+    return JSON.parse(await jxa(CALENDAR_CREATE, calendar, title, JSON.stringify(CALENDAR_SKIP)));
+  } catch (err) {
+    throw automationError(err, "Calendar");
+  }
+});
+
+/** `show` in Calendar's dictionary only highlights the event; this address opens its
+    edit popover — the one place an event's time, place and invitees are set. */
+ipcMain.handle("calendar-open", (_event, rawId) => {
+  const uid = String(rawId || "");
+  if (!/^[\w.@:+-]+$/.test(uid)) return false;
+  void shell.openExternal(`ical://ekevent/${encodeURIComponent(uid)}?method=show&options=more`);
+  return true;
 });
 
 /*

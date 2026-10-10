@@ -28,7 +28,10 @@ interface Window {
     gitStatus(root: string): Promise<GitStatus>;
     /** The OS's own picker; a folder pick can create the folder right in the dialog.
         Null when the dialog was dismissed. `defaultPath` is where the sheet opens. */
-    pickPath(kind: "file" | "folder", options?: PickOptions): Promise<string | null>;
+    /** `any` takes a file or a folder, whichever is picked. */
+    pickPath(kind: "file" | "folder" | "any", options?: PickOptions): Promise<string | null>;
+    /** Whether a path on the disk is a folder. */
+    isDir(path: string): Promise<boolean>;
     /** Opens a path the OS way — default app for a file, Finder/Explorer for a folder.
         Resolves "opened", "missing", or whatever the OS said went wrong. */
     openPath(target: string): Promise<string>;
@@ -120,6 +123,10 @@ interface Window {
     slackChannels(): Promise<Array<{ id: string; name: string; member: boolean; private: boolean }>>;
     /** The threads going in a channel — its answered messages, newest first. */
     slackThreads(channel: string, limit?: number): Promise<SlackThread[]>;
+    /** The channel's latest messages, answered or not, by last activity. */
+    slackRecent(channel: string, limit?: number): Promise<SlackThread[]>;
+    /** Slack's own search, best match first — needs a user token with search:read. */
+    slackSearch(query: string): Promise<SlackThread[]>;
     /** One thread, by the channel and timestamp that name it — what a pasted link comes to. */
     slackThread(channel: string, ts: string): Promise<SlackThread>;
     /** Starts a thread: posts `text` as its first message, and resolves with the thread. */
@@ -180,6 +187,28 @@ interface Window {
     notesFolders(): Promise<string[]>;
     /** Opens THE note, in Apple Notes. False for a malformed id. */
     notesOpen(id: string): Promise<boolean>;
+
+    /** Whether Reminders is on this Mac; permission is macOS's to say on first use. */
+    remindersStatus(): Promise<{ app: boolean }>;
+    /** The open reminders of every list, latest edit first. */
+    remindersList(limit?: number): Promise<AppleReminder[]>;
+    /** Makes a reminder titled `title` in the named list ("" means Reminders' default list), making a named list if missing. */
+    remindersCreate(list: string, title: string): Promise<AppleReminder>;
+    /** The lists a new reminder could land in. */
+    remindersLists(): Promise<string[]>;
+    /** Shows THE reminder in Reminders, selected. False for a malformed id. */
+    remindersOpen(id: string): Promise<boolean>;
+
+    /** Whether Calendar is on this Mac. */
+    calendarStatus(): Promise<{ app: boolean }>;
+    /** The next fortnight's events, soonest first — seconds on a big account. */
+    calendarUpcoming(limit?: number): Promise<CalendarEvent[]>;
+    /** The writable calendars a new event could go in. */
+    calendarCalendars(): Promise<string[]>;
+    /** A one-hour placeholder at the next half hour in the named calendar ("" = the first writable). */
+    calendarCreate(calendar: string, title: string): Promise<CalendarEvent>;
+    /** Opens THE event in Calendar's edit popover. False for a malformed id. */
+    calendarOpen(id: string): Promise<boolean>;
 
     /** Links a Notion workspace: OAuth in the real browser, the token into the OS
         keychain. Resolves once the browser comes back; rejects if it never does. */
@@ -284,6 +313,26 @@ interface Window {
   };
 }
 
+/** A reminder as the pointer Bedrock keeps. */
+type AppleReminder = {
+  /** `x-apple-reminder://…` — what `show` opens. */
+  id: string;
+  title: string;
+  list: string;
+  /** Last edit, epoch milliseconds. */
+  at: number;
+};
+
+/** A calendar event as the pointer Bedrock keeps. */
+type CalendarEvent = {
+  /** The event's uid — what `ical://ekevent/<uid>` opens. */
+  id: string;
+  title: string;
+  calendar: string;
+  /** Start, epoch milliseconds. */
+  at: number;
+};
+
 /** An Apple note as the pointer Bedrock keeps: never the note itself. */
 type AppleNote = {
   /** The CoreData id Apple minted (`x-coredata://…`) — what `show` opens. */
@@ -317,6 +366,8 @@ type SlackThread = {
   latest: number;
   /** The thread's permalink — what the note keeps, and what a click opens. */
   url: string;
+  /** Where a search found it — `#channel` — when it came from a search. */
+  place?: string;
 };
 
 /** A Google task as the pointer Bedrock keeps: the title, the due date and the tick stay
