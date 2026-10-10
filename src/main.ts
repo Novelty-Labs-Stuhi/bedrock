@@ -7213,6 +7213,7 @@ const SETTINGS_ICONS: Partial<Record<Feature, string>> = {
   antigravity: TYPE_ICONS.antigravity,
   word: TYPE_ICONS.word,
   freeform: TYPE_ICONS.freeform,
+  files: TYPE_ICONS.folder,
   // GitHub has no tile on the canvas, so it gets a plain one: a branch, on the dark tile.
   git:
     "data:image/svg+xml;utf8," +

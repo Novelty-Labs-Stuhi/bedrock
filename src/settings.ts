@@ -709,6 +709,7 @@ const INTEGRATIONS: Row[] = [
   { feature: "antigravity", name: "Antigravity" },
   { feature: "word", name: "Word" },
   { feature: "freeform", name: "Freeform" },
+  { feature: "files", name: "Files & folders" },
   { feature: "git", name: "GitHub" },
 ];
 
@@ -782,18 +783,20 @@ const setupLine = (feature: Feature, line: SetupLine): string =>
  * An integration: its tile, its name, where it stands, and its page folded underneath —
  * the header is the whole hit area for folding. A page is drawn only while it is open.
  */
-const integrationRow = (row: Row, icon: string | undefined, page: SetupPage | null, open: boolean): string =>
-  `<div class="setup${open ? " open" : ""}">` +
-  `<div class="setup-head" data-fold="${row.feature}">` +
+const integrationRow = (row: Row, icon: string | undefined, page: SetupPage | null, open: boolean): string => {
+  // Nothing to set, nothing to fold: the row only says the integration is there.
+  const folds = !!page && page.lines.length > 0;
+  return (
+  `<div class="setup${open && folds ? " open" : ""}">` +
+  `<div class="setup-head"${folds ? ` data-fold="${row.feature}"` : ` style="cursor: default"`}>` +
   (icon ? `<img class="setup-icon" src="${icon}" alt="" />` : `<span class="setup-icon"></span>`) +
   `<span class="setup-name"><b>${row.name}</b></span>` +
-  (page
-    ? `<span class="setup-status${page.ready ? " ready" : ""}">${escapeHtml(page.status)}</span>`
-    : "") +
-  `<span class="setup-fold">${open ? "⌄" : "›"}</span>` +
+  (folds ? `<span class="setup-fold">${open ? "⌄" : "›"}</span>` : "") +
   `</div>` +
-  (open && page ? `<div class="setup-body">${page.lines.map((l) => setupLine(row.feature, l)).join("")}</div>` : "") +
-  `</div>`;
+  (open && folds ? `<div class="setup-body">${page.lines.map((l) => setupLine(row.feature, l)).join("")}</div>` : "") +
+  `</div>`
+  );
+};
 
 /** A titled row of swatches in the General tab. */
 const lookRow = (title: string, _note: string, body: string): string =>
