@@ -2392,729 +2392,229 @@ async function setUpLinear(): Promise<void> {
 function integrationPage(feature: Feature): SetupPage | null {
   const bridge = window.bedrock;
   const setup = settings.setup();
+  if (!bridge) return { status: "Desktop app only", lines: [] };
+  const pick = (id: string, chosen: boolean): { id: string; label: string } => ({ id, label: chosen ? "Change…" : "Choose…" });
+  const forget = (line: SetupLine[], id: string): void => {
+    line.push({ label: "", value: "", action: { id, label: "Use default" } });
+  };
   switch (feature) {
-    case "linear": {
-      if (!bridge) {
-        return {
-          status: "desktop app only",
-          lines: [
-            {
-              label: "Why",
-              value: "the API needs a key, and a browser tab has neither a keychain to hold one nor a way past Linear's CORS. Ticks still work — they stay in the notes.",
-            },
+    case "claude": {
+      const folder = settings.claudeFolder();
+      const inTerminal = setup.claudeWindow === "terminal";
+      const lines: SetupLine[] = [
+        {
+          label: "Open in",
+          value: "",
+          choices: [
+            { id: "run-app", label: "Claude app", on: !inTerminal },
+            { id: "run-terminal", label: "Terminal", on: inTerminal },
           ],
-        };
-      }
-      if (!linearUser) {
+        },
+        { label: "Folder", value: folder || "Ask each time", action: pick("folder", !!folder) },
+      ];
+      if (folder) forget(lines, "forget");
+      if (inTerminal && !claudeCli) lines.push({ label: "CLI", value: "Not installed" });
+      const status = inTerminal && !claudeCli ? "CLI needed" : folder ? basename(folder) || folder : "Ready";
+      return { status, ready: !inTerminal || !!claudeCli, lines };
+    }
+
+    case "notion": {
+      const linked = notionState?.linked ?? false;
+      const workspace = notionState?.workspace ?? "";
+      return {
+        status: linked ? workspace || "Signed in" : "Not signed in",
+        ready: linked,
+        lines: [
+          {
+            label: "Workspace",
+            value: notionWord || (linked ? workspace || "Signed in" : "Not signed in"),
+            action: linked ? { id: "unlink", label: "Sign out" } : { id: "connect", label: "Sign in…" },
+          },
+        ],
+      };
+    }
+
+    case "slack": {
+      if (!slackState?.connected) {
         return {
-          status: "not connected",
-          lines: [
-            {
-              label: "API key",
-              value: "not connected — ticks stay in the notes and nothing is pushed",
-              action: { id: "connect", label: "Connect…" },
-            },
-            {
-              label: "Where to get one",
-              value: "linear.app → Settings → Security & access → Personal API keys. It is kept in this machine's keychain, never in the vault.",
-            },
-          ],
+          status: "Not connected",
+          lines: [{ label: "Token", value: "Not connected", action: { id: "connect", label: "Connect…" } }],
         };
       }
       return {
-        status: setup.linearTeamName || "connected",
+        status: slackState.team || "Connected",
         ready: true,
         lines: [
           {
-            label: "Account",
-            value: linearUser,
+            label: "Workspace",
+            value: `${slackState.team || "Connected"}${slackState.user ? ` · ${slackState.user}` : ""}`,
             action: { id: "connect", label: "Disconnect" },
           },
           {
-            label: "Team",
-            value: setup.linearTeamName || "not chosen — issues go to the first team this key can see",
-            action: { id: "team", label: setup.linearTeam ? "Change…" : "Choose…" },
+            label: "Channel",
+            value: setup.slackChannelName || "Ask each time",
+            action: pick("channel", !!setup.slackChannel),
           },
+        ],
+      };
+    }
+
+    case "granola": {
+      const linked = granolaState?.linked ?? false;
+      const account = granolaState?.workspace ?? "";
+      return {
+        status: linked ? account || "Signed in" : "Not signed in",
+        ready: linked,
+        lines: [
           {
-            label: "Project",
-            value: setup.linearProjectName || "none — issues go straight to the team",
-            action: { id: "project", label: setup.linearProject ? "Change…" : "Choose…" },
-          },
-          {
-            label: "What is pushed",
-            value: "a new issue note, each checklist row under it as a sub-issue, and every tick's state. Nothing is ever read back — the notes are the truth.",
+            label: "Account",
+            value: granolaWord || (linked ? account || "Signed in" : "Not signed in"),
+            action: linked ? { id: "unlink", label: "Sign out" } : { id: "connect", label: "Sign in…" },
           },
         ],
       };
     }
 
     case "google": {
-      if (!bridge) {
-        return {
-          status: "desktop app only",
-          lines: [
-            {
-              label: "Why",
-              value: "the sign-in window and the keychain the tokens live in are the shell's — npm start",
-            },
-          ],
-        };
-      }
       const linked = googleState?.linked ?? false;
       const email = googleState?.email ?? "";
       const lines: SetupLine[] = [
         {
-          label: "What this is",
-          value:
-            "task notes — notes that point at Google Tasks, the checkbox items on your Google Calendar. Bedrock keeps the pointer; the title, the date and the tick live with Google, and a click opens the task there.",
-        },
-        {
           label: "Account",
-          value: googleWord
-            ? googleWord
-            : linked
-              ? `linked${email ? ` — ${email}` : ""}. Unlinking forgets the tokens; notes keep their task links.`
-              : "not linked yet. Linking opens Google in your browser to ask you — the tokens land in the OS keychain, never the vault.",
-          action: { id: "connect", label: linked ? "Unlink" : "Link…" },
+          value: googleWord || (linked ? email || "Signed in" : "Not signed in"),
+          action: { id: "connect", label: linked ? "Sign out" : "Sign in…" },
         },
       ];
       if (linked) {
+        lines.push({ label: "List", value: setup.googleListName || "My Tasks", action: pick("list", !!setup.googleList) });
+      }
+      if (googleState?.ownClient || googleState?.builtClient === false) {
         lines.push({
-          label: "List",
-          value: setup.googleListName || "My Tasks — the account's default list",
-          action: { id: "list", label: setup.googleList ? "Change…" : "Choose…" },
+          label: "OAuth client",
+          value: googleState?.ownClient ? "Your own" : "None",
+          action:
+            googleState?.ownClient && googleState.builtClient
+              ? { id: "client", label: "Use Bedrock's" }
+              : { id: "client", label: "Change…" },
         });
       }
-      lines.push(
-        {
-          label: "What is checked",
-          value: `every ${TASK_POLL_MINUTES} minutes, on the clock, each open task note asks Google whether it is done. A finished task gets a done:: line and a tick on its tile, and is never asked about again.`,
-        },
-        {
-          label: "Client",
-          value: googleState?.ownClient
-            ? `your own Google Cloud OAuth client.${googleState.builtClient ? " Going back to Bedrock's unlinks the account." : ""}`
-            : googleState?.builtClient === false
-              ? "none — this build was made without Bedrock's client (a clone built without the secret has none). Linking needs a Desktop-app client from your own Google Cloud project."
-              : "Bedrock's own — the consent screen says Bedrock. To wear your own name there instead, use a Desktop-app client from your own Google Cloud project.",
-          action:
-            googleState?.ownClient && !googleState.builtClient
-              ? { id: "client", label: "Change…" }
-              : { id: "client", label: googleState?.ownClient ? "Use Bedrock's" : "Use my own…" },
-        },
-      );
-      const status = !googleState ? "not read yet" : linked ? email || "linked" : "not linked";
-      return { status, ready: linked, lines };
+      return { status: linked ? email || "Signed in" : "Not signed in", ready: linked, lines };
     }
 
-    case "slack": {
-      if (!bridge) {
+    case "calendar":
+    case "reminders": {
+      const app = feature === "reminders" ? "Reminders" : "Calendar";
+      const state = feature === "reminders" ? remindersState : calendarState;
+      if (state && !state.app) return { status: `No ${app} here`, lines: [] };
+      const chosen = feature === "reminders" ? setup.remindersList : setup.calendarName;
+      const lines: SetupLine[] = [
+        {
+          label: feature === "reminders" ? "List" : "Calendar",
+          value: chosen || "Default",
+          action: pick(feature === "reminders" ? "list" : "calendar", !!chosen),
+        },
+      ];
+      if (chosen) forget(lines, "reset");
+      return { status: chosen || "Ready", ready: true, lines };
+    }
+
+    case "applenotes": {
+      if (appleNotesState && !appleNotesState.app) return { status: "No Notes here", lines: [] };
+      const folder = setup.notesFolder;
+      const lines: SetupLine[] = [{ label: "Folder", value: folder || NOTES_DEFAULT_FOLDER, action: pick("folder", !!folder) }];
+      if (folder) forget(lines, "reset");
+      return { status: folder || "Ready", ready: true, lines };
+    }
+
+    case "linear": {
+      if (!linearUser) {
         return {
-          status: "desktop app only",
-          lines: [
-            {
-              label: "Why",
-              value: "the API needs a token, and a browser tab has neither a keychain to hold one nor a way past Slack's CORS.",
-            },
-          ],
-        };
-      }
-      if (!slackState?.connected) {
-        return {
-          status: "not connected",
-          lines: [
-            {
-              label: "Token",
-              value: "not connected — no thread can be started or attached",
-              action: { id: "connect", label: "Connect…" },
-            },
-            {
-              label: "Where to get one",
-              value:
-                "api.slack.com/apps → Create New App → OAuth & Permissions. Under USER Token Scopes add chat:write, channels:history and channels:read (plus groups:history and groups:read for private channels), Install to Workspace, and copy the User OAuth Token (xoxp-…). Posts made with it are yours — your name, your face, no app in the channel. A bot token (xoxb-…) works too, and posts as the app.",
-            },
-          ],
+          status: "Not connected",
+          lines: [{ label: "API key", value: "Not connected", action: { id: "connect", label: "Connect…" } }],
         };
       }
       return {
-        status: setup.slackChannelName || "connected",
+        status: setup.linearTeamName || "Connected",
         ready: true,
         lines: [
-          {
-            label: "Workspace",
-            value: `${slackState.team || "connected"}${slackState.user ? ` — posting as ${slackState.user}` : ""}${slackState.bot ? " (the app, not you — a user token would post as you)" : ""}`,
-            action: { id: "connect", label: "Disconnect" },
-          },
-          {
-            label: "Channel",
-            value:
-              setup.slackChannelName ||
-              "not chosen — a new thread asks which channel, and the recent messages come from every channel you are in",
-            action: { id: "channel", label: setup.slackChannel ? "Change…" : "Choose…" },
-          },
-          {
-            label: "What is posted",
-            value:
-              "a new thread note's name, as the first message of a thread in that channel — and nothing else, ever. Attaching a thread that is already going posts nothing: the note takes the head of its first message for a name.",
-          },
+          { label: "Account", value: linearUser, action: { id: "connect", label: "Disconnect" } },
+          { label: "Team", value: setup.linearTeamName || "First team", action: pick("team", !!setup.linearTeam) },
+          { label: "Project", value: setup.linearProjectName || "None", action: pick("project", !!setup.linearProject) },
         ],
       };
     }
 
-    case "claude": {
-      if (!bridge) return { status: "desktop app only", lines: [{ label: "Why", value: "sessions open through the Claude app, which a browser tab cannot reach — npm start" }] };
-      const folder = settings.claudeFolder();
-      const inTerminal = setup.claudeWindow === "terminal";
-      const lines: SetupLine[] = [
-        {
-          label: "Run sessions in",
-          value: "",
-          choices: [
-            { id: "run-app", label: "The Claude app", on: !inTerminal },
-            { id: "run-terminal", label: "A terminal here", on: inTerminal },
-          ],
-        },
-        {
-          label: "Sign-in",
-          value: inTerminal
-            ? claudeAccount?.email
-              ? `the CLI's own login — ${claudeAccount.email}` +
-                (claudeAccount.org ? ` (${claudeAccount.org}` : "") +
-                (claudeAccount.org && claudeAccount.seat ? `, ${claudeAccount.seat}` : "") +
-                (claudeAccount.org ? ")" : "") +
-                ". Separate from the Claude app's, so the two can be different accounts — `/login` in a session changes this one."
-              : "the CLI's own login, which is separate from the Claude app's"
-            : "none — the Claude app is already signed in as you. Bedrock never sees a token.",
-        },
-      ];
-      if (inTerminal) {
-        lines.push(
-          {
-            label: "The CLI",
-            value: claudeCli
-              ? `${claudeCli} — sessions run in your own terminal, not in a window here`
-              : "not installed. Sessions are run by Claude Code's own CLI, so it has to be here: see claude.com/product/claude-code.",
-          },
-          {
-            label: "How it behaves",
-            value: "the node opens the session in whichever terminal owns .command files — Terminal, iTerm or Ghostty. The session is not Bedrock's process, so quitting Bedrock does nothing to it.",
-          },
-          {
-            label: "In the Claude app",
-            value: "a terminal session writes the ordinary transcript, so it can still be opened in the app later — switch this back and click the node.",
-          },
-        );
-      } else {
-        lines.push({
-          label: "How it behaves",
-          value: "the node opens the session in the Claude app's own window, which owns it from then on",
-        });
-      }
-      lines.push({
-        label: "Default folder",
-        value: folder || "not set — every new session note asks where to run",
-        action: { id: "folder", label: folder ? "Change…" : "Choose…" },
-      });
-      if (folder) {
-        lines.push({
-          label: "",
-          value: "go back to asking for each new session",
-          action: { id: "forget", label: "Forget it" },
-        });
-      }
-      const status = inTerminal
-        ? claudeCli
-          ? "your terminal"
-          : "claude CLI needed"
-        : folder
-          ? basename(folder) || folder
-          : "asks each time";
-      return { status, ready: !inTerminal || !!claudeCli, lines };
-    }
-
     case "antigravity": {
-      if (!bridge) {
-        return {
-          status: "desktop app only",
-          lines: [
-            {
-              label: "Why",
-              value: "sessions run the `agy` CLI in your own terminal, and a browser tab can start neither — npm start",
-            },
-          ],
-        };
-      }
+      if (!agyCli) return { status: "CLI not installed", lines: [] };
       const folder = settings.antigravityFolder();
-      if (!agyCli) {
-        return {
-          status: "agy not installed",
-          lines: [
-            {
-              label: "The CLI",
-              value: agyRan
-                ? "not on the path Bedrock can see. It has run on this machine before, so it is probably installed somewhere a login shell finds and this app does not — check `which agy`."
-                : "not installed. Sessions are run by Antigravity's own CLI, so it has to be here: see antigravity.google/docs/cli.",
-            },
-            {
-              label: "Why a CLI",
-              value: "so the agent is genuinely outside Bedrock — it keeps working when this app is shut, and its login is its own",
-            },
-          ],
-        };
-      }
-      const lines: SetupLine[] = [
-        {
-          label: "The CLI",
-          value: `${agyCli} — sessions run in your own terminal, not in a window here`,
-        },
-        {
-          label: "Sign-in",
-          value:
-            "the CLI's own, held in this machine's keychain. Bedrock never reads it and has no sign-in of its own to offer: a session that needs a login asks for one in the terminal, where it can be answered.",
-        },
-        {
-          label: "How it behaves",
-          value:
-            "the node mints a conversation, writes its id into the note, and opens it in whichever terminal owns .command files — Terminal, iTerm or Ghostty. Closing that window is between you and the CLI; Bedrock is not involved either way.",
-        },
-        {
-          label: "Reopening a node",
-          value: "resumes THAT conversation by id, with its history — never a new one, and never a guess at which",
-        },
-        {
-          label: "Default folder",
-          value: folder || "not set — every new session note asks where to run",
-          action: { id: "folder", label: folder ? "Change…" : "Choose…" },
-        },
-      ];
-      if (folder) {
-        lines.push({
-          label: "",
-          value: "go back to asking for each new session",
-          action: { id: "forget", label: "Forget it" },
-        });
-      }
-      return { status: folder ? basename(folder) || folder : "asks each time", ready: true, lines };
-    }
-
-    /*
-     * The one page whose subject changes constantly underneath it — every note saved is a
-     * file changed — so almost every line here is read off `gitState` rather than written.
-     * The status pill answers "is there anything to do?", which for git is the only useful
-     * reading of "is this working?": connected but three commits behind is not working.
-     */
-    case "git": {
-      if (!bridge) return { status: "desktop app only", lines: [{ label: "Why", value: "there is no git in a browser tab — npm start" }] };
-      const remote = setup.gitRemote;
-      const repo = gitState;
-      const root = knownVaultRoot();
-      if (repo && !repo.installed) {
-        return {
-          status: "no git here",
-          lines: [
-            {
-              label: "git",
-              value:
-                "not installed on this machine. On a Mac, xcode-select --install gets it; " +
-                "everywhere else, git-scm.com. Nothing else on this page works until it is there.",
-            },
-          ],
-        };
-      }
-      const lines: SetupLine[] = [];
-      lines.push({
-        label: "Vault folder",
-        value: root || `not known yet — every git action here needs to know where "${vault.name}" is on disk`,
-        action: { id: "folder", label: root ? "Change…" : "Choose…" },
-      });
-      if (root) {
-        lines.push({
-          label: "Repository",
-          value: gitTrouble
-            ? `${gitTrouble} — the folder above is where this vault is remembered as living, and ` +
-              "nothing here can work until it points at the right one"
-            : !repo
-              ? "not read yet"
-              : !repo.repo
-                ? "none in that folder yet — the first commit initialises one"
-                : `on ${repo.branch || "no branch yet"}, ` +
-                  (repo.changes
-                    ? `${repo.changes} file${repo.changes === 1 ? "" : "s"} changed since the last commit`
-                    : "everything committed"),
-        });
-      }
-      if (repo?.repo && repo.lastCommit) lines.push({ label: "Last commit", value: repo.lastCommit });
-      if (repo?.repo && !repo.identity) {
-        lines.push({
-          label: "Who commits",
-          value:
-            "git has no name or email on this machine, and refuses to commit without one. " +
-            'Run git config --global user.name "…" and user.email "…" once, in a terminal.',
-        });
-      }
-      lines.push({
-        label: "Commit",
-        value: "stages everything in the vault's folder and commits it, initialising a repository the first time",
-        action: { id: "commit", label: "Commit" },
-      });
-      lines.push({
-        label: "Remote",
-        value: remote || "none yet — set a GitHub URL to push to",
-        action: { id: "remote", label: remote ? "Change" : "Set" },
-      });
-      lines.push({
-        label: "Push",
-        value: !remote
-          ? "set a remote first; then this pushes your commits to it"
-          : repo?.upstream && repo.behind
-            ? `the remote is ${repo.behind} commit${repo.behind === 1 ? "" : "s"} ahead of this vault — ` +
-              "pull those in first or this is refused"
-            : "sends your commits to the remote, over the git already set up on this machine — no token lives in the vault",
-        action: { id: "push", label: "Push" },
-      });
-      lines.push({
-        label: "Pull",
-        value: !remote
-          ? "and this brings the remote's commits back down, once there is a remote"
-          : "brings the remote's commits down and replays yours on top. Uncommitted work is " +
-            "refused and a clash is abandoned, so this never leaves the vault half-changed.",
-        action: { id: "pull", label: "Pull" },
-      });
-      // Signing in is git's own business and cannot be checked without attempting a push,
-      // so the page says where that lives rather than pretending to know.
-      lines.push({
-        label: "Signing in",
-        value:
-          "whoever this machine's git already is — an ssh key or a credential helper. " +
-          "Bedrock keeps no token, so a push that is refused is answered outside the app, once.",
-      });
-      const status = gitTrouble
-        ? "folder is not there"
-        : !repo
-          ? root
-            ? "not read yet"
-            : "folder unknown"
-          : !repo.repo
-          ? "no repository yet"
-          : !repo.identity
-            ? "git has no identity"
-            : repo.changes
-              ? `${repo.changes} to commit`
-              : !remote
-                ? "local snapshots"
-                : repo.upstream && repo.behind
-                  ? `${repo.behind} behind`
-                  : repo.ahead
-                    ? `${repo.ahead} to push`
-                    : repo.upstream
-                      ? "pushed"
-                      : "committed";
-      // Green means the vault and the remote hold the same thing — which a repository that
-      // has a remote but has never pushed to it does not, however tidy it looks locally.
-      const ready = Boolean(
-        repo?.repo && repo.identity && !repo.changes && remote && repo.upstream && !repo.ahead && !repo.behind,
-      );
-      return { status, ready, lines };
-    }
-
-    case "freeform": {
-      if (!bridge) {
-        return {
-          status: "desktop app only",
-          lines: [
-            {
-              label: "Why",
-              value: "boards are opened and made through the Mac's own Shortcuts and URL scheme, which a browser tab cannot reach — npm start",
-            },
-          ],
-        };
-      }
-      if (freeformState && !freeformState.app) {
-        return {
-          status: "no Freeform here",
-          lines: [
-            {
-              label: "Freeform",
-              value: "not on this Mac. It comes with macOS 13 and later, and nothing here can work without it.",
-            },
-          ],
-        };
-      }
-      const has = freeformState?.shortcut ?? false;
-      const lines: SetupLine[] = [
-        {
-          label: "What this is",
-          value:
-            "notes that point at Freeform boards. Bedrock keeps only the pointer — a board's id and name — and the boards stay Freeform's own, in iCloud. Nothing is hosted here.",
-        },
-        {
-          label: "Shortcut",
-          value: has
-            ? `“${FREEFORM_SHORTCUT}” is in your Shortcuts library — making a board runs it`
-            : "Apple's one door into making a board is the Shortcuts app, so Bedrock ships a signed shortcut. Installing opens it there — a single Add Shortcut click, which Apple keeps for you on purpose.",
-          ...(has ? {} : { action: { id: "install", label: "Install…" } }),
-        },
-        {
-          label: "Try it",
-          value:
-            freeformWord ||
-            (has
-              ? "makes a real board called “Bedrock connected” and opens it — proof the whole road works"
-              : "install the shortcut first; then this makes a real board and opens it"),
-          ...(has ? { action: { id: "test", label: "Try it" } } : {}),
-        },
-      ];
-      const status = !freeformState
-        ? "not read yet"
-        : !has
-          ? "shortcut needed"
-          : settings.enabled("freeform")
-            ? "ready"
-            : "try it";
-      return { status, ready: has, lines };
-    }
-
-    case "notion": {
-      if (!bridge) {
-        return {
-          status: "desktop app only",
-          lines: [
-            {
-              label: "Why",
-              value: "the OAuth window and the keychain the token lives in are the shell's — npm start",
-            },
-          ],
-        };
-      }
-      const linked = notionState?.linked ?? false;
-      const workspace = notionState?.workspace ?? "";
-      const lines: SetupLine[] = [
-        {
-          label: "What this is",
-          value:
-            "page notes — notes that point at Notion pages. Bedrock keeps only the pointer (the page's own link), and the pages stay in Notion. A click opens the page where it lives.",
-        },
-        {
-          label: "Workspace",
-          value: notionWord
-            ? notionWord
-            : linked
-              ? `linked${workspace ? ` — ${workspace}` : ""}. Unlinking forgets the token; notes keep their page links.`
-              : "not linked yet. Linking opens Notion in your browser to ask you — the token lands in the OS keychain, never the vault.",
-          action: linked ? { id: "unlink", label: "Unlink" } : { id: "connect", label: "Link…" },
-        },
-        {
-          label: "How it talks",
-          value:
-            "over Notion's own MCP server (mcp.notion.com) — the door Notion built for AI apps, with nothing installed here and no API key to paste.",
-        },
-      ];
-      const status = !notionState ? "not read yet" : linked ? workspace || "linked" : "not linked";
-      return { status, ready: linked, lines };
-    }
-
-    case "granola": {
-      if (!bridge) {
-        return {
-          status: "desktop app only",
-          lines: [
-            {
-              label: "Why",
-              value: "the OAuth window and the keychain the token lives in are the shell's — npm start",
-            },
-          ],
-        };
-      }
-      const linked = granolaState?.linked ?? false;
-      const account = granolaState?.workspace ?? "";
-      const lines: SetupLine[] = [
-        {
-          label: "What this is",
-          value:
-            "meeting notes — notes that point at meetings Granola took notes of. Attaching one copies its summarised notes into the note here, so the words are on the canvas; a click opens the meeting in Granola. Nothing is made in Granola from here.",
-        },
-        {
-          label: "Account",
-          value: granolaWord
-            ? granolaWord
-            : linked
-              ? `linked${account ? ` — ${account}` : ""}. Unlinking forgets the token; notes keep their copies.`
-              : "not linked yet. Linking opens Granola in your browser to ask you — the token lands in the OS keychain, never the vault.",
-          action: linked ? { id: "unlink", label: "Unlink" } : { id: "connect", label: "Link…" },
-        },
-        {
-          label: "How it talks",
-          value:
-            "over Granola's own MCP server (mcp.granola.ai) — the same door Notion opened, with nothing installed here and no API key to paste.",
-        },
-      ];
-      const status = !granolaState ? "not read yet" : linked ? account || "linked" : "not linked";
-      return { status, ready: linked, lines };
-    }
-
-    case "applenotes": {
-      if (!bridge) {
-        return {
-          status: "desktop app only",
-          lines: [
-            {
-              label: "Why",
-              value: "notes are listed, made and opened through the Mac's own scripting door, which a browser tab cannot reach — npm start",
-            },
-          ],
-        };
-      }
-      if (appleNotesState && !appleNotesState.app) {
-        return {
-          status: "no Notes here",
-          lines: [
-            {
-              label: "Apple Notes",
-              value: "not on this Mac, and nothing here can work without it.",
-            },
-          ],
-        };
-      }
-      const on = settings.enabled("applenotes");
-      const notesFolder = setup.notesFolder;
-      const lines: SetupLine[] = [
-        {
-          label: "What this is",
-          value:
-            "notes that point at notes in Apple Notes. Bedrock keeps only the pointer — a note's id and name — and the notes stay Apple's own, in iCloud. Nothing is hosted here.",
-        },
-        {
-          label: "Permission",
-          value:
-            "unlike Freeform there is nothing to install: Notes answers to scripting directly. The first real action makes macOS ask whether Bedrock may drive Notes — one Allow click, which the OS remembers (and keeps under System Settings → Privacy & Security → Automation).",
-        },
-        {
-          label: "New notes land in",
-          value: notesFolder || `“${NOTES_DEFAULT_FOLDER}” — its own folder in Notes, made when first needed`,
-          action: { id: "folder", label: notesFolder ? "Change…" : "Choose…" },
-        },
-      ];
-      if (notesFolder) {
-        lines.push({
-          label: "",
-          value: `go back to the default, “${NOTES_DEFAULT_FOLDER}”`,
-          action: { id: "reset", label: "Forget it" },
-        });
-      }
-      lines.push({
-        label: "Try it",
-        value:
-          appleNotesWord ||
-          "makes a real note called “Bedrock connected” and opens it — proof the whole road works",
-        action: { id: "test", label: "Try it" },
-      });
-      const status = !appleNotesState ? "not read yet" : on ? "ready" : "try it";
-      return { status, ready: on, lines };
-    }
-
-    case "reminders":
-    case "calendar": {
-      const app = feature === "reminders" ? "Reminders" : "Calendar";
-      if (!bridge) {
-        return {
-          status: "desktop app only",
-          lines: [{ label: "Why", value: `${app} is driven through the Mac's own scripting door, which a browser tab cannot reach — npm start` }],
-        };
-      }
-      const state = feature === "reminders" ? remindersState : calendarState;
-      if (state && !state.app) {
-        return { status: `no ${app} here`, lines: [{ label: app, value: "not on this Mac, and nothing here can work without it." }] };
-      }
-      const on = settings.enabled(feature);
-      const chosen = feature === "reminders" ? setup.remindersList : setup.calendarName;
-      const word = feature === "reminders" ? remindersWord : calendarWord;
-      const lines: SetupLine[] = [
-        {
-          label: "What this is",
-          value:
-            feature === "reminders"
-              ? "reminders attached to a note. Bedrock makes a blank one titled after the note and shows it in Reminders — the date, the alarm and the rest are set there. Bedrock keeps only its id."
-              : "events attached to a note. Bedrock makes a one-hour placeholder at the next half hour, titled after the note, and opens it in Calendar's own editor — the real time, place and invitees are set there. Bedrock keeps only its id.",
-        },
-        {
-          label: "Permission",
-          value: `nothing to install: ${app} answers to scripting directly. The first real action makes macOS ask whether Bedrock may drive ${app} — one Allow click, kept under System Settings → Privacy & Security → Automation.`,
-        },
-        {
-          label: feature === "reminders" ? "New reminders go in" : "New events go in",
-          value:
-            chosen ||
-            (feature === "reminders" ? "Reminders' own default list" : "the first calendar that can be written to"),
-          action: { id: feature === "reminders" ? "list" : "calendar", label: chosen ? "Change…" : "Choose…" },
-        },
-      ];
-      if (chosen) lines.push({ label: "", value: "go back to the default", action: { id: "reset", label: "Forget it" } });
-      lines.push({
-        label: "Try it",
-        value:
-          word ||
-          (feature === "reminders"
-            ? "makes a real reminder called “Bedrock connected” and shows it — proof the whole road works"
-            : "makes a real event called “Bedrock connected” at the next half hour and opens it — proof the whole road works"),
-        action: { id: "test", label: "Try it" },
-      });
-      const status = !state ? "not read yet" : on ? "ready" : "try it";
-      return { status, ready: on, lines };
+      const lines: SetupLine[] = [{ label: "Folder", value: folder || "Ask each time", action: pick("folder", !!folder) }];
+      if (folder) forget(lines, "forget");
+      return { status: folder ? basename(folder) || folder : "Ready", ready: true, lines };
     }
 
     case "word": {
-      if (!bridge) {
-        return {
-          status: "desktop app only",
-          lines: [
-            {
-              label: "Why",
-              value: "documents are made and opened through the Mac's own scripting door, which a browser tab cannot reach — npm start",
-            },
-          ],
-        };
-      }
-      if (wordState && !wordState.app) {
-        return {
-          status: "no Word here",
-          lines: [
-            {
-              label: "Word",
-              value: "not on this Mac — it is Microsoft's app, not the system's, and nothing here can work without it.",
-            },
-          ],
-        };
-      }
-      const on = settings.enabled("word");
+      if (wordState && !wordState.app) return { status: "No Word here", lines: [] };
       const folder = setup.wordFolder;
+      const lines: SetupLine[] = [{ label: "Folder", value: folder || WORD_DEFAULT_FOLDER, action: pick("folder", !!folder) }];
+      if (folder) forget(lines, "reset");
+      return { status: "Ready", ready: true, lines };
+    }
+
+    case "freeform": {
+      if (freeformState && !freeformState.app) return { status: "No Freeform here", lines: [] };
+      const has = freeformState?.shortcut ?? false;
+      return {
+        status: has ? "Ready" : "Shortcut needed",
+        ready: has,
+        lines: has ? [] : [{ label: "Shortcut", value: "Not installed", action: { id: "install", label: "Install…" } }],
+      };
+    }
+
+    case "git": {
+      const remote = setup.gitRemote;
+      const repo = gitState;
+      const root = knownVaultRoot();
+      if (repo && !repo.installed) return { status: "git not installed", lines: [] };
       const lines: SetupLine[] = [
+        { label: "Folder", value: root || "Unknown", action: pick("folder", !!root) },
+        { label: "Remote", value: remote || "None", action: { id: "remote", label: remote ? "Change…" : "Set…" } },
         {
-          label: "What this is",
-          value:
-            "document notes — notes that point at Word files on this disk. A click opens the document in Word; the note keeps only the pointer (the file's path), and the file is yours like any other.",
-        },
-        {
-          label: "New documents land in",
-          value: folder || `${WORD_DEFAULT_FOLDER} — made when it is first needed`,
-          action: { id: "folder", label: folder ? "Change…" : "Choose…" },
+          label: "Sync",
+          value: gitTrouble
+            ? gitTrouble
+            : !repo?.repo
+              ? "No repository yet"
+              : repo.changes
+                ? `${repo.changes} changed`
+                : repo.behind
+                  ? `${repo.behind} behind`
+                  : repo.ahead
+                    ? `${repo.ahead} to push`
+                    : "Up to date",
+          choices: [
+            { id: "commit", label: "Commit", on: false },
+            ...(remote
+              ? [
+                  { id: "push", label: "Push", on: false },
+                  { id: "pull", label: "Pull", on: false },
+                ]
+              : []),
+          ],
         },
       ];
-      if (folder) {
-        lines.push({
-          label: "",
-          value: `go back to the default, ${WORD_DEFAULT_FOLDER}`,
-          action: { id: "reset", label: "Forget it" },
-        });
-      }
-      lines.push({
-        label: "Try it",
-        value:
-          wordWord ||
-          "makes a real document called “Bedrock connected”, saves it there and opens it in Word — the first run is when macOS asks its Allow question",
-        action: { id: "test", label: "Try it" },
-      });
-      const status = !wordState ? "not read yet" : on ? "ready" : "try it";
-      return { status, ready: on, lines };
+      const status = gitTrouble
+        ? "Folder missing"
+        : !repo?.repo
+          ? "No repository"
+          : repo.changes
+            ? `${repo.changes} to commit`
+            : repo.ahead
+              ? `${repo.ahead} to push`
+              : repo.behind
+                ? `${repo.behind} behind`
+                : "Up to date";
+      const ready = Boolean(repo?.repo && !repo.changes && !repo.ahead && !repo.behind);
+      return { status, ready, lines };
     }
 
     default:
@@ -3171,14 +2671,12 @@ function runIntegrationAction(feature: Feature, action: string): void {
  * the CLI's login is the CLI's and is asked for in the terminal.
  */
 let agyCli: string | null = null;
-let agyRan = false;
 
 async function refreshAntigravity(): Promise<void> {
   const bridge = window.bedrock;
   if (!bridge) return;
   const status = await bridge.agyStatus().catch(() => null);
   agyCli = status?.cli ?? null;
-  agyRan = status?.ran ?? false;
   redrawSettings();
 }
 
@@ -3246,21 +2744,11 @@ function forgetClaudeFolder(): void {
  */
 let claudeCli: string | null = null;
 
-/**
- * And who the CLI would run as. Read alongside it because it is the same kind of fact —
- * something true of this machine that the mode depends on and nothing else would tell you.
- */
-let claudeAccount: { email: string; org: string; seat: string } | null = null;
-
 async function refreshClaudeCli(): Promise<void> {
   const bridge = window.bedrock;
   if (!bridge) return;
-  const [status, account] = await Promise.all([
-    bridge.claudeCliStatus().catch(() => null),
-    bridge.claudeAccount().catch(() => null),
-  ]);
+  const status = await bridge.claudeCliStatus().catch(() => null);
   claudeCli = status?.cli ?? null;
-  claudeAccount = account;
   redrawSettings();
 }
 
@@ -3291,8 +2779,6 @@ async function terminalReady(): Promise<boolean> {
 
 /* ---------------------------------------------------- freeform's own page --- */
 
-/** The shortcut's name everywhere: the shipped file, the library, `shortcuts run`. */
-const FREEFORM_SHORTCUT = "New Freeform Board (Bedrock)";
 
 /**
  * Whether Freeform is on this Mac and whether the shortcut is in the library — the two
@@ -5915,7 +5401,6 @@ async function antigravityReady(): Promise<boolean> {
   if (!bridge) return false;
   const status = await bridge.agyStatus().catch(() => null);
   agyCli = status?.cli ?? null;
-  agyRan = status?.ran ?? false;
   if (!agyCli) {
     ui.status.textContent =
       "Antigravity: the agy CLI is not installed — see antigravity.google/docs/cli, then click again";
@@ -7711,7 +7196,34 @@ ui.openFolder.addEventListener("click", () => void pickFolder());
 ui.newFolder.addEventListener("click", () => void newFolder());
 ui.graph.addEventListener("click", () => openGraph());
 
+/** The tile each integration wears on the canvas — what its row in Settings wears too. */
+const SETTINGS_ICONS: Partial<Record<Feature, string>> = {
+  claude: TYPE_ICONS.claude,
+  notion: TYPE_ICONS.notion,
+  slack: TYPE_ICONS.slack,
+  granola: TYPE_ICONS.granola,
+  google: TYPE_ICONS.gtask,
+  calendar: TYPE_ICONS.calevent,
+  reminders: TYPE_ICONS.reminder,
+  applenotes: TYPE_ICONS.applenote,
+  linear: TYPE_ICONS.linear,
+  antigravity: TYPE_ICONS.antigravity,
+  word: TYPE_ICONS.word,
+  freeform: TYPE_ICONS.freeform,
+  // GitHub has no tile on the canvas, so it gets a plain one: a branch, on the dark tile.
+  git:
+    "data:image/svg+xml;utf8," +
+    encodeURIComponent(
+      '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">' +
+        '<rect width="64" height="64" rx="14" fill="#24292f"/>' +
+        '<g fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round">' +
+        '<circle cx="22" cy="18" r="5"/><circle cx="22" cy="46" r="5"/><circle cx="42" cy="24" r="5"/>' +
+        '<path d="M22 23v18M42 29c0 8-8 9-17 13"/></g></svg>',
+    ),
+};
+
 const redrawSettings = mountSettings(ui.settings, ui.settingsPanel, settings, {
+  icon: (feature) => SETTINGS_ICONS[feature],
   page: integrationPage,
   onAction: runIntegrationAction,
   base: () => baseRoot,

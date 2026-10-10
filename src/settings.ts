@@ -413,7 +413,8 @@ export class SettingsStore {
   private root: Prefs = emptyPrefs();
   /** What this vault answers differently. Every key, for a vault configured before layers. */
   private over: Prefs = emptyPrefs();
-  /** This vault's connections — never inherited. */
+  /** The connections — which channel, which folder — one set for every vault, kept in
+      the Bedrock folder's config; an answer only an older vault file holds still counts. */
   private setups: Setup = { ...SETUP_DEFAULT };
   /**
    * `"mode": "attachments"` in this vault's config: every node is a plain note, and what
@@ -422,7 +423,8 @@ export class SettingsStore {
    * born with attachments — and one that says `"mode"` itself keeps its own answer.
    */
   private attachments = false;
-  private writeScope: Scope = "vault";
+  /** The folder's own `"mode"`, written back as it was found. */
+  private rootMode = "";
   private timer: number | undefined;
   private dirtyRoot = false;
   private dirtyVault = false;
@@ -446,23 +448,30 @@ export class SettingsStore {
     this.over = emptyPrefs();
     this.setups = { ...SETUP_DEFAULT };
     this.attachments = false;
-    this.writeScope = "vault";
+    this.rootMode = "";
     let rootAttachments = false;
+    let rootSetup: Record<string, unknown> = {};
     if (root) {
       const parsed = await readConfig(root);
       if (parsed) this.root = parsePrefs(parsed as never);
       rootAttachments = parsed?.mode === "attachments";
+      this.rootMode = typeof parsed?.mode === "string" ? parsed.mode : "";
+      rootSetup = (parsed?.setup ?? {}) as Record<string, unknown>;
     }
     this.attachments = rootAttachments;
     const parsed = await readConfig(vault);
+    const take = (setup: Record<string, unknown>): void => {
+      for (const key of Object.keys(SETUP_DEFAULT) as Array<keyof Setup>) {
+        const value = setup[key];
+        if (typeof value === "string" && value) this.setups[key] = value as never;
+      }
+    };
+    // The vault's own answers from before there was one set, then the folder's over them.
+    take((parsed?.setup ?? {}) as Record<string, unknown>);
+    take(rootSetup);
     if (!parsed) return;
     this.over = parsePrefs(parsed as never);
     if (typeof parsed.mode === "string") this.attachments = parsed.mode === "attachments";
-    const setup = (parsed.setup ?? {}) as Record<string, unknown>;
-    for (const key of Object.keys(SETUP_DEFAULT) as Array<keyof Setup>) {
-      const value = setup[key];
-      if (typeof value === "string") this.setups[key] = value as never;
-    }
     if (this.setups.claudeWindow !== "terminal") this.setups.claudeWindow = "app";
     // Version 2 kept the Claude folder on its own; it is a setup like any other now.
     const claude = parsed.claude as { folder?: unknown } | undefined;
@@ -503,44 +512,30 @@ export class SettingsStore {
     return this.rootVault !== null;
   }
 
+  /**
+   * One set of answers for every vault: the Bedrock folder's, when there is one. What a
+   * vault once answered its own way is left in its file and no longer read.
+   */
   scope(): Scope {
-    return this.layered() ? this.writeScope : "vault";
+    return this.layered() ? "root" : "vault";
   }
 
-  setScope(scope: Scope): void {
-    this.writeScope = scope;
-  }
-
-  /** The answers the settings window should show: the layer it is writing to, resolved. */
+  /** The answers the settings window shows — the same ones every vault uses. */
   shown(): Resolved {
     return this.resolve(this.scope());
   }
 
-  /** The keys this vault answers its own way — feature ids, look keys, layout keys. */
-  overrides(): string[] {
-    return [...Object.keys(this.over.features), ...Object.keys(this.over.look), ...Object.keys(this.over.layout)];
-  }
-
-  /** This vault goes back to the folder's answers for everything. Its connections stay. */
-  dropOverrides(): void {
-    if (this.overrides().length === 0) return;
-    this.over = emptyPrefs();
-    this.schedule("vault");
-    this.onChange?.();
-    this.onLook?.();
-    this.onLayout?.();
-  }
-
-  enabled(feature: Feature): boolean {
-    return this.resolve("vault").features[feature];
+  /** Every feature and integration is on: an integration not signed into asks when used. */
+  enabled(_feature: Feature): boolean {
+    return true;
   }
 
   look(): Look {
-    return this.resolve("vault").look;
+    return this.resolve(this.scope()).look;
   }
 
   layout(): LayoutPrefs {
-    return this.resolve("vault").layout;
+    return this.resolve(this.scope()).layout;
   }
 
   setup(): Setup {
@@ -599,7 +594,7 @@ export class SettingsStore {
       this.setups[key] = value;
       changed = true;
     }
-    if (changed) this.schedule("vault");
+    if (changed) this.schedule(this.scope());
   }
 
   /** The vault's default folder for new Antigravity sessions, or null when it has none. */
@@ -649,8 +644,18 @@ export class SettingsStore {
   /** The Bedrock folder's config file as it would be written now. */
   private rootSnapshot(): string {
     return (
-      JSON.stringify({ version: 4, features: this.root.features, look: this.root.look, layout: this.root.layout }, null, 1) +
-      "\n"
+      JSON.stringify(
+        {
+          version: 4,
+          ...(this.rootMode ? { mode: this.rootMode } : {}),
+          features: this.root.features,
+          look: this.root.look,
+          layout: this.root.layout,
+          setup: this.setups,
+        },
+        null,
+        1,
+      ) + "\n"
     );
   }
 
@@ -684,31 +689,7 @@ async function writeConfig(vault: Vault, text: string): Promise<void> {
 
 /* -------------------------------------------------------------------- panel --- */
 
-type Row = { feature: Feature; name: string; what: string };
-
-/**
- * What the app can do on its own. A feature is the canvas growing a new kind of node or a
- * new gesture — nothing outside this machine is involved, so there is nothing to set up:
- * the switch IS the whole configuration.
- */
-const FEATURES: Row[] = [
-  {
-    feature: "files",
-    name: "Files and folders",
-    what: "file and folder nodes — a click opens the default app or Finder (desktop app)",
-  },
-  {
-    feature: "web",
-    name: "Webpages",
-    what: "paste an address and the node wears the site's own icon, and opens it",
-  },
-  {
-    feature: "active",
-    name: "Note styles",
-    what: "right-click a note to give it a sign, a colour and a pulse",
-  },
-  { feature: "stickies", name: "Stickies", what: "loose text pinned to the canvas" },
-];
+type Row = { feature: Feature; name: string };
 
 /**
  * Somebody else's service, reached from a note. These are the rows with a second half:
@@ -716,63 +697,19 @@ const FEATURES: Row[] = [
  * folder, which key — see `PanelHooks.detail`.
  */
 const INTEGRATIONS: Row[] = [
-  { feature: "linear", name: "Linear", what: "issue notes — tick them here, the tick lands in Linear" },
-  {
-    feature: "claude",
-    name: "Claude Code",
-    what: "session notes — the node opens a coding session in the Claude app (desktop app)",
-  },
-  {
-    feature: "antigravity",
-    name: "Antigravity",
-    what: "session notes — the node opens an agent session in your own terminal (desktop app)",
-  },
-  { feature: "git", name: "GitHub", what: "commit the vault and push it to a GitHub remote, from this page (desktop app)" },
-  {
-    feature: "freeform",
-    name: "Freeform",
-    what: "board notes — link Apple's whiteboards and make new ones from here (desktop app, Mac)",
-  },
-  {
-    feature: "notion",
-    name: "Notion",
-    what: "page notes — link Notion pages and make new ones from here (desktop app)",
-  },
-  {
-    feature: "granola",
-    name: "Granola",
-    what: "meeting notes — attach a meeting Granola took notes of; the notes come along, and a click opens it in Granola (desktop app)",
-  },
-  {
-    feature: "slack",
-    name: "Slack",
-    what: "thread notes — start a thread in one channel, or attach one going already; a click opens it in Slack (desktop app)",
-  },
-  {
-    feature: "google",
-    name: "Google Tasks",
-    what: "task notes — the tasks on your Google Calendar; make one or attach one, and the node wears a tick when it is done (desktop app)",
-  },
-  {
-    feature: "applenotes",
-    name: "Apple Notes",
-    what: "notes that point at Apple's notes — link them and make new ones from here (desktop app, Mac)",
-  },
-  {
-    feature: "reminders",
-    name: "Reminders",
-    what: "reminders attached to a note — make one and finish it in Reminders, or attach one you have (desktop app, Mac)",
-  },
-  {
-    feature: "calendar",
-    name: "Calendar",
-    what: "events attached to a note — make one and finish it in Calendar's own editor, or attach an upcoming one (desktop app, Mac)",
-  },
-  {
-    feature: "word",
-    name: "Word",
-    what: "document notes — link Word documents and make new ones from here (desktop app, Mac)",
-  },
+  { feature: "claude", name: "Claude Code" },
+  { feature: "notion", name: "Notion" },
+  { feature: "slack", name: "Slack" },
+  { feature: "granola", name: "Granola" },
+  { feature: "google", name: "Google Tasks" },
+  { feature: "calendar", name: "Calendar" },
+  { feature: "reminders", name: "Reminders" },
+  { feature: "applenotes", name: "Apple Notes" },
+  { feature: "linear", name: "Linear" },
+  { feature: "antigravity", name: "Antigravity" },
+  { feature: "word", name: "Word" },
+  { feature: "freeform", name: "Freeform" },
+  { feature: "git", name: "GitHub" },
 ];
 
 /**
@@ -806,24 +743,20 @@ export type PanelHooks = {
   version?: () => string | null;
   /** The General tab's "Check for updates…": ask the bucket now, answer in a dialog. */
   onUpdateCheck?: () => void;
+  /** The tile an integration wears on the canvas, drawn beside its name. */
+  icon?: (feature: Feature) => string | undefined;
 };
 
-type Tab = "general" | "layout" | "features" | "integrations";
+type Tab = "general" | "layout" | "integrations";
 
 const TABS: Array<{ key: Tab; name: string }> = [
   { key: "general", name: "General" },
   { key: "layout", name: "Layout" },
-  { key: "features", name: "Features" },
   { key: "integrations", name: "Integrations" },
 ];
 
 const escapeHtml = (text: string): string =>
   text.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]!);
-
-/** A plain switch — a feature has nothing behind it to configure. */
-const switchRow = (row: Row, on: boolean): string =>
-  `<label class="setting"><input type="checkbox" data-feature="${row.feature}"${on ? " checked" : ""} />` +
-  `<span><b>${row.name}</b><small>${row.what}</small></span></label>`;
 
 /** One question on an integration's page. */
 const setupLine = (feature: Feature, line: SetupLine): string =>
@@ -846,15 +779,14 @@ const setupLine = (feature: Feature, line: SetupLine): string =>
   `</div>`;
 
 /**
- * An integration: its switch, and its own page folded underneath. The header is the whole
- * hit area for folding — except the checkbox, which is a different question and keeps its
- * own click. A page is drawn only while it is open, so a fold costs nothing to keep shut.
+ * An integration: its tile, its name, where it stands, and its page folded underneath —
+ * the header is the whole hit area for folding. A page is drawn only while it is open.
  */
-const integrationRow = (row: Row, on: boolean, page: SetupPage | null, open: boolean): string =>
+const integrationRow = (row: Row, icon: string | undefined, page: SetupPage | null, open: boolean): string =>
   `<div class="setup${open ? " open" : ""}">` +
   `<div class="setup-head" data-fold="${row.feature}">` +
-  `<input type="checkbox" data-feature="${row.feature}"${on ? " checked" : ""} />` +
-  `<span class="setup-name"><b>${row.name}</b><small>${row.what}</small></span>` +
+  (icon ? `<img class="setup-icon" src="${icon}" alt="" />` : `<span class="setup-icon"></span>`) +
+  `<span class="setup-name"><b>${row.name}</b></span>` +
   (page
     ? `<span class="setup-status${page.ready ? " ready" : ""}">${escapeHtml(page.status)}</span>`
     : "") +
@@ -864,8 +796,8 @@ const integrationRow = (row: Row, on: boolean, page: SetupPage | null, open: boo
   `</div>`;
 
 /** A titled row of swatches in the General tab. */
-const lookRow = (title: string, note: string, body: string): string =>
-  `<div class="settings-look"><h5>${title}</h5><small>${note}</small>${body}</div>`;
+const lookRow = (title: string, _note: string, body: string): string =>
+  `<div class="settings-look"><h5>${title}</h5>${body}</div>`;
 
 /**
  * Wires the ⚙ button to the settings window — a card in the middle of the screen with a
@@ -922,8 +854,7 @@ export function mountSettings(
         swatchRow("edge", look.edge, { title: "The usual red", fill: "#f92411" }),
       ) +
       `<label class="setting"><input type="checkbox" data-look="captions"${look.captions ? " checked" : ""} />` +
-      `<span><b>Names on the canvas</b><small>off reads the graph as shapes: put the pointer on a note` +
-      ` to name it, its neighbours and the links between them, or on a link to name that link</small></span></label>`
+      `<span><b>Names on the canvas</b></span></label>`
     );
   };
 
@@ -933,34 +864,30 @@ export function mountSettings(
       .map(
         (row) =>
           `<label class="setting"><input type="radio" name="layout-${field}" data-layout="${field}" value="${row.key}"` +
-          `${row.key === picked ? " checked" : ""} /><span><b>${row.name}</b><small>${row.what}</small></span></label>`,
+          `${row.key === picked ? " checked" : ""} /><span><b>${row.name}</b></span></label>`,
       )
       .join("");
 
   const layout = (): string => {
     const prefs = store.shown().layout;
     /** A slider with its value beside it; the next run reads it, nothing moves on its own. */
-    const dial = (field: "edgeLength" | "nodeSpacing", label: string, what: string, range: { min: number; max: number }): string =>
+    const dial = (field: "edgeLength" | "nodeSpacing", label: string, _what: string, range: { min: number; max: number }): string =>
       `<label class="settings-dial"><span class="settings-dial-head"><b>${label}</b>` +
       `<output data-dial-out="${field}">${prefs[field]}</output> px</span>` +
       `<input type="range" data-layout="${field}" value="${prefs[field]}" min="${range.min}" max="${range.max}" step="1" />` +
-      `<small>${what}</small></label>`;
+      `</label>`;
     const number = (field: "sizeMin" | "sizeMax", label: string): string =>
       `<label class="settings-num"><span>${label}</span>` +
       `<input type="number" data-layout="${field}" value="${prefs[field]}" min="${SIZE_RANGE.min}" max="${SIZE_RANGE.max}" step="1" /> px</label>`;
     return (
-      `<div class="settings-look"><h5>The layout</h5>` +
-      `<small>nothing that has a place ever moves on its own. A drag round some notes lays out just those (cola —` +
-      ` linked notes at the Pull distance, every note keeping the Spread clear round its label) with the rest held` +
-      ` still, and a note that arrives without a place settles among its links the same way</small>` +
+      `<div class="settings-look"><h5>Layout</h5>` +
       dial("edgeLength", "Pull", "how long a link wants to be — shorter knots a cluster tighter", EDGE_LENGTH_RANGE) +
       dial("nodeSpacing", "Spread", "clear ground round every note — more pushes everything apart", NODE_SPACING_RANGE) +
       `</div>` +
-      `<div class="settings-look"><h5>Note sizes</h5><small>what a note's circle is sized by</small>` +
+      `<div class="settings-look"><h5>Note sizes</h5>` +
       choices("sizing", prefs.sizing, SIZINGS) +
       `<div class="settings-nums">${number("sizeMin", "smallest")}${number("sizeMax", "biggest")}</div></div>` +
       `<div class="settings-look"><h5>Scrolling</h5>` +
-      `<small>a drag on empty canvas draws a selection; the right button (or Space) held down drags the canvas itself</small>` +
       choices("scroll", prefs.scroll, [
         { key: "pan", name: "Trackpad", what: "two fingers move the canvas, a pinch zooms it" },
         { key: "zoom", name: "Mouse", what: "the wheel zooms; hold the right button to move the canvas" },
@@ -969,66 +896,14 @@ export function mountSettings(
     );
   };
 
-  const features = (): string => {
-    const on = store.shown().features;
-    return FEATURES.map((row) => switchRow(row, on[row.feature])).join("");
-  };
-
-  const integrations = (): string => {
-    const on = store.shown().features;
-    // An integration's page is this vault's connection to it. Every vault's answers can
-    // say the integration is on; which channel, which team, is not theirs to say.
-    const atRoot = store.scope() === "root";
-    return INTEGRATIONS.map((row) =>
-      integrationRow(row, on[row.feature], atRoot ? null : (hooks.page?.(row.feature) ?? null), unfolded.has(row.feature)),
+  const integrations = (): string =>
+    INTEGRATIONS.map((row) =>
+      integrationRow(row, hooks.icon?.(row.feature), hooks.page?.(row.feature) ?? null, unfolded.has(row.feature)),
     ).join("");
-  };
-
-  /** What an override key is called on screen, so the list of them reads as the rows do. */
-  const overrideName = (key: string): string =>
-    [...FEATURES, ...INTEGRATIONS].find((row) => row.feature === key)?.name ??
-    ({
-      bg: "Canvas",
-      node: "Notes",
-      edge: "Connections",
-      captions: "Names on the canvas",
-      sizing: "Note sizes",
-      sizeMin: "smallest",
-      sizeMax: "biggest",
-      edgeLength: "Pull",
-      nodeSpacing: "Spread",
-      scroll: "Scrolling",
-    }[key] ?? key);
-
-  /**
-   * Which layer the window writes to, and what that means here. Only when there is a
-   * Bedrock folder to answer for every vault — a browser tab has one vault and one file.
-   */
-  const scopeStrip = (): string => {
-    if (!store.layered()) return "";
-    const scope = store.scope();
-    const pill = (key: Scope, name: string): string =>
-      `<button type="button" class="settings-scope-pill${scope === key ? " on" : ""}" data-scope="${key}">${name}</button>`;
-    const overrides = store.overrides();
-    const word =
-      scope === "root"
-        ? "what every vault starts from — a vault that answered differently keeps its answer"
-        : overrides.length === 0
-          ? "this vault follows the answers for every vault; change one here and only this vault changes"
-          : `this vault answers its own way for ${overrides.map(overrideName).map(escapeHtml).join(", ")}`;
-    return (
-      `<div class="settings-scope"><span class="settings-scope-pills">${pill("root", "All vaults")}${pill("vault", "This vault")}</span>` +
-      `<small>${word}</small>` +
-      (scope === "vault" && overrides.length > 0
-        ? `<button type="button" class="settings-scope-drop" data-drop-overrides title="Back to the answers for every vault">Drop</button>`
-        : "") +
-      `</div>`
-    );
-  };
 
   const draw = (): void => {
     const body =
-      tab === "general" ? general() : tab === "layout" ? layout() : tab === "features" ? features() : integrations();
+      tab === "general" ? general() : tab === "layout" ? layout() : integrations();
     host.innerHTML =
       `<div class="settings-card">` +
       `<div class="settings-head"><h3>Settings</h3>` +
@@ -1039,7 +914,6 @@ export function mountSettings(
           `<button type="button" class="settings-tab${t.key === tab ? " on" : ""}" data-tab="${t.key}">${t.name}</button>`,
       ).join("") +
       `</div>` +
-      scopeStrip() +
       `<div class="settings-body">${body}</div>` +
       `</div>`;
   };
@@ -1079,10 +953,6 @@ export function mountSettings(
       box.value = String(store.shown().layout[field]); // say what was kept, if it had to be clamped
       return;
     }
-    const feature = box.dataset.feature as Feature | undefined;
-    if (!feature) return;
-    store.set(feature, box.checked);
-    draw(); // a row switched on may now have something to report
   });
 
   host.addEventListener("click", (event) => {
@@ -1094,9 +964,9 @@ export function mountSettings(
     const hit = target.closest<HTMLElement>("button");
     if (!hit) {
       // Not a button: the only other thing worth clicking is an integration's header,
-      // which folds its page. The checkbox on it is its own question and keeps its click.
+      // which folds its page.
       const fold = target.closest<HTMLElement>("[data-fold]")?.dataset.fold as Feature | undefined;
-      if (!fold || (target as HTMLInputElement).type === "checkbox") return;
+      if (!fold) return;
       if (!unfolded.delete(fold)) unfolded.add(fold);
       draw();
       return;
@@ -1112,17 +982,6 @@ export function mountSettings(
     }
     if (hit.dataset.updateCheck !== undefined) {
       hooks.onUpdateCheck?.(); // the shell answers in a dialog of its own
-      return;
-    }
-    const scope = hit.dataset.scope as Scope | undefined;
-    if (scope) {
-      store.setScope(scope);
-      draw();
-      return;
-    }
-    if (hit.dataset.dropOverrides !== undefined) {
-      store.dropOverrides();
-      draw();
       return;
     }
     const picked = hit.dataset.tab as Tab | undefined;

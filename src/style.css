@@ -497,6 +497,14 @@ button.twisty:hover {
   cursor: pointer;
 }
 
+.setup-icon {
+  width: 20px;
+  height: 20px;
+  flex: none;
+  border-radius: 5px;
+  object-fit: cover;
+}
+
 .setup-name {
   flex: 1;
   min-width: 0;
