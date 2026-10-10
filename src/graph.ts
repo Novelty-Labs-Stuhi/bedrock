@@ -1035,11 +1035,8 @@ export type IssueChange = {
  */
 const PULSE_MS = 3000;
 
-/** Where a panel opened from a tool chip goes: just right of the chip, level with its top. */
-const toolPoint = (chip: HTMLElement): { x: number; y: number } => {
-  const box = chip.getBoundingClientRect();
-  return { x: box.right + 6, y: box.top };
-};
+/** The + drawn in the middle of a pointed-at note, in model units. */
+const linkMark = (node: NodeSingular): number => Math.max(14, node.width() * 0.4);
 
 const clientPoint = (event: cytoscape.EventObject): { x: number; y: number } => {
   const original = event.originalEvent as MouseEvent | undefined;
@@ -1578,13 +1575,10 @@ export type GraphHandlers = {
   onHint: (hint: string | null) => void;
   /** A note dragged into another and let go there: `source` merges into `target`. */
   onMergeNodes: (source: string, target: string) => void;
-  /** The + beside a clicked note: what can be attached to it, as a menu at `client`. */
+  /** The + on a pointed-at note's ring: what can be attached to it, as a menu at `client`. */
   onAttachMenu: (host: string, client: Client) => void;
-  /** A click on the open note (its pencil): its menu — Style, Rename, Delete — at `client`. */
-  onNodeEdit: (path: string, client: Client) => void;
-  /** The same two along a clicked connection; its Rename is `onOpenEdge`. */
+  /** The bin along a clicked connection; its pencil is `onOpenEdge`. */
   onEdgeDelete: (source: string, target: string) => void;
-  onEdgeStyle: (source: string, target: string, client: Client) => void;
   /** Right-click on one of a note's attachments. */
   onAttachmentMenu: (att: string, host: string, client: Client) => void;
   /**
@@ -1723,7 +1717,10 @@ export class GraphView {
   /** Attachment path -> its small icon on the rim of its note. */
   private attEls = new Map<string, HTMLElement>();
   /** The strip a clicked note opens beside itself: its attachments and the + box. */
-  private strip: { host: string; el: HTMLElement } | null = null; // `el` is the row of tools, + first
+  private strip: { host: string; el: HTMLElement; hover: boolean } | null = null; // `el` is the row of tools, + first
+  /** The note the pointer is over, as cytoscape last said — a hover ring stays while it is. */
+  private hovered: string | null = null;
+  private hoverClose: number | undefined;
   /** How far an open note's ring has been turned, in tiles (only past ATT_RING_MAX). */
   private ringTurn = 0;
   private ringWheel = 0;
@@ -2408,17 +2405,14 @@ export class GraphView {
       // In a vault of attachments every note is a plain note: a click opens the strip of
       // what is attached to it, and the + to attach more.
       if (this.settings.attachMode()) {
+        // Pointing at a note opens its ring (see `mouseover`), with the + drawn in its middle:
+        // a click anywhere on the note draws an arrow out of it. The + is only drawn — the
+        // press is the note's, so pressing and moving drags it. Its menu (Style, Rename,
+        // Delete) is the right button's.
         this.closeEdgeTools();
-        // A click opens the note: its attachments round it and the +. A click on the open
-        // note is its pencil — the ring folds away and the note's menu opens beside it. The
-        // right button draws an arrow out of the note instead (see `cxttap`).
-        if (this.strip?.host === node.id()) {
-          const at = node.renderedPosition();
-          const box = this.container.getBoundingClientRect();
-          const client = { x: box.left + at.x + (node.renderedWidth() / 2) + 8, y: box.top + at.y - 10 };
-          this.closeStrip();
-          this.handlers.onNodeEdit(node.id(), client);
-        } else this.openStrip(node.id());
+        this.closeStrip();
+        // A tick later, or the click's own grab/free cycle wipes the draft's hint at once.
+        window.setTimeout(() => this.startDraft(node), 0);
         return;
       }
       if (this.openTyped(node, event.position)) return;
@@ -2504,13 +2498,13 @@ export class GraphView {
       if (node && node.hasClass("picked")) this.handlers.onSelect(this.pickedPaths(), client);
       else if (node && node.data("kind") === "leaf") this.handlers.onLeafMenu(node.id(), client);
       else if (node && node.data("kind") === "file") {
-        // In a vault of attachments the right button draws an arrow out of the note: click
-        // another note to link the two, empty space to grow a new one there, the note itself
-        // again (or Esc, or the right button) to drop it.
+        // In a vault of attachments the ring folds away for the menu; arrows come out of the
+        // + in the middle of a pointed-at note instead.
         if (this.settings.attachMode()) {
           this.closeEdgeTools();
-          this.startDraft(node);
-        } else this.handlers.onNodeMenu(node.id(), client);
+          this.closeStrip();
+        }
+        this.handlers.onNodeMenu(node.id(), client);
       } else this.handlers.onCanvasMenu({ ...event.position }, client);
     });
 
@@ -2526,7 +2520,15 @@ export class GraphView {
         return;
       }
       if (this.draftSource || node.data("kind") !== "file") return;
-      if (this.strip || this.edgeTools) return; // something is open: its dimming is the only spotlight
+      this.hovered = node.id();
+      // In a vault of attachments pointing at a note opens it: its attachments come out round
+      // it, the + to attach more on the bottom-right, and the + to draw an arrow in the middle.
+      if (this.settings.attachMode() && !this.edgeTools && !this.rename && !this.drag) {
+        this.holdStrip();
+        if (this.strip?.host !== node.id()) this.openStrip(node.id(), true);
+      }
+      // Something opened by hand: its dimming is the only spotlight.
+      if ((this.strip && !this.strip.hover) || this.edgeTools) return;
       const neighborhood = node.closedNeighborhood();
       cy.elements().difference(neighborhood).addClass("faded");
       if (this.atts.size) this.drawOverlay(); // the tiles on faded notes fade with them
@@ -2543,8 +2545,10 @@ export class GraphView {
     });
     cy.on("mouseout", "node", () => {
       this.coolLeaf();
+      this.hovered = null;
       if (this.draftSource) return;
       this.clearSpotlight();
+      this.releaseStrip();
     });
 
     // Nothing on the line itself says it can be opened, so the status bar says it.
@@ -4555,8 +4559,14 @@ export class GraphView {
       },
       { passive: false },
     );
-    el.addEventListener("mouseenter", () => this.showTip(el, el.dataset.tip ?? ""));
-    el.addEventListener("mouseleave", () => this.hideTip());
+    el.addEventListener("mouseenter", () => {
+      this.holdStrip();
+      this.showTip(el, el.dataset.tip ?? "");
+    });
+    el.addEventListener("mouseleave", () => {
+      this.hideTip();
+      this.releaseStrip();
+    });
     el.addEventListener("click", (event) => {
       event.stopPropagation();
       const att = this.atts.get(path);
@@ -4738,10 +4748,12 @@ export class GraphView {
   private morphTimer: number | undefined;
 
   /**
-   * Opens a note: everything else dims, its attachments come out round it, and the + for
-   * another sits on its bottom-right. It rides the note through pans, zooms and drags.
+   * Opens a note: its attachments come out round it, the + for another sits on its
+   * bottom-right, and a + in its middle draws an arrow out of it. It rides the note through
+   * pans, zooms and drags. Opened by hand everything else dims; opened by `hover` the pointer's
+   * own spotlight stays, and it folds when the pointer has left the note and all that is on it.
    */
-  openStrip(host: string): void {
+  openStrip(host: string, hover = false): void {
     if (this.strip) this.dropStrip();
     this.closeEdgeTools();
     const el = this.toolRow([
@@ -4754,14 +4766,15 @@ export class GraphView {
           this.handlers.onAttachMenu(host, { x: box.right + 4, y: box.top });
         },
       },
-    ], [], false);
+    ], null);
     el.classList.add("node-tools");
-    // No button for editing: the open note itself is one (see the node tap), and says so
-    // with a pencil drawn on it that the click goes straight through.
-    const pencil = document.createElement("div");
-    pencil.className = "node-pencil";
-    pencil.innerHTML = ICON_PENCIL;
-    el.appendChild(pencil);
+    // The + in the middle: a mark, not a button — the note under it takes the press (`tap`).
+    const link = document.createElement("div");
+    link.className = "node-link";
+    link.innerHTML = ICON_PLUS;
+    el.appendChild(link);
+    el.addEventListener("mouseover", () => this.holdStrip());
+    el.addEventListener("mouseout", () => this.releaseStrip());
     // Past ATT_RING_MAX, the place after the last tile shown: a tile of its own that turns
     // the ring. Placed with the tiles in `drawAttachments`.
     const rotate = document.createElement("button");
@@ -4774,7 +4787,7 @@ export class GraphView {
     });
     el.appendChild(rotate);
     this.overlay.appendChild(el);
-    this.strip = { host, el };
+    this.strip = { host, el, hover };
     this.ringTurn = 0;
     this.morph();
     this.dimForStrip();
@@ -4783,14 +4796,13 @@ export class GraphView {
   }
 
   /**
-   * A row of round tools, and after the last one the pencil: a click on it unfolds `chips`
-   * (Style, Rename…) to its right, a second click folds them away. Nothing in it reaches the
-   * canvas underneath — a press here is not the start of a pan or a marquee.
+   * A row of round tools, and after the last one the pencil when there is something it
+   * `edit`s. Nothing in it reaches the canvas underneath — a press here is not the start of
+   * a pan or a marquee.
    */
   private toolRow(
     tools: Array<{ label: string; title: string; cls?: string; run: (button: HTMLElement) => void }>,
-    chips: Array<{ label: string; run: (chip: HTMLElement) => void }>,
-    pencil = true,
+    edit: (() => void) | null,
   ): HTMLElement {
     const row = document.createElement("div");
     row.className = "tool-row";
@@ -4808,11 +4820,7 @@ export class GraphView {
       parent.appendChild(button);
     };
     for (const tool of tools) add(row, `tool${tool.cls ? ` ${tool.cls}` : ""}`, tool.label, tool.title, tool.run);
-    if (pencil) add(row, "tool tool-pencil", ICON_PENCIL, "Edit", () => row.classList.toggle("editing"));
-    const tray = document.createElement("div");
-    tray.className = "tool-chips";
-    for (const chip of chips) add(tray, `tool-chip${chip.label === "Delete" ? " tool-danger" : ""}`, chip.label, chip.label, chip.run);
-    row.appendChild(tray);
+    if (edit) add(row, "tool tool-pencil", ICON_PENCIL, "Rename", edit);
     return row;
   }
 
@@ -4822,6 +4830,32 @@ export class GraphView {
     this.morph();
     this.clearSpotlight();
     this.drawOverlay(); // the tiles fold back onto the corner
+  }
+
+  /** The pointer is on the hover-opened note or something of its ring: it stays. */
+  private holdStrip(): void {
+    window.clearTimeout(this.hoverClose);
+  }
+
+  /**
+   * The pointer left the note or a piece of its ring. A moment's grace to cross the gap to
+   * the tiles; then, unless it is back on the note (cytoscape says nothing while it is over
+   * the + in the middle) or dragging it, the ring folds.
+   */
+  private releaseStrip(): void {
+    if (!this.strip?.hover) return;
+    window.clearTimeout(this.hoverClose);
+    this.hoverClose = window.setTimeout(() => {
+      const strip = this.strip;
+      if (!strip?.hover || this.drag || this.hovered === strip.host) return;
+      if (strip.el.querySelector(":hover") || [...this.attEls.values()].some((el) => el.matches(":hover"))) return;
+      // The + was clicked and its menu is up: the ring waits for it to go.
+      if (document.querySelector(".menu-panel")) {
+        this.releaseStrip();
+        return;
+      }
+      this.closeStrip();
+    }, 240);
   }
 
   private dropStrip(): void {
@@ -4846,7 +4880,7 @@ export class GraphView {
       const edge = cy.getElementById(edgeId(this.edgeTools.source, this.edgeTools.target));
       if (edge.nonempty()) cy.elements().difference(edge.union(edge.connectedNodes())).addClass("faded");
     }
-    const node = this.strip ? cy.getElementById(this.strip.host) : null;
+    const node = this.strip && !this.strip.hover ? cy.getElementById(this.strip.host) : null;
     if (!node || node.empty()) return;
     cy.elements().difference(node).addClass("faded");
   }
@@ -4859,20 +4893,13 @@ export class GraphView {
     this.closeEdgeTools();
     if (open && open.source === source && open.target === target) return;
     this.closeStrip();
+    // The pencil names the line at once; its style is on the right button.
     const el = this.toolRow(
       [{ label: ICON_BIN, title: "Delete connection", run: () => { this.closeEdgeTools(); this.handlers.onEdgeDelete(source, target); } }],
-      [
-        ...(this.settings.enabled("active")
-          ? [{ label: "Style", run: (chip: HTMLElement) => this.handlers.onEdgeStyle(source, target, toolPoint(chip)) }]
-          : []),
-        {
-          label: "Rename",
-          run: () => {
-            this.closeEdgeTools();
-            this.handlers.onOpenEdge(source, target, (edge.data("label") as string | undefined) ?? null);
-          },
-        },
-      ],
+      () => {
+        this.closeEdgeTools();
+        this.handlers.onOpenEdge(source, target, (edge.data("label") as string | undefined) ?? null);
+      },
     );
     el.classList.add("edge-tools");
     this.overlay.appendChild(el);
@@ -4918,13 +4945,10 @@ export class GraphView {
       el.style.transform = `translate(-50%, -50%) scale(${zoom})`;
     };
     // Bin towards the source, pencil towards the target — read the line left to right
-    // and the pencil is always the one on the right, with its chips beyond it.
+    // and the pencil is always the one on the right.
     const flip = dx < 0 ? -1 : 1;
     put(bin, mid.x - dx * step * flip, mid.y - dy * step * flip);
     put(pencil, mid.x + dx * step * flip, mid.y + dy * step * flip);
-    const tray = tools.el.querySelector<HTMLElement>(".tool-chips")!;
-    tray.style.left = `${mid.x + dx * step * flip + (size / 2) * zoom + 6}px`;
-    tray.style.top = `${mid.y + dy * step * flip}px`;
   }
 
   /** Which note is open, if any. */
@@ -4948,7 +4972,7 @@ export class GraphView {
       node.data("_mute", 1);
       node.style("text-opacity", 0);
     }
-    // The + on the ring's bottom-right; the only button there is.
+    // The + to attach, on the ring's bottom-right.
     const zoom = this.cy!.zoom();
     const plus = strip.el.querySelector<HTMLElement>(".tool-plus")!;
     const angle = ring.tool(0);
@@ -4957,14 +4981,14 @@ export class GraphView {
     plus.style.width = `${ring.plus}px`;
     plus.style.height = `${ring.plus}px`;
     plus.style.transform = `translate(-50%, -50%) scale(${zoom})`;
-    // The pencil drawn on the note, a third of it across.
-    const pencil = strip.el.querySelector<HTMLElement>(".node-pencil")!;
-    const mark = node.width() * 0.34;
-    pencil.style.left = `${at.x}px`;
-    pencil.style.top = `${at.y}px`;
-    pencil.style.width = `${mark}px`;
-    pencil.style.height = `${mark}px`;
-    pencil.style.transform = `translate(-50%, -50%) scale(${zoom})`;
+    // The + that draws an arrow, in the middle of the note, two fifths of it across.
+    const link = strip.el.querySelector<HTMLElement>(".node-link")!;
+    const mark = linkMark(node as NodeSingular);
+    link.style.left = `${at.x}px`;
+    link.style.top = `${at.y}px`;
+    link.style.width = `${mark}px`;
+    link.style.height = `${mark}px`;
+    link.style.transform = `translate(-50%, -50%) scale(${zoom})`;
   }
 
   /** The label an attachment shows while pointed at: what it is, and what it is called. */

@@ -330,7 +330,7 @@ const graphView = new GraphView(ui.cy, {
       items.push({ label: "Style…", run: () => styleEdge(source, target, client) });
     }
     // Cutting the line means taking the link out of the note that draws it — there is
-    // nothing else holding the connection up. Last, and it asks first.
+    // nothing else holding the connection up. Last; it does not ask.
     items.push({
       label: "Delete connection",
       hint: `${linkSourceName(source)}${ARROW}${noteName(target)}`,
@@ -417,9 +417,7 @@ const graphView = new GraphView(ui.cy, {
     ui.status.textContent = hint ?? statusText();
   },
   onAttachMenu: (host, client) => showMenu(client, attachItems(host)),
-  onNodeEdit: (path, client) => showMenu(client, nodeEditItems(path, client)),
   onEdgeDelete: (source, target) => void deleteEdge(source, target),
-  onEdgeStyle: (source, target, client) => styleEdge(source, target, client),
   onAttachmentMenu: (att, host, client) => showAttachmentMenu(att, host, client),
   onOpenForeign: (type, data) => void openForeign(type, data),
   onMergeNodes: (source, target) => void mergeNotes(source, target),
@@ -1059,7 +1057,6 @@ async function syncAfterStructuralChange(): Promise<void> {
 }
 
 async function deleteEntry(path: string, kind: "file" | "dir"): Promise<void> {
-  if (!(await askConfirm(`Delete ${path}?`))) return;
   // An open buffer would write the links back over the top of the pass below.
   await flushAll();
   const gone = new Set(
@@ -1092,8 +1089,6 @@ async function deleteNotes(paths: string[]): Promise<void> {
   const live = new Set(filePaths());
   const gone = new Set(paths.filter((path) => live.has(path)));
   if (!gone.size) return;
-  const what = gone.size === 1 ? `Delete ${[...gone][0]}?` : `Delete these ${gone.size} notes?`;
-  if (!(await askConfirm(what))) return;
   graphView.clearPicked(); // whatever happens next, the selection has been answered
   await flushAll(); // an open buffer would write the links back over the pass below
   const before = filePaths();
@@ -1665,7 +1660,6 @@ async function deleteEdge(source: string, target: string): Promise<void> {
   const leaf = leafOf(source);
   if (leaf) {
     const title = `${linkSourceName(source)}${ARROW}${noteName(target)}`;
-    if (!(await askConfirm(`Cut the section's arrow ${title}?`, "Delete"))) return;
     await flushAll();
     const resolver = new LinkResolver(filePaths());
     const spelling = target.replace(/\.md$/i, "");
@@ -1684,10 +1678,6 @@ async function deleteEdge(source: string, target: string): Promise<void> {
   const title = `${noteName(source)}${ARROW}${noteName(target)}`;
   const note = edgeNotePath(source, target);
   const described = await vault.exists(note);
-  const ask = described
-    ? `Delete the connection ${title}, and what was written about it?`
-    : `Delete the connection ${title}?`;
-  if (!(await askConfirm(ask, "Delete"))) return;
   await flushAll(); // the source note may be open, with the link still in its buffer
   const resolver = new LinkResolver(filePaths());
   const spelling = target.replace(/\.md$/i, "");
@@ -2267,10 +2257,9 @@ function showLeafMenu(leaf: string, client: { x: number; y: number }): void {
   showMenu(client, items);
 }
 
-/** Takes a section — heading and text — out of the meeting's note, after asking. */
+/** Takes a section — heading and text — out of the meeting’s note. */
 async function deleteLeaf(path: string, index: number): Promise<void> {
   const title = graphView.leafTitle(path, index) || `section ${index + 1}`;
-  if (!(await askConfirm(`Delete “${title}” from ${noteName(path)}? Granola keeps the meeting itself.`, "Delete"))) return;
   await flushAll();
   const before = await vault.read(path);
   const after = deleteSection(before, index);
@@ -6910,7 +6899,6 @@ function showAttachmentMenu(att: string, host: string, client: Client): void {
 
 /** Takes an attachment off its note. The thing itself — the page, the session — is left where it lives. */
 async function removeAttachment(att: string, host: string): Promise<void> {
-  if (!(await askConfirm(`Remove this from ${noteName(host)}? What it points at is left where it lives.`, "Remove"))) return;
   await flushAll();
   const next = withoutAttachLine(await vault.read(host), noteName(att));
   await vault.write(host, next);
@@ -7004,17 +6992,6 @@ function attachNodeMenu(path: string, client: Client): MenuItem[] {
     { label: "Rename", run: () => renameOnGraph(path) },
     { label: "Delete", run: () => void deleteEntry(path, "file") },
   );
-  return items;
-}
-
-/** A click on an open note — its pencil — in a vault of attachments: what can be changed about it. */
-function nodeEditItems(path: string, client: Client): MenuItem[] {
-  const items: MenuItem[] = [];
-  if (settings.enabled("active")) items.push({ label: "Style…", run: () => void styleNode(path, client) });
-  items.push({ label: "Rename", run: () => renameOnGraph(path) });
-  const target = graphView.refTarget(path);
-  if (target !== null) items.push({ label: "Open in its vault", run: () => void openRefNode(path, target || null, true) });
-  items.push({ label: "Delete", run: () => void deleteEntry(path, "file") });
   return items;
 }
 
