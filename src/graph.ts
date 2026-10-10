@@ -1588,6 +1588,8 @@ export type GraphHandlers = {
   onEdgeMenu: (source: string, target: string, label: string | null, client: Client) => void;
   /** Right-click on empty canvas: offer what can be made or attached there. */
   onCanvasMenu: (at: cytoscape.Position, client: Client) => void;
+  /** A click on bare canvas with nothing open to close: a new node goes there. */
+  onCanvasClick: (at: cytoscape.Position) => void;
   /** Link draft finished on another note: link `source` -> `target`. */
   onLinkExisting: (source: string, target: string) => void;
   /**
@@ -2484,6 +2486,17 @@ export class GraphView {
 
     cy.on("tap", (event) => {
       if (event.target !== cy) return; // background only
+      // A click that closes something is only that: a ring opened by a click, a lit
+      // selection, a connection's tools, an issue card, a draft. A ring that came up on
+      // hover is not something open — the pointer has already left it.
+      const busy =
+        (!!this.strip && !this.strip.hover) ||
+        !!this.edgeTools ||
+        this.pickedPaths().length > 0 ||
+        this.draftRow !== null ||
+        !!this.issue ||
+        !!this.draftSource ||
+        !!this.rename;
       this.closeStrip();
       this.closeEdgeTools();
       // "Until you click somewhere": a click on bare canvas is that somewhere. Cytoscape
@@ -2499,7 +2512,9 @@ export class GraphView {
         this.endDraft({ ...event.position });
         return;
       }
-      // Nothing else: a stray click on the canvas must not litter the vault.
+      // Nothing else open: the click is where a new node goes. One left unnamed goes
+      // again (see main.ts), so a stray click does not litter the vault.
+      if (!busy) this.handlers.onCanvasClick({ ...event.position });
     });
 
     // A plain drag on empty ground draws the selection rectangle. Cytoscape still sees

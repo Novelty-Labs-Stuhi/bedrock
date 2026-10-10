@@ -340,6 +340,7 @@ const graphView = new GraphView(ui.cy, {
     });
     showMenu(client, items);
   },
+  onCanvasClick: (at) => void createHolderAt(at, null, null, true),
   onCanvasMenu: (at, client) => {
     /*
      * Right-click on empty space. The same two branches as a note's menu, minus the
@@ -1736,6 +1737,8 @@ async function createHolderAt(
   at: { x: number; y: number },
   folder: string | null,
   source: string | null = null,
+  /** Made by a bare click: dismissed without a name, it was a stray click, and goes. */
+  dropUnnamed = false,
 ): Promise<void> {
   const dir = folder ?? "";
   const path = freshPath(dir, HOLDER_NAME);
@@ -1749,6 +1752,12 @@ async function createHolderAt(
     : `created ${path} — name it; right-click → Turn into makes it something`;
   graphView.renameNode(path, (name) => {
     void (async () => {
+      if (!name && dropUnnamed && !(await vault.read(path).catch(() => "")).trim()) {
+        await vault.remove(path, "file").catch(() => undefined);
+        await refresh();
+        ui.status.textContent = "";
+        return;
+      }
       const finalPath = name ? ((await applyRename(path, "file", name)) ?? path) : path;
       if (source) await finishLink(source, finalPath, null);
     })();
@@ -1868,6 +1877,14 @@ async function turnHolderInto(
     if (!pointer) return; // the picker was dismissed — still a holder
   }
 
+  // A thread needs a channel to start in; with none chosen for the vault, it is asked here,
+  // before anything is written, like every other question.
+  let channel: { id: string; name: string } | null = null;
+  if (kind === "slack") {
+    channel = await slackTarget();
+    if (!channel) return;
+  }
+
   // An attachment's file is made only now: a question dismissed above leaves nothing behind.
   const path = typeof holder === "string" ? holder : await holder();
   await flushAll(); // the note may be open and mid-edit — don't write behind its own buffer
@@ -1903,7 +1920,7 @@ async function turnHolderInto(
     case "notion":
       return makeNotionPage(path);
     case "slack":
-      return makeSlackThread(path);
+      return makeSlackThread(path, channel);
     case "gtask":
       return makeGoogleTask(path);
     case "word":
@@ -2521,7 +2538,7 @@ function integrationPage(feature: Feature): SetupPage | null {
       }
       return {
         status: setup.slackChannelName || "connected",
-        ready: !!setup.slackChannel,
+        ready: true,
         lines: [
           {
             label: "Workspace",
@@ -2530,7 +2547,9 @@ function integrationPage(feature: Feature): SetupPage | null {
           },
           {
             label: "Channel",
-            value: setup.slackChannelName || "not chosen — threads have nowhere to start, and nothing to attach from",
+            value:
+              setup.slackChannelName ||
+              "not chosen — a new thread asks which channel, and the recent messages come from every channel you are in",
             action: { id: "channel", label: setup.slackChannel ? "Change…" : "Choose…" },
           },
           {
@@ -5534,21 +5553,24 @@ async function setUpSlack(): Promise<void> {
   await refreshSlack();
 }
 
-/** Which channel threads start in — the one question the vault answers about Slack. */
-async function pickSlackChannel(): Promise<void> {
+type SlackChannelPick = { id: string; name: string; member: boolean };
+
+/** A channel, asked over the ones the token can see — the ones you are in first. */
+async function askSlackChannel(question: string): Promise<SlackChannelPick | null> {
   const bridge = window.bedrock;
-  if (!bridge || !slackState?.connected) return;
+  if (!bridge) return null;
   ui.status.textContent = "Slack: reading the channels…";
   let channels: Awaited<ReturnType<NonNullable<Window["bedrock"]>["slackChannels"]>>;
   try {
     channels = await bridge.slackChannels();
   } catch (err) {
     ui.status.textContent = `Slack: ${shellError(err)}`;
-    return;
+    return null;
   }
+  ui.status.textContent = "";
   if (!channels.length) {
     ui.status.textContent = "Slack: that token can see no channels";
-    return;
+    return null;
   }
   // A workspace has hundreds of these, so the pick is searched rather than scrolled.
   // Two channels cannot share a name, so the label is the whole answer.
@@ -5556,8 +5578,23 @@ async function pickSlackChannel(): Promise<void> {
     label: `#${channel.name}`,
     hint: channel.member ? (channel.private ? "private" : "") : "not a member",
   }));
-  const picked = await askPick("Which channel should threads start in?", rows, "Search channels…");
+  const picked = await askPick(question, rows, "Search channels…");
   const channel = channels.find((c) => `#${c.name}` === picked);
+  return channel ? { id: channel.id, name: channel.name, member: channel.member } : null;
+}
+
+/** Where a new thread starts: the vault's channel when it has one, asked otherwise. */
+async function slackTarget(): Promise<{ id: string; name: string } | null> {
+  const { slackChannel, slackChannelName } = settings.setup();
+  if (slackChannel) return { id: slackChannel, name: slackChannelName };
+  const channel = await askSlackChannel("Which channel should this thread start in?");
+  return channel ? { id: channel.id, name: `#${channel.name}` } : null;
+}
+
+/** Which channel threads start in by default — asked each time when none is chosen. */
+async function pickSlackChannel(): Promise<void> {
+  if (!slackState?.connected) return;
+  const channel = await askSlackChannel("Which channel should threads start in?");
   if (!channel) return;
   settings.setSetup({ slackChannel: channel.id, slackChannelName: `#${channel.name}` });
   ui.status.textContent = channel.member
@@ -5582,13 +5619,9 @@ async function slackConnected(): Promise<boolean> {
   return true;
 }
 
-/** Whether a thread may be STARTED: connected, and with a channel to start it in. */
+/** Whether a thread may be STARTED: connected. The channel is asked when none is set. */
 async function slackReady(): Promise<boolean> {
   if (!(await slackConnected())) return false;
-  if (!settings.setup().slackChannel) {
-    ui.status.textContent = "Slack: choose a channel first — Settings → Integrations → Slack";
-    return false;
-  }
   return true;
 }
 
@@ -5634,10 +5667,12 @@ function readSlackLink(typed: string): { channel: string; ts: string } | null {
  * message with answers — so the note's name is posted as the first message, in the
  * vault's channel, and the link Slack mints for it is written home and opened.
  */
-async function makeSlackThread(path: string): Promise<void> {
+async function makeSlackThread(path: string, target?: { id: string; name: string } | null): Promise<void> {
   const bridge = window.bedrock;
   if (!bridge) return;
-  const { slackChannel, slackChannelName } = settings.setup();
+  const where = target ?? (await slackTarget());
+  if (!where) return; // no channel picked — the note stays, a click offers the start again
+  const { id: slackChannel, name: slackChannelName } = where;
   ui.status.textContent = `Slack: starting “${noteName(path)}” in ${slackChannelName}…`;
   let thread: SlackThread;
   try {
@@ -5679,9 +5714,10 @@ async function openSlackNode(path: string, url: string | null): Promise<void> {
     return;
   }
   if (!(await slackReady())) return;
-  const where = settings.setup().slackChannelName;
-  if (!(await askConfirm(`Start a thread in ${where}, with “${noteName(path)}” as its first message?`, "Post"))) return;
-  await makeSlackThread(path);
+  const where = await slackTarget();
+  if (!where) return;
+  if (!(await askConfirm(`Start a thread in ${where.name}, with “${noteName(path)}” as its first message?`, "Post"))) return;
+  await makeSlackThread(path, where);
 }
 
 /**
@@ -5695,6 +5731,8 @@ async function createSlackAt(
   source: string | null = null,
 ): Promise<void> {
   if (!(await slackReady())) return;
+  const where = await slackTarget();
+  if (!where) return;
   const dir = folder ?? "";
   const path = uniquePath(filePaths(), dir, "Slack thread", ".md");
   await vault.createFile(path, slackTemplate(""));
@@ -5710,18 +5748,18 @@ async function createSlackAt(
   }
   graphStale = true;
   await refreshSidebar();
-  ui.status.textContent = `created ${path} — name it, and that name opens a thread in ${settings.setup().slackChannelName}`;
+  ui.status.textContent = `created ${path} — name it, and that name opens a thread in ${where.name}`;
   graphView.renameNode(path, (name) => {
     void (async () => {
       const finalPath = name ? ((await applyRename(path, "file", name)) ?? path) : path;
       if (!source) {
-        await makeSlackThread(finalPath);
+        await makeSlackThread(finalPath, where);
         return;
       }
       // Linked thread: the link is written home first, unnamed — a click on the line
       // names it — and then the thread starts.
       await finishLink(source, finalPath, null);
-      await makeSlackThread(finalPath);
+      await makeSlackThread(finalPath, where);
     })();
   });
 }
@@ -6662,9 +6700,6 @@ type AttachOption = {
   /** Drawn dimmer, to the right — what tells two rows with the same name apart. */
   hint?: string;
   place: (at: { x: number; y: number }, folder: string | null, source: string | null) => Promise<void>;
-  /** A way in rather than a thing — "Search Notion…", "Paste a link…" — left out where a
-      search box already stands in for it. */
-  extra?: boolean;
 };
 
 type Attachable = {
@@ -6677,6 +6712,10 @@ type Attachable = {
   /** The service's own best matches for typed words; with it, the + offers a search box
       over the options, which are then the recent ones. */
   search?: (query: string) => Promise<AttachOption[]>;
+  /** Ways in rather than things — "Search Notion…", "Paste a link…" — known without
+      asking anyone, so a menu can show them before the list has loaded. The + leaves
+      them out where its search box already does what they do. */
+  ways?: AttachOption[];
 };
 
 /** A last-touched stamp, short enough to sit in a menu row. */
@@ -6850,11 +6889,10 @@ const ATTACHABLES: Attachable[] = [
     label: "Notion page",
     options: async () => {
       // An empty query lists what is recent, which is the right default for a menu. A
-      // workspace is bigger than any list, so the search stays reachable underneath it.
-      const rows = (await shellOrThrow().notionSearch("")).map(notionOption);
-      rows.push({ label: "Search Notion…", place: searchNotionAt, extra: true });
-      return rows;
+      // workspace is bigger than any list, so the search stays reachable beside it.
+      return (await shellOrThrow().notionSearch("")).map(notionOption);
     },
+    ways: [{ label: "Search Notion…", place: searchNotionAt }],
     search: async (query) => (await shellOrThrow().notionSearch(query)).map(notionOption),
   },
   {
@@ -6892,31 +6930,25 @@ const ATTACHABLES: Attachable[] = [
         hint: taskHint(task),
         place: (at, folder, source) => attachGoogleTask(task, at, folder, source),
       }));
-      rows.push({ label: "From another list…", place: pickGoogleTaskAt });
       return rows;
     },
+    ways: [{ label: "From another list…", place: pickGoogleTaskAt }],
   },
   {
     kind: "slack",
     feature: "slack",
     label: "Slack thread",
     options: async () => {
-      // The threads going in the vault's channel, newest first; a thread anywhere else —
-      // or one in this channel nobody has answered yet — comes in through a pasted link.
-      // The latest in the vault's channel, answered or not, by the last word said; a
-      // thread anywhere else is found by the search, or by a pasted link.
-      const channel = settings.setup().slackChannel;
-      const recent = channel
-        ? await shellOrThrow()
-            .slackRecent(channel, 30)
-            .catch((err: unknown) => {
-              throw new Error(shellError(err));
-            })
-        : [];
-      const rows = recent.map(slackOption);
-      rows.push({ label: "Paste a link…", place: pasteSlackThreadAt, extra: true });
-      return rows;
+      // The latest messages, answered or not, by the last word said under them — in the
+      // vault's channel when it has one, in every channel you are in when it has not.
+      const recent = await shellOrThrow()
+        .slackRecent(settings.setup().slackChannel, 30)
+        .catch((err: unknown) => {
+          throw new Error(shellError(err));
+        });
+      return recent.map(slackOption);
     },
+    ways: [{ label: "Paste a link…", place: pasteSlackThreadAt }],
     search: async (query) => {
       const bridge = shellOrThrow();
       // A pasted link is the most exact search there is.
@@ -7057,7 +7089,7 @@ function attachMenu(release: (option: AttachOption, kind: DraftKind) => () => vo
     label: one.label,
     icon: TYPE_ICONS[one.kind],
     children: async () => {
-      const options = await one.options();
+      const options = [...(await one.options()), ...(one.ways ?? [])];
       return options.map((option) => ({
         label: option.label,
         hint: option.hint,
@@ -7219,8 +7251,8 @@ const ATT_KINDS: Array<{ feature: Feature; kind: HolderKind; label: string; make
  * exists, picked from what the integration can see.
  */
 function attachItems(host: string): MenuItem[] {
+  // A new node is a click on empty canvas now; this menu is only what rides on the note.
   const items: MenuItem[] = [
-    { label: "New node", icon: NOTE_DOT, run: () => graphView.startLink(host) },
     {
       label: "Existing node",
       icon: NOTE_DOT,
@@ -7249,41 +7281,29 @@ function attachItems(host: string): MenuItem[] {
         ),
     });
     const search = listing.search;
-    if (search) {
-      // New on top, then the box — the service's best matches as you type — and under it
-      // the recent ones, latest first.
-      items.push({
-        label: row.label,
-        icon: TYPE_ICONS[row.kind],
-        search: {
-          placeholder: `Search ${row.label === "Slack thread" ? "Slack" : row.label.replace(/ page$/, "")}…`,
-          limit: 10,
-          top: row.make ? [{ label: `New ${row.label}`, icon: TYPE_ICONS[row.kind], run: make }] : [],
-          remote: async (query) =>
-            (
-              await search(query).catch((err: unknown) => {
-                throw new Error(shellError(err));
-              })
-            ).map(pick),
-        },
-        children: async () => (await listing.options()).filter((option) => !option.extra).map(pick),
-      });
-      continue;
-    }
+    // Every integration the same way: New on top, then a box, then the list. The box asks
+    // the service itself when it can search (Notion, Slack) and narrows the list otherwise;
+    // a way in that is not a thing ("From another list…") stands under New, unless the
+    // service's search already does what it does.
+    const ways = search ? [] : (listing.ways ?? []).map(pick);
     items.push({
       label: row.label,
       icon: TYPE_ICONS[row.kind],
-      children: async () => [
-        ...(row.make ? [{ label: `New ${row.label}`, run: make }] : []),
-        ...(await listing.options()).map((option) => ({
-          label: option.label,
-          hint: option.hint,
-          run: () =>
-            void withAttachTarget(host, () => option.place({ x: 0, y: 0 }, null, null)).then(() =>
-              graphView.openStrip(host),
-            ),
-        })),
-      ],
+      search: {
+        // A service that searches itself is named; a list that is only narrowed, what it lists.
+        placeholder: search ? `Search ${row.label.split(" ")[0]}…` : `Search ${row.label.toLowerCase()}s…`,
+        limit: 10,
+        top: [...(row.make ? [{ label: `New ${row.label}`, icon: TYPE_ICONS[row.kind], run: make }] : []), ...ways],
+        remote: search
+          ? async (query) =>
+              (
+                await search(query).catch((err: unknown) => {
+                  throw new Error(shellError(err));
+                })
+              ).map(pick)
+          : undefined,
+      },
+      children: async () => (await listing.options()).map(pick),
     });
   }
   return items;

@@ -1666,14 +1666,32 @@ ipcMain.handle("slack-recent", async (_event, rawChannel, rawLimit) => {
   const account = readSlack();
   if (!account) throw new Error("Slack is not connected");
   const channel = String(rawChannel || "");
-  if (!/^[CG][A-Z0-9]+$/.test(channel)) return [];
   const limit = Math.max(1, Math.min(Number(rawLimit) || 30, 100));
-  const page = await slackFetch(account.token, "conversations.history", { channel, limit: 100 });
-  return (page.messages || [])
-    .filter((message) => !message.subtype && slackPlain(message.text))
-    .map((message) => slackThreadRow(account, channel, message))
-    .sort((a, b) => b.latest - a.latest)
-    .slice(0, limit);
+  const latestIn = async (id, count) => {
+    const page = await slackFetch(account.token, "conversations.history", { channel: id, limit: count });
+    return (page.messages || [])
+      .filter((message) => !message.subtype && slackPlain(message.text))
+      .map((message) => slackThreadRow(account, id, message));
+  };
+  if (/^[CG][A-Z0-9]+$/.test(channel)) {
+    return (await latestIn(channel, 100)).sort((a, b) => b.latest - a.latest).slice(0, limit);
+  }
+  // No channel chosen: the few latest of every channel you are in, merged. Slack says
+  // nothing about which channels are busiest, so each is asked — a few at a time, and
+  // only so many, because history is rate-limited per workspace.
+  const mine = await slackFetch(account.token, "users.conversations", {
+    types: "public_channel,private_channel",
+    exclude_archived: true,
+    limit: 200,
+  });
+  const names = new Map((mine.channels || []).map((one) => [String(one.id), String(one.name || "")]));
+  const ids = [...names.keys()].slice(0, 30);
+  const found = [];
+  for (let i = 0; i < ids.length; i += 6) {
+    const batch = await Promise.all(ids.slice(i, i + 6).map((id) => latestIn(id, 5).catch(() => [])));
+    for (const rows of batch) found.push(...rows.map((row) => ({ ...row, place: `#${names.get(row.channel)}` })));
+  }
+  return found.sort((a, b) => b.latest - a.latest).slice(0, limit);
 });
 
 /**
