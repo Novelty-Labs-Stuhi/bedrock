@@ -19,9 +19,13 @@ export function inlineEdit(
   onCommit: (value: string) => void,
   onCancel: () => void,
   beside = false,
+  /** A name for something that has none yet: no box, nothing filled in — only a caret
+      where the name will stand. Clicking away from it empty is a change of mind. */
+  bare = false,
 ): InlineEditor {
   const input = document.createElement("input");
   input.className = beside ? "inline-edit beside" : "inline-edit";
+  if (bare) input.classList.add("bare");
   input.type = "text";
   input.spellcheck = false;
   input.value = value;
@@ -35,7 +39,7 @@ export function inlineEdit(
     settled = true;
     const next = input.value.trim();
     input.remove();
-    if (commit && next && next !== value) onCommit(next);
+    if (commit && next && (bare || next !== value)) onCommit(next);
     else onCancel();
   };
 

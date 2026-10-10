@@ -1764,6 +1764,8 @@ export class GraphView {
   private ringWheel = 0;
   /** A clicked connection: everything else dims, and its bin and pencil sit along it. */
   private edgeTools: { source: string; target: string; el: HTMLElement } | null = null;
+  /** When a name field last closed: the press that blurs one lands a moment before its tap. */
+  private renameClosedAt = 0;
   /** What arrives from outside: note path -> how many references elsewhere point at it. */
   private incoming = new Map<string, number>();
   /**
@@ -2496,7 +2498,8 @@ export class GraphView {
         this.draftRow !== null ||
         !!this.issue ||
         !!this.draftSource ||
-        !!this.rename;
+        !!this.rename ||
+        performance.now() - this.renameClosedAt < 500;
       this.closeStrip();
       this.closeEdgeTools();
       // "Until you click somewhere": a click on bare canvas is that somewhere. Cytoscape
@@ -3869,30 +3872,37 @@ export class GraphView {
    * typed name, or `null` when the field was dismissed unchanged — because callers chain further
    * steps onto it (naming a connection next) and a cancelled rename must not strand them.
    */
-  renameNode(path: string, onSettled: (name: string | null) => void): void {
+  renameNode(path: string, onSettled: (name: string | null) => void, fresh = false): void {
     const cy = this.cy;
     if (!cy) return;
     const node = cy.getElementById(path);
     if (node.empty()) return;
     this.rename?.editor.close();
     const at = this.renameAnchor(node as NodeSingular);
+    // A node being born has no name to show yet: its placeholder label stands aside for
+    // the caret, and comes back only if it is dismissed and kept.
+    const label = node.data("label") as string;
+    if (fresh) node.data("label", "");
     let settled = false;
     const done = (name: string | null): void => {
       if (settled) return;
       settled = true;
       this.rename = null;
+      this.renameClosedAt = performance.now();
+      if (fresh && name === null && node.inside()) node.data("label", label);
       onSettled(name);
     };
     const editor = inlineEdit(
       this.overlay,
       at,
-      noteName(path),
+      fresh ? "" : noteName(path),
       (value) => done(value),
       () => {
         this.handlers.onHint(null);
         done(null);
       },
       true,
+      fresh,
     );
     this.rename = { path, editor };
   }

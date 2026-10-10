@@ -1761,7 +1761,7 @@ async function createHolderAt(
       const finalPath = name ? ((await applyRename(path, "file", name)) ?? path) : path;
       if (source) await finishLink(source, finalPath, null);
     })();
-  });
+  }, true);
   await refreshSidebar();
 }
 

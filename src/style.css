@@ -2113,6 +2113,19 @@ button.issue-id:hover {
   box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
 }
 
+/* A new node's name: no field at all, only the caret where the label will be. */
+.inline-edit.beside.bare {
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  caret-color: var(--accent);
+  field-sizing: content;
+  min-width: 2px;
+  width: auto;
+}
+
 .inline-name {
   flex: 1;
   min-width: 0;
