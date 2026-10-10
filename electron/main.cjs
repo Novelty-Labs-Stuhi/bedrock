@@ -73,28 +73,12 @@ function openHandler({ url }) {
 
 /**
  * A window opened for no vault in particular — the first launch, File > New Window, the
- * dock icon with nothing open — goes to the most recently opened vault that is not already
- * in a window: the last one first, then the one before it, and so on down the list. Only
- * when every vault on the list is on screen (or the list is empty, or its folders are gone)
- * does it come up empty and ask, the way every window used to.
+ * dock icon with nothing open — opens on the vault picker. The last vault is not reopened
+ * on its own: the picker is the front door, its list is the recent vaults, and its corner
+ * is where an update says it has come.
  */
-function createWindow(url = null) {
-  let claim = null;
-  if (!url) {
-    const open = new Set(vaultRoots.values());
-    claim = readRecent().find((root) => !open.has(root) && fs.existsSync(root)) ?? null;
-    const address = new URL("app://-/");
-    if (claim) address.searchParams.set("root", claim);
-    url = address.toString();
-  }
+function createWindow(url = "app://-/") {
   const win = new BrowserWindow(windowOptions());
-  // Claimed at once, before the page has loaded and said so itself: two New Windows in quick
-  // succession must not both go to the same vault.
-  if (claim) {
-    const id = win.webContents.id;
-    vaultRoots.set(id, claim);
-    win.webContents.once("destroyed", () => vaultRoots.delete(id));
-  }
   win.webContents.setWindowOpenHandler(openHandler);
   // A window the renderer opened is a Bedrock window too, and gets the same rules.
   win.webContents.on("did-create-window", (child) => child.webContents.setWindowOpenHandler(openHandler));
@@ -4087,11 +4071,11 @@ ipcMain.handle("google-open", (_event, rawUrl) => {
 /* ------------------------------------------------------------------ updates --- */
 /*
  * A new Bedrock arrives on its own. The packaged app asks the download bucket for
- * `latest-mac.yml` shortly after launch and every few hours after that, and when the
- * version there is newer it fetches the zip in the background. Nobody hears about the
- * check or the download; the windows are told once, when the update is on disk, and
- * show a plaque that offers a restart. Left alone, the update installs itself the next
- * time the app quits — "Later" costs nothing.
+ * `latest-mac.yml` a moment after launch and every hour after that, and when the version
+ * there is newer it fetches the zip in the background. The windows are told as soon as
+ * one is found (`update-state`): the plaque says it is downloading, then that it is ready
+ * and offers a restart. Left alone, the update installs itself the next time the app
+ * quits — "Later" costs nothing.
  *
  * Squirrel.Mac will only take an update signed by the identity the running app carries,
  * and electron-updater checks the zip against the hash the manifest names, so the
@@ -4103,24 +4087,42 @@ ipcMain.handle("google-open", (_event, rawUrl) => {
  */
 const { autoUpdater } = require("electron-updater");
 
-/** The update sitting on disk, once one is: `{ version }`. Null until then. */
-let readyUpdate = null;
+/**
+ * The newer Bedrock, once one is found: `{ version, ready, percent }` — `ready` when it is
+ * on disk, `percent` of the download until then. Null while there is none.
+ */
+let updateState = null;
+/** The update sitting on disk, once one is. */
+const readyUpdate = () => (updateState && updateState.ready ? updateState : null);
 
-const CHECK_EVERY = 4 * 60 * 60 * 1000;
+const CHECK_EVERY = 60 * 60 * 1000;
+
+function tellUpdate(next) {
+  updateState = next;
+  for (const win of BrowserWindow.getAllWindows()) win.webContents.send("update-state", updateState);
+}
 
 function startUpdates() {
   if (!app.isPackaged) return;
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.on("update-available", (info) => {
+    if (readyUpdate()) return;
+    tellUpdate({ version: String(info.version), ready: false, percent: 0 });
+  });
+  autoUpdater.on("download-progress", (progress) => {
+    if (!updateState || updateState.ready) return;
+    const percent = Math.floor(progress.percent || 0);
+    if (percent !== updateState.percent) tellUpdate({ ...updateState, percent });
+  });
   autoUpdater.on("update-downloaded", (info) => {
-    readyUpdate = { version: String(info.version) };
-    for (const win of BrowserWindow.getAllWindows()) win.webContents.send("update-ready", readyUpdate);
+    tellUpdate({ version: String(info.version), ready: true, percent: 100 });
   });
   // No network, a bucket outage, the app running off the mounted dmg rather than from
   // /Applications — none of it is the person's problem. Noted, and asked again later.
   autoUpdater.on("error", (err) => console.warn("update check failed:", err && err.message ? err.message : err));
   const check = () => autoUpdater.checkForUpdates().catch(() => null);
-  setTimeout(check, 10_000);
+  setTimeout(check, 3_000);
   setInterval(check, CHECK_EVERY);
 }
 
@@ -4134,10 +4136,10 @@ async function checkForUpdatesByHand(win) {
     await say("Updates come with the packaged app", "Run from the repo, there is nothing to update to.");
     return;
   }
-  if (readyUpdate) {
+  if (readyUpdate()) {
     const { response } = await dialog.showMessageBox(win || undefined, {
       type: "info",
-      message: `Bedrock ${readyUpdate.version} is downloaded`,
+      message: `Bedrock ${readyUpdate().version} is downloaded`,
       detail: "It installs when Bedrock restarts.",
       buttons: ["Restart Now", "Later"],
       defaultId: 0,
@@ -4164,10 +4166,10 @@ async function checkForUpdatesByHand(win) {
 }
 
 ipcMain.handle("app-version", () => app.getVersion());
-// A window opened after the download asks, rather than waiting for a message it missed.
-ipcMain.handle("update-status", () => readyUpdate);
+// A window opened after an update was found asks, rather than waiting for a message it missed.
+ipcMain.handle("update-status", () => updateState);
 ipcMain.handle("update-install", () => {
-  if (!readyUpdate) return false;
+  if (!readyUpdate()) return false;
   autoUpdater.quitAndInstall();
   return true;
 });

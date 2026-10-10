@@ -9,7 +9,8 @@ interface FileSystemDirectoryHandle {
 type VaultListing = { name: string; root: string; edited: number; open: boolean };
 
 /** A newer Bedrock the shell has downloaded and is holding until a restart. */
-type UpdateInfo = { version: string };
+/** A newer Bedrock: downloading (`percent`) until it is `ready` on disk. */
+type UpdateInfo = { version: string; ready: boolean; percent: number };
 
 interface Window {
   showDirectoryPicker(options?: { mode?: "read" | "readwrite"; id?: string }): Promise<FileSystemDirectoryHandle>;
@@ -225,14 +226,14 @@ interface Window {
 
     /** What this build calls itself — package.json's version, stamped per release. */
     appVersion(): Promise<string>;
-    /** The newer Bedrock already downloaded, if there is one; null until then. */
+    /** The newer Bedrock the shell has found — downloading or ready — or null. */
     updateStatus(): Promise<UpdateInfo | null>;
     /** Quits into the downloaded update. False when there is none to install. */
     updateInstall(): Promise<boolean>;
     /** Asks the bucket now, and tells the person the answer in a dialog either way. */
     updateCheck(): Promise<void>;
-    /** A newer Bedrock finished downloading while this window was open. */
-    onUpdateReady(fn: (info: UpdateInfo) => void): void;
+    /** A newer Bedrock was found, came further down, or finished downloading. */
+    onUpdateState(fn: (info: UpdateInfo | null) => void): void;
 
     /** This window saying which vault it now has open, so the others can be asked whether
         a vault is already on screen. Null when it has none, or none with a known path. */

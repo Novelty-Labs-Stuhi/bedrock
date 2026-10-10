@@ -21,7 +21,9 @@
   --sel-strong: #35363a;
   /* For the one row or button under the cursor, which has to beat ordinary text. */
   --text-strong: #ffffff;
-  --accent: #f92411; /* the cola compound demo's colour */
+  /* Focus, the current choice, the answer that does something: a light grey — the chrome
+     wears no colour of its own, the notes are where colour is. */
+  --accent: #a9abb0;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
   font-size: 14px;
 }
@@ -674,7 +676,7 @@ button.twisty:hover {
   background: var(--bg-hover);
 }
 .format-bar button:active {
-  background: var(--accent);
+  background: var(--btn-on);
   color: #fff;
 }
 
@@ -1210,6 +1212,19 @@ button.twisty:hover {
 .update-word {
   margin-right: 4px;
   white-space: nowrap;
+}
+
+/* Amber while it comes down, green once it can be restarted into. */
+.update-dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: #d29922;
+}
+
+.update-dot.ready {
+  background: #3fb950;
 }
 
 /* The answer that does something is the one that looks like a button. */
