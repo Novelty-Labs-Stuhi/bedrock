@@ -1873,8 +1873,11 @@ async function turnHolderInto(
       ui.status.textContent = "File and folder links need the desktop app — npm start";
       return;
     }
-    pointer = await bridge.pickPath(kind);
+    // One sheet takes either; what was picked decides whether this is a file or a folder.
+    pointer = await bridge.pickPath("any");
     if (!pointer) return; // the picker was dismissed — still a holder
+    kind = (await bridge.isDir(pointer).catch(() => false)) ? "folder" : "file";
+    label = kind === "folder" ? "Folder" : "File";
   }
 
   // A thread needs a channel to start in; with none chosen for the vault, it is asked here,
@@ -6727,7 +6730,7 @@ const ATT_KINDS: Array<{ feature: Feature; kind: HolderKind; label: string; make
   { feature: "word", kind: "word", label: "Word document", make: true },
   { feature: "freeform", kind: "freeform", label: "Freeform board", make: true },
   { feature: "web", kind: "web", label: "Webpage", make: true },
-  { feature: "files", kind: "file", label: "File on disk", make: true },
+  { feature: "files", kind: "file", label: "File or folder", make: true },
 ];
 
 /**

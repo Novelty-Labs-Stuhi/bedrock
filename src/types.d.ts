@@ -28,7 +28,10 @@ interface Window {
     gitStatus(root: string): Promise<GitStatus>;
     /** The OS's own picker; a folder pick can create the folder right in the dialog.
         Null when the dialog was dismissed. `defaultPath` is where the sheet opens. */
-    pickPath(kind: "file" | "folder", options?: PickOptions): Promise<string | null>;
+    /** `any` takes a file or a folder, whichever is picked. */
+    pickPath(kind: "file" | "folder" | "any", options?: PickOptions): Promise<string | null>;
+    /** Whether a path on the disk is a folder. */
+    isDir(path: string): Promise<boolean>;
     /** Opens a path the OS way — default app for a file, Finder/Explorer for a folder.
         Resolves "opened", "missing", or whatever the OS said went wrong. */
     openPath(target: string): Promise<string>;

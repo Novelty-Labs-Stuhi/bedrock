@@ -648,11 +648,20 @@ ipcMain.handle("vault-create", (_event, rawName) => {
 
 ipcMain.handle("base-ref", (_event, full) => refForm(path.resolve(expandHome(String(full)))));
 
+/** Whether a picked path is a folder — what decides the tile a pointer to it wears. */
+ipcMain.handle("fs-is-dir", (_event, rawPath) => {
+  try {
+    return fs.statSync(String(rawPath || "")).isDirectory();
+  } catch {
+    return false;
+  }
+});
+
 ipcMain.handle("fs-pick", async (event, kind, options = {}) => {
   // A test hook: with BEDROCK_PICK_FOLDER set, every folder sheet answers with that folder
   // and never opens. The OS's dialog cannot be driven over the debugging port, and the
   // flows behind it (Move into…, Open Vault…) can.
-  if (kind === "folder" && process.env.BEDROCK_PICK_FOLDER) return process.env.BEDROCK_PICK_FOLDER;
+  if ((kind === "folder" || kind === "any") && process.env.BEDROCK_PICK_FOLDER) return process.env.BEDROCK_PICK_FOLDER;
   const win = BrowserWindow.fromWebContents(event.sender);
   const result = await dialog.showOpenDialog(win, {
     properties:
@@ -660,7 +669,10 @@ ipcMain.handle("fs-pick", async (event, kind, options = {}) => {
         ? // `createDirectory` puts the New Folder button in the macOS sheet; Windows'
           // folder picker has one of its own without being asked.
           ["openDirectory", "createDirectory"]
-        : ["openFile"],
+        : kind === "any"
+          ? // A file or a folder, whichever is picked — macOS lets one sheet take both.
+            ["openFile", "openDirectory"]
+          : ["openFile"],
     // Where the sheet opens: where the caller says — and for a folder with no say, the
     // Bedrock folder, so a fresh install's first sheet already stands where vaults go and
     // its New Folder button makes one.

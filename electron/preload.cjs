@@ -16,6 +16,7 @@ contextBridge.exposeInMainWorld("bedrock", {
   gitPull: (root, remote) => ipcRenderer.invoke("git-pull", root, remote),
   gitStatus: (root) => ipcRenderer.invoke("git-status", root),
   pickPath: (kind, options) => ipcRenderer.invoke("fs-pick", kind, options),
+  isDir: (path) => ipcRenderer.invoke("fs-is-dir", path),
   openPath: (target) => ipcRenderer.invoke("fs-open", target),
   vaultFs: (root, op, rel, arg) => ipcRenderer.invoke("vault-fs", root, op, rel, arg),
   peekNote: (target, root) => ipcRenderer.invoke("note-peek", target, root),
