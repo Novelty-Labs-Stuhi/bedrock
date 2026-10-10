@@ -2993,6 +2993,228 @@ ipcMain.handle("notes-open", async (_event, rawId) => {
 });
 
 /*
+ * Reminders and Calendar. Both have scripting dictionaries, so like Notes there is
+ * nothing to install — one Automation Allow per app. Bedrock only MAKES a blank one,
+ * titled after the note, and hands it to the app's own window to be finished there: the
+ * date, the alarm, the invitees are Apple's UI, not ours. What crosses back is the id.
+ */
+const REMINDERS_APP = "/System/Applications/Reminders.app";
+const CALENDAR_APP = "/System/Applications/Calendar.app";
+
+/** The open reminders of every list, latest edit first — three Apple events per list. */
+const REMINDERS_LIST = `
+const R = Application("Reminders");
+const out = [];
+for (const list of R.lists()) {
+  const name = list.name();
+  const open = list.reminders.whose({ completed: false });
+  const ids = open.id(), names = open.name(), dates = open.modificationDate();
+  for (let i = 0; i < ids.length; i++) {
+    out.push({ id: String(ids[i]), title: String(names[i] || ""), list: name, at: dates[i] instanceof Date ? dates[i].getTime() : 0 });
+  }
+}
+out.sort((a, b) => b.at - a.at);
+JSON.stringify(out.slice(0, 200));`;
+
+/** The list and title arrive as argv. "" is Reminders' own default list — where a
+    reminder made anywhere else on the Mac would land; a named list is made if missing. */
+const REMINDERS_CREATE = `
+function run(argv) {
+  const listName = String(argv[0] || "");
+  const title = String(argv[1] || "Untitled");
+  const R = Application("Reminders");
+  let target = listName ? null : R.defaultList();
+  if (!target) {
+    for (const list of R.lists()) {
+      if (list.name() === listName) { target = list; break; }
+    }
+  }
+  if (!target) {
+    target = R.List({ name: listName });
+    R.lists.push(target);
+  }
+  const reminder = R.Reminder({ name: title });
+  target.reminders.push(reminder);
+  return JSON.stringify({ id: String(reminder.id()), title: String(reminder.name()), list: target.name(), at: Date.now() });
+}`;
+
+const REMINDERS_LISTS = `JSON.stringify(Application("Reminders").lists.name());`;
+
+/** Selected in its list with the title ready to type into — Reminders' own edit mode. */
+const REMINDERS_SHOW = `
+function run(argv) {
+  const R = Application("Reminders");
+  const reminder = R.reminders.byId(String(argv[0]));
+  reminder.name(); // throws here, worded, when the reminder is gone
+  R.activate();
+  R.show(reminder);
+  return "ok";
+}`;
+
+/** Calendars nobody writes into by hand, left out of every list Bedrock shows. */
+const CALENDAR_SKIP = ["Birthdays", "Siri Suggestions", "Scheduled Reminders"];
+
+/** The next fortnight, every calendar. Slow (seconds) on a big iCloud account, and a
+    repeating event shows only on its first date — Calendar's dictionary sees masters. */
+const CALENDAR_UPCOMING = `
+function run(argv) {
+  const skip = JSON.parse(argv[0]);
+  const C = Application("Calendar");
+  const now = new Date(), until = new Date(now.getTime() + 14 * 864e5);
+  const out = [];
+  for (const cal of C.calendars()) {
+    const name = cal.name();
+    if (skip.indexOf(name) >= 0) continue;
+    const hit = cal.events.whose({ _and: [{ startDate: { _greaterThan: now } }, { startDate: { _lessThan: until } }] });
+    const uids = hit.uid(), titles = hit.summary(), starts = hit.startDate();
+    for (let i = 0; i < uids.length; i++) {
+      out.push({ id: String(uids[i]), title: String(titles[i] || ""), calendar: name, at: starts[i] instanceof Date ? starts[i].getTime() : 0 });
+    }
+  }
+  out.sort((a, b) => a.at - b.at);
+  return JSON.stringify(out.slice(0, 200));
+}`;
+
+/** The calendars a new event could go in: writable, and not one of the skipped. */
+const CALENDAR_CALENDARS = `
+function run(argv) {
+  const skip = JSON.parse(argv[0]);
+  const names = [];
+  for (const cal of Application("Calendar").calendars()) {
+    let writable = false;
+    try { writable = cal.writable(); } catch (e) {}
+    const name = cal.name();
+    if (writable && skip.indexOf(name) < 0 && names.indexOf(name) < 0) names.push(name);
+  }
+  return JSON.stringify(names);
+}`;
+
+/**
+ * A one-hour event at the next half hour — a placeholder the edit popover opens on, so
+ * the real time is set where times are set. "" means the first writable calendar.
+ */
+const CALENDAR_CREATE = `
+function run(argv) {
+  const calName = String(argv[0] || "");
+  const title = String(argv[1] || "Untitled");
+  const skip = JSON.parse(argv[2]);
+  const C = Application("Calendar");
+  let target = null;
+  let first = null;
+  for (const cal of C.calendars()) {
+    let writable = false;
+    try { writable = cal.writable(); } catch (e) {}
+    if (!writable) continue;
+    const name = cal.name();
+    if (name === calName) { target = cal; break; }
+    if (!first && skip.indexOf(name) < 0) first = cal;
+  }
+  target = target || first;
+  if (!target) throw new Error("no calendar here can be written to");
+  const start = new Date();
+  start.setSeconds(0, 0);
+  start.setMinutes(start.getMinutes() < 30 ? 30 : 60);
+  const end = new Date(start.getTime() + 3600e3);
+  const event = C.Event({ summary: title, startDate: start, endDate: end });
+  target.events.push(event);
+  return JSON.stringify({ id: String(event.uid()), title, calendar: target.name(), at: start.getTime() });
+}`;
+
+/** The same refusal as Notes', addressed to whichever app it was. */
+function automationError(err, app) {
+  const said = String((err && err.message) || err);
+  if (said.includes("-1743") || /not authori[sz]ed/i.test(said)) {
+    return new Error(
+      `macOS is keeping Bedrock away from ${app} — System Settings → Privacy & Security → Automation → Bedrock → ${app}`,
+    );
+  }
+  return new Error(said.replace(/^.*execution error: /, "").trim() || `${app} did not answer`);
+}
+
+const jxa = (script, ...args) => command("osascript", ["-l", "JavaScript", "-e", script, ...args]);
+
+ipcMain.handle("reminders-status", () => ({
+  app: process.platform === "darwin" && fs.existsSync(REMINDERS_APP),
+}));
+
+ipcMain.handle("reminders-list", async (_event, limit = 40) => {
+  try {
+    return JSON.parse((await jxa(REMINDERS_LIST)) || "[]").slice(0, Math.max(1, Number(limit) || 40));
+  } catch (err) {
+    throw automationError(err, "Reminders");
+  }
+});
+
+ipcMain.handle("reminders-create", async (_event, rawList, rawTitle) => {
+  const list = String(rawList ?? "").trim();
+  const title = String(rawTitle ?? "").trim() || "Untitled";
+  try {
+    return JSON.parse(await jxa(REMINDERS_CREATE, list, title));
+  } catch (err) {
+    throw automationError(err, "Reminders");
+  }
+});
+
+ipcMain.handle("reminders-lists", async () => {
+  try {
+    return JSON.parse((await jxa(REMINDERS_LISTS)) || "[]");
+  } catch (err) {
+    throw automationError(err, "Reminders");
+  }
+});
+
+ipcMain.handle("reminders-open", async (_event, rawId) => {
+  const id = String(rawId || "");
+  if (!id.startsWith("x-apple-reminder://")) return false;
+  try {
+    await jxa(REMINDERS_SHOW, id);
+    return true;
+  } catch (err) {
+    throw automationError(err, "Reminders");
+  }
+});
+
+ipcMain.handle("calendar-status", () => ({
+  app: process.platform === "darwin" && fs.existsSync(CALENDAR_APP),
+}));
+
+ipcMain.handle("calendar-upcoming", async (_event, limit = 40) => {
+  try {
+    const raw = await jxa(CALENDAR_UPCOMING, JSON.stringify(CALENDAR_SKIP));
+    return JSON.parse(raw || "[]").slice(0, Math.max(1, Number(limit) || 40));
+  } catch (err) {
+    throw automationError(err, "Calendar");
+  }
+});
+
+ipcMain.handle("calendar-calendars", async () => {
+  try {
+    return JSON.parse((await jxa(CALENDAR_CALENDARS, JSON.stringify(CALENDAR_SKIP))) || "[]");
+  } catch (err) {
+    throw automationError(err, "Calendar");
+  }
+});
+
+ipcMain.handle("calendar-create", async (_event, rawCalendar, rawTitle) => {
+  const calendar = String(rawCalendar ?? "").trim();
+  const title = String(rawTitle ?? "").trim() || "Untitled";
+  try {
+    return JSON.parse(await jxa(CALENDAR_CREATE, calendar, title, JSON.stringify(CALENDAR_SKIP)));
+  } catch (err) {
+    throw automationError(err, "Calendar");
+  }
+});
+
+/** `show` in Calendar's dictionary only highlights the event; this address opens its
+    edit popover — the one place an event's time, place and invitees are set. */
+ipcMain.handle("calendar-open", (_event, rawId) => {
+  const uid = String(rawId || "");
+  if (!/^[\w.@:+-]+$/.test(uid)) return false;
+  void shell.openExternal(`ical://ekevent/${encodeURIComponent(uid)}?method=show&options=more`);
+  return true;
+});
+
+/*
  * Remote MCP servers. Notion and Granola are both reached over the MCP server each of
  * them runs (mcp.notion.com, mcp.granola.ai) rather than a REST key: linking is OAuth
  * in the real browser — this shell registers itself as a client, opens the consent page,

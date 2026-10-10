@@ -226,6 +226,8 @@ const graphView = new GraphView(ui.cy, {
   onOpenSlack: (path, url) => void openSlackNode(path, url),
   onOpenGoogleTask: (path, task, url) => void openGoogleTaskNode(path, task, url),
   onOpenAppleNote: (path, note) => void openAppleNoteNode(path, note),
+  onOpenReminder: (path, id) => void openReminderNode(path, id),
+  onOpenCalEvent: (path, id) => void openCalEventNode(path, id),
   onOpenWord: (path, doc) => void openWordNode(path, doc),
   onLinkExisting: (source, target) => linkNotes(source, target),
   onLinkNew: (source, at, kind) => {
@@ -1828,7 +1830,11 @@ async function turnHolderInto(
   const ready =
     kind === "applenote"
       ? await appleNotesReady()
-      : kind === "notion"
+      : kind === "reminder"
+        ? await remindersReady()
+        : kind === "calevent"
+          ? await calendarReady()
+          : kind === "notion"
         ? await notionReady()
         : kind === "slack"
           ? await slackReady()
@@ -1890,6 +1896,10 @@ async function turnHolderInto(
   switch (kind) {
     case "applenote":
       return makeAppleNote(path);
+    case "reminder":
+      return makeReminder(path);
+    case "calevent":
+      return makeCalEvent(path);
     case "notion":
       return makeNotionPage(path);
     case "slack":
@@ -2983,6 +2993,56 @@ function integrationPage(feature: Feature): SetupPage | null {
       return { status, ready: on, lines };
     }
 
+    case "reminders":
+    case "calendar": {
+      const app = feature === "reminders" ? "Reminders" : "Calendar";
+      if (!bridge) {
+        return {
+          status: "desktop app only",
+          lines: [{ label: "Why", value: `${app} is driven through the Mac's own scripting door, which a browser tab cannot reach — npm start` }],
+        };
+      }
+      const state = feature === "reminders" ? remindersState : calendarState;
+      if (state && !state.app) {
+        return { status: `no ${app} here`, lines: [{ label: app, value: "not on this Mac, and nothing here can work without it." }] };
+      }
+      const on = settings.enabled(feature);
+      const chosen = feature === "reminders" ? setup.remindersList : setup.calendarName;
+      const word = feature === "reminders" ? remindersWord : calendarWord;
+      const lines: SetupLine[] = [
+        {
+          label: "What this is",
+          value:
+            feature === "reminders"
+              ? "reminders attached to a note. Bedrock makes a blank one titled after the note and shows it in Reminders — the date, the alarm and the rest are set there. Bedrock keeps only its id."
+              : "events attached to a note. Bedrock makes a one-hour placeholder at the next half hour, titled after the note, and opens it in Calendar's own editor — the real time, place and invitees are set there. Bedrock keeps only its id.",
+        },
+        {
+          label: "Permission",
+          value: `nothing to install: ${app} answers to scripting directly. The first real action makes macOS ask whether Bedrock may drive ${app} — one Allow click, kept under System Settings → Privacy & Security → Automation.`,
+        },
+        {
+          label: feature === "reminders" ? "New reminders go in" : "New events go in",
+          value:
+            chosen ||
+            (feature === "reminders" ? "Reminders' own default list" : "the first calendar that can be written to"),
+          action: { id: feature === "reminders" ? "list" : "calendar", label: chosen ? "Change…" : "Choose…" },
+        },
+      ];
+      if (chosen) lines.push({ label: "", value: "go back to the default", action: { id: "reset", label: "Forget it" } });
+      lines.push({
+        label: "Try it",
+        value:
+          word ||
+          (feature === "reminders"
+            ? "makes a real reminder called “Bedrock connected” and shows it — proof the whole road works"
+            : "makes a real event called “Bedrock connected” at the next half hour and opens it — proof the whole road works"),
+        action: { id: "test", label: "Try it" },
+      });
+      const status = !state ? "not read yet" : on ? "ready" : "try it";
+      return { status, ready: on, lines };
+    }
+
     case "word": {
       if (!bridge) {
         return {
@@ -3067,6 +3127,12 @@ function runIntegrationAction(feature: Feature, action: string): void {
   else if (feature === "applenotes" && action === "test") void testAppleNotes();
   else if (feature === "applenotes" && action === "folder") void setUpNotesFolder();
   else if (feature === "applenotes" && action === "reset") forgetNotesFolder();
+  else if (feature === "reminders" && action === "test") void testReminders();
+  else if (feature === "reminders" && action === "list") void setUpRemindersList();
+  else if (feature === "reminders" && action === "reset") forgetRemindersList();
+  else if (feature === "calendar" && action === "test") void testCalendar();
+  else if (feature === "calendar" && action === "calendar") void setUpCalendarName();
+  else if (feature === "calendar" && action === "reset") forgetCalendarName();
   else if (feature === "word" && action === "folder") void setUpWordFolder();
   else if (feature === "word" && action === "reset") forgetWordFolder();
   else if (feature === "word" && action === "test") void testWord();
@@ -3434,6 +3500,240 @@ async function appleNotesReady(): Promise<boolean> {
     return false;
   }
   return true;
+}
+
+/* ------------------------------------------------- reminders and calendar --- */
+
+/** Whether each app is on this Mac; null until the shell says. */
+let remindersState: { app: boolean } | null = null;
+let calendarState: { app: boolean } | null = null;
+/** The last try's outcome, worded for the page. */
+let remindersWord = "";
+let calendarWord = "";
+
+async function refreshReminders(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  remindersState = await bridge.remindersStatus().catch(() => null);
+  redrawSettings();
+}
+
+async function refreshCalendar(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  calendarState = await bridge.calendarStatus().catch(() => null);
+  redrawSettings();
+}
+
+async function setUpRemindersList(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  let lists: string[] = [];
+  try {
+    lists = await bridge.remindersLists();
+  } catch (err) {
+    ui.status.textContent = `Reminders: ${(err as Error).message}`;
+    return;
+  }
+  const chosen = await askChoice(
+    "Which list should new reminders go in?",
+    lists,
+    "A new list…",
+    "Name the list — it is made when first needed",
+    settings.setup().remindersList,
+  );
+  if (!chosen) return;
+  settings.setSetup({ remindersList: chosen });
+  ui.status.textContent = `Reminders: new reminders go in “${chosen}”`;
+  redrawSettings();
+}
+
+function forgetRemindersList(): void {
+  settings.setSetup({ remindersList: "" });
+  ui.status.textContent = "Reminders: new reminders go in the default list";
+  redrawSettings();
+}
+
+async function setUpCalendarName(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  let calendars: string[] = [];
+  try {
+    calendars = await bridge.calendarCalendars();
+  } catch (err) {
+    ui.status.textContent = `Calendar: ${(err as Error).message}`;
+    return;
+  }
+  const chosen = await askPick(
+    "Which calendar should new events go in?",
+    calendars.map((label) => ({ label })),
+  );
+  if (!chosen) return;
+  settings.setSetup({ calendarName: chosen });
+  ui.status.textContent = `Calendar: new events go in “${chosen}”`;
+  redrawSettings();
+}
+
+function forgetCalendarName(): void {
+  settings.setSetup({ calendarName: "" });
+  ui.status.textContent = "Calendar: new events go in the first writable calendar";
+  redrawSettings();
+}
+
+/** The activation, as for Notes: make a real one, show it — and passing switches it on. */
+async function testReminders(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  remindersWord = "creating a reminder — macOS may ask you to allow this…";
+  redrawSettings();
+  try {
+    const one = await bridge.remindersCreate(settings.setup().remindersList, "Bedrock connected");
+    settings.set("reminders", true);
+    remindersWord = `made “${one.title}” in ${one.list} just now — it should be on your screen`;
+    ui.status.textContent = "Reminders: connected";
+    void bridge.remindersOpen(one.id).catch(() => false);
+  } catch (err) {
+    remindersWord = (err as Error).message;
+    ui.status.textContent = `Reminders: ${remindersWord}`;
+  }
+  redrawSettings();
+}
+
+async function testCalendar(): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  calendarWord = "creating an event — macOS may ask you to allow this…";
+  redrawSettings();
+  try {
+    const one = await bridge.calendarCreate(settings.setup().calendarName, "Bedrock connected");
+    settings.set("calendar", true);
+    calendarWord = `made “${one.title}” in ${one.calendar} just now — it should be open on your screen`;
+    ui.status.textContent = "Calendar: connected";
+    void bridge.calendarOpen(one.id);
+  } catch (err) {
+    calendarWord = (err as Error).message;
+    ui.status.textContent = `Calendar: ${calendarWord}`;
+  }
+  redrawSettings();
+}
+
+async function remindersReady(): Promise<boolean> {
+  const bridge = window.bedrock;
+  if (!bridge) {
+    ui.status.textContent = "Reminders need the desktop app — npm start";
+    return false;
+  }
+  remindersState = await bridge.remindersStatus().catch(() => null);
+  if (!remindersState?.app) {
+    ui.status.textContent = "Reminders is not on this Mac";
+    redrawSettings();
+    return false;
+  }
+  return true;
+}
+
+async function calendarReady(): Promise<boolean> {
+  const bridge = window.bedrock;
+  if (!bridge) {
+    ui.status.textContent = "Calendar events need the desktop app — npm start";
+    return false;
+  }
+  calendarState = await bridge.calendarStatus().catch(() => null);
+  if (!calendarState?.app) {
+    ui.status.textContent = "Calendar is not on this Mac";
+    redrawSettings();
+    return false;
+  }
+  return true;
+}
+
+/** What a reminder or event is titled: its note's name — an attachment's own file name
+    carries a number when the note has more than one. */
+const titleFor = (path: string): string => noteName(graphView.hostOf(path) ?? path);
+
+/** The pointer, as for an Apple note: the id Apple minted, empty until it is made. */
+const reminderTemplate = (id: string): string =>
+  id ? `type:: reminder\n\nreminder:: ${id}\n` : `type:: reminder\n`;
+const calEventTemplate = (id: string): string => (id ? `type:: calevent\n\nevent:: ${id}\n` : `type:: calevent\n`);
+
+/**
+ * Makes the reminder or event a note here stands for, titled what the note is named,
+ * writes the id home, and hands it to the app to be finished — Reminders shows it
+ * selected, Calendar opens its edit popover.
+ */
+async function makeReminder(path: string): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  const title = titleFor(path);
+  ui.status.textContent = `Reminders: creating “${title}”…`;
+  let one: AppleReminder;
+  try {
+    one = await bridge.remindersCreate(settings.setup().remindersList, title);
+  } catch (err) {
+    ui.status.textContent = `Reminders: ${(err as Error).message}`;
+    return;
+  }
+  await writePointer(path, "reminder", one.id);
+  graphView.setReminder(path, one.id);
+  void bridge.remindersOpen(one.id).catch(() => false);
+  ui.status.textContent = `${title} → a reminder in ${one.list} — finish it in Reminders`;
+}
+
+async function makeCalEvent(path: string): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) return;
+  const title = titleFor(path);
+  ui.status.textContent = `Calendar: creating “${title}”…`;
+  let one: CalendarEvent;
+  try {
+    one = await bridge.calendarCreate(settings.setup().calendarName, title);
+  } catch (err) {
+    ui.status.textContent = `Calendar: ${(err as Error).message}`;
+    return;
+  }
+  await writePointer(path, "event", one.id);
+  graphView.setCalEvent(path, one.id);
+  void bridge.calendarOpen(one.id);
+  ui.status.textContent = `${title} → an event in ${one.calendar} — set its time in Calendar`;
+}
+
+async function writePointer(path: string, field: string, id: string): Promise<void> {
+  await flushAll(); // the note may be open and mid-edit; the write must not clobber
+  await vault.write(path, setField(await vault.read(path), field, id));
+  graphStale = true;
+  for (let i = 0; i < panes.length; i++) if (pathOf(panes[i]) === path) await renderPage(i);
+}
+
+async function openReminderNode(path: string, id: string | null): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) {
+    ui.status.textContent = "Reminders need the desktop app — npm start";
+    return;
+  }
+  if (!id) {
+    if (await remindersReady()) await makeReminder(path);
+    return;
+  }
+  try {
+    const opened = await bridge.remindersOpen(id);
+    ui.status.textContent = opened ? `${titleFor(path)} → Reminders` : "the reminder:: line is not a reminder id";
+  } catch (err) {
+    ui.status.textContent = `Reminders: ${(err as Error).message}`;
+  }
+}
+
+async function openCalEventNode(path: string, id: string | null): Promise<void> {
+  const bridge = window.bedrock;
+  if (!bridge) {
+    ui.status.textContent = "Calendar events need the desktop app — npm start";
+    return;
+  }
+  if (!id) {
+    if (await calendarReady()) await makeCalEvent(path);
+    return;
+  }
+  const opened = await bridge.calendarOpen(id).catch(() => false);
+  ui.status.textContent = opened ? `${titleFor(path)} → Calendar` : "the event:: line is not an event id";
 }
 
 /* -------------------------------------------------------- word's own page --- */
@@ -6460,6 +6760,56 @@ const ATTACHABLES: Attachable[] = [
     },
   },
   {
+    kind: "reminder",
+    feature: "reminders",
+    label: "Reminder",
+    options: async () => {
+      const reminders = await shellOrThrow().remindersList(40);
+      return reminders.map((one) => ({
+        label: one.title || "Untitled",
+        hint: one.list,
+        place: (at, folder, source) =>
+          attachNodeAt(
+            {
+              kind: "reminder",
+              title: one.title,
+              text: reminderTemplate(one.id),
+              handle: one.id,
+              done: `${one.title || "Untitled"} → its reminder`,
+            },
+            at,
+            folder,
+            source,
+          ),
+      }));
+    },
+  },
+  {
+    kind: "calevent",
+    feature: "calendar",
+    label: "Calendar event",
+    options: async () => {
+      const events = await shellOrThrow().calendarUpcoming(40);
+      return events.map((one) => ({
+        label: one.title || "Untitled",
+        hint: `${shortWhen(one.at)} · ${one.calendar}`,
+        place: (at, folder, source) =>
+          attachNodeAt(
+            {
+              kind: "calevent",
+              title: one.title,
+              text: calEventTemplate(one.id),
+              handle: one.id,
+              done: `${one.title || "Untitled"} → its event in Calendar`,
+            },
+            at,
+            folder,
+            source,
+          ),
+      }));
+    },
+  },
+  {
     kind: "notion",
     feature: "notion",
     label: "Notion page",
@@ -6827,6 +7177,8 @@ async function withAttachTarget(host: string, run: () => Promise<void>): Promise
 const ATT_KINDS: Array<{ feature: Feature; kind: HolderKind; label: string; make: boolean }> = [
   { feature: "notion", kind: "notion", label: "Notion page", make: true },
   { feature: "applenotes", kind: "applenote", label: "Apple note", make: true },
+  { feature: "reminders", kind: "reminder", label: "Reminder", make: true },
+  { feature: "calendar", kind: "calevent", label: "Calendar event", make: true },
   { feature: "claude", kind: "claude", label: "Claude session", make: true },
   { feature: "antigravity", kind: "antigravity", label: "Antigravity session", make: true },
   { feature: "granola", kind: "granola", label: "Granola meeting", make: false },
@@ -7033,6 +7385,8 @@ async function openForeign(type: string, data: Record<string, unknown>): Promise
     slack: ["sthread", (url) => bridge.slackOpen(url)],
     gtask: ["gurl", (url) => bridge.googleOpen(url)],
     applenote: ["anote", (id) => bridge.notesOpen(id)],
+    reminder: ["rmd", (id) => bridge.remindersOpen(id)],
+    calevent: ["cev", (id) => bridge.calendarOpen(id)],
     granola: ["gmeet", (id) => bridge.granolaOpen(id)],
     word: ["wdoc", (path) => bridge.wordOpen(path)],
     file: ["fspath", (path) => bridge.openPath(path)],
@@ -7308,6 +7662,8 @@ ui.settings.addEventListener("click", () => {
   void refreshSlack();
   void refreshGoogle();
   void refreshAppleNotes();
+  void refreshReminders();
+  void refreshCalendar();
   void refreshWord();
 });
 // The desktop app has a real menu bar — Settings… under the app's name (⌘,), Open

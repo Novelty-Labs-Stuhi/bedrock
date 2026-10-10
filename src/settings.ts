@@ -28,6 +28,8 @@ export type Feature =
   | "slack"
   | "google"
   | "applenotes"
+  | "reminders"
+  | "calendar"
   | "word";
 
 export const CONFIG_FILE = ".notes/config.json";
@@ -55,6 +57,8 @@ const DEFAULTS: Record<Feature, boolean> = {
   slack: false,
   google: false,
   applenotes: false,
+  reminders: false,
+  calendar: false,
   word: false,
 };
 
@@ -291,6 +295,10 @@ export type Setup = {
    * account, or "" for the default the shell keeps (“Bedrock”).
    */
   notesFolder: string;
+  /** Which Reminders list new reminders go in — "" for Reminders' own default list. */
+  remindersList: string;
+  /** Which calendar new events go in — "" for the first one that can be written to. */
+  calendarName: string;
 };
 
 const SETUP_DEFAULT: Setup = {
@@ -308,6 +316,8 @@ const SETUP_DEFAULT: Setup = {
   gitRemote: "",
   wordFolder: "",
   notesFolder: "",
+  remindersList: "",
+  calendarName: "",
 };
 
 const clampSize = (value: number): number =>
@@ -747,6 +757,16 @@ const INTEGRATIONS: Row[] = [
     feature: "applenotes",
     name: "Apple Notes",
     what: "notes that point at Apple's notes — link them and make new ones from here (desktop app, Mac)",
+  },
+  {
+    feature: "reminders",
+    name: "Reminders",
+    what: "reminders attached to a note — make one and finish it in Reminders, or attach one you have (desktop app, Mac)",
+  },
+  {
+    feature: "calendar",
+    name: "Calendar",
+    what: "events attached to a note — make one and finish it in Calendar's own editor, or attach an upcoming one (desktop app, Mac)",
   },
   {
     feature: "word",
