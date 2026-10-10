@@ -120,6 +120,10 @@ interface Window {
     slackChannels(): Promise<Array<{ id: string; name: string; member: boolean; private: boolean }>>;
     /** The threads going in a channel — its answered messages, newest first. */
     slackThreads(channel: string, limit?: number): Promise<SlackThread[]>;
+    /** The channel's latest messages, answered or not, by last activity. */
+    slackRecent(channel: string, limit?: number): Promise<SlackThread[]>;
+    /** Slack's own search, best match first — needs a user token with search:read. */
+    slackSearch(query: string): Promise<SlackThread[]>;
     /** One thread, by the channel and timestamp that name it — what a pasted link comes to. */
     slackThread(channel: string, ts: string): Promise<SlackThread>;
     /** Starts a thread: posts `text` as its first message, and resolves with the thread. */
@@ -359,6 +363,8 @@ type SlackThread = {
   latest: number;
   /** The thread's permalink — what the note keeps, and what a click opens. */
   url: string;
+  /** Where a search found it — `#channel` — when it came from a search. */
+  place?: string;
 };
 
 /** A Google task as the pointer Bedrock keeps: the title, the due date and the tick stay

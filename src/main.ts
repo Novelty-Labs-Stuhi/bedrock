@@ -6662,6 +6662,9 @@ type AttachOption = {
   /** Drawn dimmer, to the right — what tells two rows with the same name apart. */
   hint?: string;
   place: (at: { x: number; y: number }, folder: string | null, source: string | null) => Promise<void>;
+  /** A way in rather than a thing — "Search Notion…", "Paste a link…" — left out where a
+      search box already stands in for it. */
+  extra?: boolean;
 };
 
 type Attachable = {
@@ -6671,6 +6674,9 @@ type Attachable = {
   label: string;
   /** What could be attached to. Throws something worth reading when it cannot say. */
   options: () => Promise<AttachOption[]>;
+  /** The service's own best matches for typed words; with it, the + offers a search box
+      over the options, which are then the recent ones. */
+  search?: (query: string) => Promise<AttachOption[]>;
 };
 
 /** A last-touched stamp, short enough to sit in a menu row. */
@@ -6732,6 +6738,35 @@ function shellOrThrow(): NonNullable<Window["bedrock"]> {
   if (!bridge) throw new Error("needs the desktop app");
   return bridge;
 }
+
+const notionOption = (page: NotionPage): AttachOption => ({
+  label: page.title || "Untitled",
+  place: (at, folder, source) =>
+    attachNodeAt(
+      {
+        kind: "notion",
+        title: page.title,
+        text: notionTemplate(page.url),
+        handle: page.url,
+        done: `${page.title || "Untitled"} → its page in Notion`,
+      },
+      at,
+      folder,
+      source,
+    ),
+});
+
+const slackOption = (thread: SlackThread): AttachOption => ({
+  label: slackLabel(thread.text),
+  hint: [
+    thread.place,
+    thread.replies ? `${thread.replies} ${thread.replies === 1 ? "reply" : "replies"}` : "",
+    when(thread.latest),
+  ]
+    .filter(Boolean)
+    .join(" · "),
+  place: (at, folder, source) => attachSlackThread(thread, at, folder, source),
+});
 
 const ATTACHABLES: Attachable[] = [
   {
@@ -6816,26 +6851,11 @@ const ATTACHABLES: Attachable[] = [
     options: async () => {
       // An empty query lists what is recent, which is the right default for a menu. A
       // workspace is bigger than any list, so the search stays reachable underneath it.
-      const pages = await shellOrThrow().notionSearch("");
-      const rows: AttachOption[] = pages.map((page) => ({
-        label: page.title || "Untitled",
-        place: (at, folder, source) =>
-          attachNodeAt(
-            {
-              kind: "notion",
-              title: page.title,
-              text: notionTemplate(page.url),
-              handle: page.url,
-              done: `${page.title || "Untitled"} → its page in Notion`,
-            },
-            at,
-            folder,
-            source,
-          ),
-      }));
-      rows.push({ label: "Search Notion…", place: searchNotionAt });
+      const rows = (await shellOrThrow().notionSearch("")).map(notionOption);
+      rows.push({ label: "Search Notion…", place: searchNotionAt, extra: true });
       return rows;
     },
+    search: async (query) => (await shellOrThrow().notionSearch(query)).map(notionOption),
   },
   {
     kind: "granola",
@@ -6883,23 +6903,26 @@ const ATTACHABLES: Attachable[] = [
     options: async () => {
       // The threads going in the vault's channel, newest first; a thread anywhere else —
       // or one in this channel nobody has answered yet — comes in through a pasted link.
-      const bridge = shellOrThrow();
+      // The latest in the vault's channel, answered or not, by the last word said; a
+      // thread anywhere else is found by the search, or by a pasted link.
       const channel = settings.setup().slackChannel;
-      const rows: AttachOption[] = [];
-      if (channel) {
-        const threads = await bridge.slackThreads(channel, 30).catch((err: unknown) => {
-          throw new Error(shellError(err));
-        });
-        for (const thread of threads) {
-          rows.push({
-            label: slackLabel(thread.text),
-            hint: `${thread.replies} ${thread.replies === 1 ? "reply" : "replies"} · ${when(thread.latest)}`,
-            place: (at, folder, source) => attachSlackThread(thread, at, folder, source),
-          });
-        }
-      }
-      rows.push({ label: "Paste a link…", place: pasteSlackThreadAt });
+      const recent = channel
+        ? await shellOrThrow()
+            .slackRecent(channel, 30)
+            .catch((err: unknown) => {
+              throw new Error(shellError(err));
+            })
+        : [];
+      const rows = recent.map(slackOption);
+      rows.push({ label: "Paste a link…", place: pasteSlackThreadAt, extra: true });
       return rows;
+    },
+    search: async (query) => {
+      const bridge = shellOrThrow();
+      // A pasted link is the most exact search there is.
+      const link = readSlackLink(query);
+      const found = link ? [await bridge.slackThread(link.channel, link.ts)] : await bridge.slackSearch(query);
+      return found.map(slackOption);
     },
   },
   {
@@ -7215,6 +7238,36 @@ function attachItems(host: string): MenuItem[] {
     const listing = ATTACHABLES.find((one) => one.kind === row.kind);
     if (!listing) {
       items.push({ label: `${row.label}…`, icon: TYPE_ICONS[row.kind], run: make });
+      continue;
+    }
+    const pick = (option: AttachOption): MenuItem => ({
+      label: option.label,
+      hint: option.hint,
+      run: () =>
+        void withAttachTarget(host, () => option.place({ x: 0, y: 0 }, null, null)).then(() =>
+          graphView.openStrip(host),
+        ),
+    });
+    const search = listing.search;
+    if (search) {
+      // New on top, then the box — the service's best matches as you type — and under it
+      // the recent ones, latest first.
+      items.push({
+        label: row.label,
+        icon: TYPE_ICONS[row.kind],
+        search: {
+          placeholder: `Search ${row.label === "Slack thread" ? "Slack" : row.label.replace(/ page$/, "")}…`,
+          limit: 10,
+          top: row.make ? [{ label: `New ${row.label}`, icon: TYPE_ICONS[row.kind], run: make }] : [],
+          remote: async (query) =>
+            (
+              await search(query).catch((err: unknown) => {
+                throw new Error(shellError(err));
+              })
+            ).map(pick),
+        },
+        children: async () => (await listing.options()).filter((option) => !option.extra).map(pick),
+      });
       continue;
     }
     items.push({

@@ -46,6 +46,8 @@ contextBridge.exposeInMainWorld("bedrock", {
   slackForget: () => ipcRenderer.invoke("slack-forget"),
   slackChannels: () => ipcRenderer.invoke("slack-channels"),
   slackThreads: (channel, limit) => ipcRenderer.invoke("slack-threads", channel, limit),
+  slackRecent: (channel, limit) => ipcRenderer.invoke("slack-recent", channel, limit),
+  slackSearch: (query) => ipcRenderer.invoke("slack-search", query),
   slackThread: (channel, ts) => ipcRenderer.invoke("slack-thread", channel, ts),
   slackPost: (channel, text) => ipcRenderer.invoke("slack-post", channel, text),
   slackOpen: (url) => ipcRenderer.invoke("slack-open", url),

@@ -1658,6 +1658,61 @@ ipcMain.handle("slack-threads", async (_event, rawChannel, rawLimit) => {
     .map((message) => slackThreadRow(account, channel, message));
 });
 
+/**
+ * The channel's latest messages, answered or not — any message can be where a thread
+ * starts — by the last thing said under them, newest first.
+ */
+ipcMain.handle("slack-recent", async (_event, rawChannel, rawLimit) => {
+  const account = readSlack();
+  if (!account) throw new Error("Slack is not connected");
+  const channel = String(rawChannel || "");
+  if (!/^[CG][A-Z0-9]+$/.test(channel)) return [];
+  const limit = Math.max(1, Math.min(Number(rawLimit) || 30, 100));
+  const page = await slackFetch(account.token, "conversations.history", { channel, limit: 100 });
+  return (page.messages || [])
+    .filter((message) => !message.subtype && slackPlain(message.text))
+    .map((message) => slackThreadRow(account, channel, message))
+    .sort((a, b) => b.latest - a.latest)
+    .slice(0, limit);
+});
+
+/**
+ * Slack's own search, best match first, across every channel the person is in. Only a
+ * user token with `search:read` may search — a bot token never can — so that refusal is
+ * worded as what to do. A hit that is a reply stands for its whole thread.
+ */
+ipcMain.handle("slack-search", async (_event, rawQuery) => {
+  const account = readSlack();
+  if (!account) throw new Error("Slack is not connected");
+  const query = String(rawQuery || "").trim();
+  if (!query) return [];
+  let body;
+  try {
+    body = await slackFetch(account.token, "search.messages", { query, count: 20, sort: "score" });
+  } catch (err) {
+    if (/scope|not_allowed_token_type/.test(String(err.message))) {
+      throw new Error("Slack search needs a user token (xoxp-) with search:read");
+    }
+    throw err;
+  }
+  const seen = new Set();
+  const out = [];
+  for (const match of (body.messages && body.messages.matches) || []) {
+    const channel = String((match.channel && match.channel.id) || "");
+    if (!/^[CGD][A-Z0-9]+$/.test(channel)) continue;
+    const link = parseSlackLink(String(match.permalink || ""));
+    const ts = (link && link.ts) || String(match.ts || "");
+    if (!ts || seen.has(`${channel}/${ts}`)) continue;
+    seen.add(`${channel}/${ts}`);
+    out.push({
+      ...slackThreadRow(account, channel, { ...match, ts, reply_count: 0 }),
+      text: slackPlain(match.text),
+      place: match.channel && match.channel.name ? `#${match.channel.name}` : "",
+    });
+  }
+  return out;
+});
+
 /** One thread, by the pair that names it — what a pasted link comes down to. */
 ipcMain.handle("slack-thread", async (_event, rawChannel, rawTs) => {
   const account = readSlack();
