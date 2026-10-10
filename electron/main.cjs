@@ -1582,6 +1582,8 @@ ipcMain.handle("slack-connect", async (_event, rawToken) => {
   if (!token) throw new Error("no token given");
   if (!/^xox[bp]-/.test(token)) throw new Error("that is not a Slack token — one starts with xoxp- (you) or xoxb- (the app)");
   const who = await slackFetch(token, "auth.test", {});
+  slackNoSearch = false; // a new token may be allowed what the old one was not
+  slackHistory = null;
   const account = {
     team: String(who.team || ""),
     teamId: String(who.team_id || ""),
@@ -1705,14 +1707,15 @@ ipcMain.handle("slack-search", async (_event, rawQuery) => {
   const query = String(rawQuery || "").trim();
   if (!query) return [];
   let body;
-  try {
-    body = await slackFetch(account.token, "search.messages", { query, count: 20, sort: "score" });
-  } catch (err) {
-    if (/scope|not_allowed_token_type/.test(String(err.message))) {
-      throw new Error("Slack search needs a user token (xoxp-) with search:read");
+  if (!slackNoSearch) {
+    try {
+      body = await slackFetch(account.token, "search.messages", { query, count: 20, sort: "score" });
+    } catch (err) {
+      if (!/scope|not_allowed_token_type/.test(String(err.message))) throw err;
+      slackNoSearch = true; // a token that may not search will not be allowed next keystroke either
     }
-    throw err;
   }
+  if (!body) return slackHistorySearch(account, query);
   const seen = new Set();
   const out = [];
   for (const match of (body.messages && body.messages.matches) || []) {
@@ -1730,6 +1733,60 @@ ipcMain.handle("slack-search", async (_event, rawQuery) => {
   }
   return out;
 });
+
+/** Set once Slack has refused `search.messages` to this token; cleared by a new token. */
+let slackNoSearch = false;
+/** The channels' recent history, read once for a burst of typing. */
+let slackHistory = null;
+const SLACK_HISTORY_TTL = 2 * 60 * 1000;
+
+/**
+ * Search without Slack's search: the last 200 messages of every channel you are in, read
+ * once and kept for a couple of minutes, matched against every word typed. It cannot see
+ * further back than that — Slack's own search (a user token with search:read) can.
+ */
+async function slackHistorySearch(account, query) {
+  if (!slackHistory || Date.now() - slackHistory.at > SLACK_HISTORY_TTL) {
+    const mine = await slackFetch(account.token, "users.conversations", {
+      types: "public_channel,private_channel",
+      exclude_archived: true,
+      limit: 200,
+    });
+    const names = new Map((mine.channels || []).map((one) => [String(one.id), String(one.name || "")]));
+    const ids = [...names.keys()].slice(0, 40);
+    const rows = [];
+    for (let i = 0; i < ids.length; i += 6) {
+      const batch = await Promise.all(
+        ids.slice(i, i + 6).map((id) =>
+          slackFetch(account.token, "conversations.history", { channel: id, limit: 200 })
+            .then((page) =>
+              (page.messages || [])
+                .filter((message) => !message.subtype && slackPlain(message.text))
+                .map((message) => ({ ...slackThreadRow(account, id, message), place: `#${names.get(id)}` })),
+            )
+            .catch(() => []),
+        ),
+      );
+      for (const found of batch) rows.push(...found);
+    }
+    slackHistory = { at: Date.now(), rows };
+  }
+  const phrase = query.toLowerCase();
+  const words = phrase.split(/\s+/).filter(Boolean);
+  const place = (row) => `${row.text} ${row.place}`.toLowerCase();
+  return slackHistory.rows
+    .filter((row) => words.every((word) => place(row).includes(word)))
+    // The words together, as typed, before the words merely all there; then the busiest
+    // threads; then the latest.
+    .sort(
+      (a, b) =>
+        Number(b.text.toLowerCase().includes(phrase)) - Number(a.text.toLowerCase().includes(phrase)) ||
+        Number(b.text.toLowerCase().startsWith(phrase)) - Number(a.text.toLowerCase().startsWith(phrase)) ||
+        b.replies - a.replies ||
+        b.latest - a.latest,
+    )
+    .slice(0, 20);
+}
 
 /** One thread, by the pair that names it — what a pasted link comes down to. */
 ipcMain.handle("slack-thread", async (_event, rawChannel, rawTs) => {
