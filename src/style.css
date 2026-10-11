@@ -2352,12 +2352,11 @@ button.issue-id:hover {
   display: none;
 }
 
-/* The paperclip to attach: bare on the ring, no plate or rim — a white mark that lifts on hover. */
+/* The paperclip to attach: bare on the ring, no plate or rim — a white mark that brightens on hover. */
 .tool.tool-attach {
   border: 0;
   background: none;
   color: rgba(255, 255, 255, 0.85);
-  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.45));
 }
 
 .tool.tool-attach:hover {
@@ -2368,6 +2367,13 @@ button.issue-id:hover {
   width: 82%;
   height: 82%;
   stroke-width: 2;
+  overflow: visible;
+}
+
+/* The clip's own shape, broader and in the canvas colour: the lines under it stop at its edge. */
+.tool.tool-attach .clip-ground {
+  stroke: var(--ground, var(--bg));
+  stroke-width: 6;
 }
 
 /* A ring folding away: its pieces sink into the note (graph.ts sets where to). */

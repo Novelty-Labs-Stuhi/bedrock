@@ -642,8 +642,8 @@ const URL_RE = /https?:\/\/[^\s)\]>]+/;
  * paragraph, so it stops at NAME_LINES and the last line says there was more; the tree and
  * the tab still say it in full.
  */
-const NAME_MEASURE = 18; // characters to a line, at most
-const NAME_LINES = 3;
+const NAME_MEASURE = 12; // characters to a line, at most
+const NAME_LINES = 4;
 function stackedName(ele: cytoscape.NodeSingular): string {
   const label = String(ele.data("label") ?? "").trim();
   if (label.length <= NAME_MEASURE) return label;
@@ -709,6 +709,10 @@ function styleSheet(look: Look, attachments = false): cytoscape.StylesheetJson {
         "text-justification": "left",
         "text-max-width": "150px",
         "min-zoomed-font-size": 8,
+        // A name always reads over the links that cross it: it sits on a patch of the ground
+        // itself, so a line running under it simply stops at the words and goes on after.
+        ...plate,
+        "text-background-opacity": 1,
         width: 20,
         height: 20,
       },
@@ -848,6 +852,10 @@ function styleSheet(look: Look, attachments = false): cytoscape.StylesheetJson {
         color: ink,
         "text-rotation": "autorotate",
         ...plate,
+        "text-background-opacity": 1,
+        // Drawn after the unnamed lines, so its name covers them as a note's does; still under
+        // every note and every note's name, which cytoscape always draws after the lines.
+        "z-index": 1,
       },
     },
     /*
@@ -1014,9 +1022,11 @@ const ICON_ROTATE =
   `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M12.8 6.2A5 5 0 1 0 13 9.5 M13 3v3.4H9.6"/></svg>`;
 // Drawn, not typed: a font's "+" sits on its baseline, below the middle of the circle.
 const ICON_PLUS = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3.5v9M3.5 8h9"/></svg>`;
-// The paperclip that attaches: drawn bare on the ring, no plate under it.
-const ICON_CLIP =
-  `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m16 6-8.414 8.586a2 2 0 0 0 2.829 2.828l8.414-8.586a4 4 0 1 0-5.657-5.657l-8.379 8.551a6 6 0 1 0 8.485 8.485l8.379-8.551"/></svg>`;
+// The paperclip that attaches: drawn bare on the ring, no plate under it — only a broad stroke
+// of the canvas colour along its own shape (`.clip-ground`), so a line crossing it breaks off.
+const CLIP_PATH =
+  "m16 6-8.414 8.586a2 2 0 0 0 2.829 2.828l8.414-8.586a4 4 0 1 0-5.657-5.657l-8.379 8.551a6 6 0 1 0 8.485 8.485l8.379-8.551";
+const ICON_CLIP = `<svg viewBox="0 0 24 24" aria-hidden="true"><path class="clip-ground" d="${CLIP_PATH}"/><path d="${CLIP_PATH}"/></svg>`;
 const ICON_PENCIL =
   `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10.5 2.5l3 3-8 8H2.5v-3z M9 4l3 3"/></svg>`;
 
@@ -2084,9 +2094,15 @@ export class GraphView {
     this.sizeWatcher.observe(this.container);
   }
 
+  /** The canvas colour, on the canvas and for the overlay's pieces that cut lines out of it. */
+  private paintGround(hex: string): void {
+    this.container.style.background = hex;
+    this.overlay.style.setProperty("--ground", hex);
+  }
+
   private build(docs: Doc[], active: string | null, described: ReadonlySet<string>): void {
     this.cy?.destroy();
-    this.container.style.background = canvasHex(this.settings.look().bg);
+    this.paintGround(canvasHex(this.settings.look().bg));
     this.cy = cytoscape({
       container: this.container,
       elements: buildElements(docs, described),
@@ -3108,7 +3124,7 @@ export class GraphView {
    */
   applyLook(): void {
     const look = this.settings.look();
-    this.container.style.background = canvasHex(look.bg);
+    this.paintGround(canvasHex(look.bg));
     this.cy?.style(styleSheet(look, this.settings.attachMode()));
     // A hover interrupted by the settings window never got its mouseout, so whatever it
     // left lit or speaking is cleared here — otherwise it would still be lit, unpointed-at.
