@@ -1014,6 +1014,9 @@ const ICON_ROTATE =
   `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M12.8 6.2A5 5 0 1 0 13 9.5 M13 3v3.4H9.6"/></svg>`;
 // Drawn, not typed: a font's "+" sits on its baseline, below the middle of the circle.
 const ICON_PLUS = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3.5v9M3.5 8h9"/></svg>`;
+// The paperclip that attaches: drawn bare on the ring, no plate under it.
+const ICON_CLIP =
+  `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m16 6-8.414 8.586a2 2 0 0 0 2.829 2.828l8.414-8.586a4 4 0 1 0-5.657-5.657l-8.379 8.551a6 6 0 1 0 8.485 8.485l8.379-8.551"/></svg>`;
 const ICON_PENCIL =
   `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10.5 2.5l3 3-8 8H2.5v-3z M9 4l3 3"/></svg>`;
 
@@ -1828,6 +1831,15 @@ export class GraphView {
     // is read here — see `onWheel` for what it means. Once, on the container: a rebuild
     // makes a new cytoscape but never a new container.
     this.container.addEventListener("wheel", (event) => this.onWheel(event), { capture: true, passive: false });
+    // The ring sits on the overlay, not the canvas: a scroll over a tile or the paperclip
+    // still moves the map (a long ring's tiles turn it instead — see `attEvents`).
+    this.overlay.addEventListener(
+      "wheel",
+      (event) => {
+        if ((event.target as HTMLElement).closest(".att-badge, .node-tools")) this.onWheel(event);
+      },
+      { passive: false },
+    );
 
     /*
      * The canvas is moved the way a board is, not the way a map used to be: a plain drag on
@@ -2774,6 +2786,7 @@ export class GraphView {
     if (!pinch && this.settings.layout().scroll === "pan") {
       if (this.renderer) this.renderer.textureOnViewport = false;
       cy.panBy({ x: -event.deltaX * scale, y: -event.deltaY * scale });
+      this.recheckStrip(event.clientX, event.clientY);
       return;
     }
     // A pinch's deltas are small and mean a ratio; a wheel's are cytoscape's own scale.
@@ -2783,6 +2796,33 @@ export class GraphView {
     if (this.renderer) this.renderer.textureOnViewport = factor > 1;
     const box = this.container.getBoundingClientRect();
     cy.zoom({ level, renderedPosition: { x: event.clientX - box.left, y: event.clientY - box.top } });
+    this.recheckStrip(event.clientX, event.clientY);
+  }
+
+  private stripCheck: number | undefined;
+
+  /**
+   * The map moved under a still pointer, and nothing says so on its own — cytoscape hears no
+   * mouseout until the mouse itself moves. Once the scroll settles: a hover-opened ring the
+   * pointer is no longer on (the note, a tile, the paperclip) folds, as if the pointer had left.
+   */
+  private recheckStrip(x: number, y: number): void {
+    if (!this.strip?.hover) return;
+    window.clearTimeout(this.stripCheck);
+    this.stripCheck = window.setTimeout(() => {
+      const strip = this.strip;
+      const cy = this.cy;
+      if (!strip?.hover || !cy || this.drag) return;
+      const node = cy.getElementById(strip.host);
+      if (node.nonempty()) {
+        const box = this.container.getBoundingClientRect();
+        const at = node.renderedPosition();
+        if (Math.hypot(x - box.left - at.x, y - box.top - at.y) <= (node as NodeSingular).renderedWidth() / 2) return;
+      }
+      if (this.hovered === strip.host) this.hovered = null;
+      if (document.elementFromPoint(x, y)?.closest(".att-badge.open, .node-tools")) return;
+      this.closeStrip();
+    }, 120);
   }
 
   /**
@@ -4836,19 +4876,24 @@ export class GraphView {
 
   private morphTimer: number | undefined;
 
+  /** Rings on their way back into their notes, removed once there (or when the map moves). */
+  private folding: HTMLElement[] = [];
+
   /**
    * The glide is between two places ON SCREEN — so a pan, zoom or drag mid-glide would
    * leave the tiles chasing where the map was, a beat behind it. The map moving ends the
    * glide: the tiles take their places at once and ride the map from there.
    */
   private endMorph(): void {
+    for (const el of this.folding) el.remove();
+    this.folding = [];
     if (!this.overlay.classList.contains("att-morph")) return;
     window.clearTimeout(this.morphTimer);
     this.overlay.classList.remove("att-morph");
   }
 
   /**
-   * Opens a note: its attachments come out round it, the + for another sits on its
+   * Opens a note: its attachments come out round it, the paperclip for another sits on its
    * bottom-right, and a + in its middle draws an arrow out of it. It rides the note through
    * pans, zooms and drags. Opened by hand everything else dims; opened by `hover` the pointer's
    * own spotlight stays, and it folds when the pointer has left the note and all that is on it.
@@ -4858,9 +4903,9 @@ export class GraphView {
     this.closeEdgeTools();
     const el = this.toolRow([
       {
-        label: ICON_PLUS,
+        label: ICON_CLIP,
         title: "Attach…",
-        cls: "tool-plus",
+        cls: "tool-attach",
         run: (button) => {
           const box = button.getBoundingClientRect();
           this.handlers.onAttachMenu(host, { x: box.right + 4, y: box.top });
@@ -4949,7 +4994,7 @@ export class GraphView {
       const strip = this.strip;
       if (!strip?.hover || this.drag || this.hovered === strip.host) return;
       if (strip.el.querySelector(":hover") || [...this.attEls.values()].some((el) => el.matches(":hover"))) return;
-      // The + was clicked and its menu is up: the ring waits for it to go.
+      // The paperclip was clicked and its menu is up: the ring waits for it to go.
       if (document.querySelector(".menu-panel")) {
         this.releaseStrip();
         return;
@@ -4964,9 +5009,35 @@ export class GraphView {
       node.removeStyle("text-opacity");
       node.removeData("_mute");
     }
-    this.strip?.el.remove();
+    if (this.strip) this.fold(this.strip.el, node && node.nonempty() ? (node as NodeSingular) : null);
     this.strip = null;
     this.hideTip();
+  }
+
+  /**
+   * A ring's own pieces — the paperclip, the + in the middle, the turning tile — sink back
+   * into the middle of the note, shrinking as they go, the way the tiles glide back onto its
+   * corner. Gone at once if the note is.
+   */
+  private fold(el: HTMLElement, node: NodeSingular | null): void {
+    if (!node) {
+      el.remove();
+      return;
+    }
+    el.classList.add("folding");
+    const at = node.renderedPosition();
+    const zoom = this.cy!.zoom();
+    for (const piece of el.querySelectorAll<HTMLElement>(".tool, .node-link, .ring-rotate")) {
+      piece.style.left = `${at.x}px`;
+      piece.style.top = `${at.y}px`;
+      piece.style.opacity = "0";
+      piece.style.transform = `translate(-50%, -50%) scale(${zoom * 0.2})`;
+    }
+    this.folding.push(el);
+    window.setTimeout(() => {
+      el.remove();
+      this.folding = this.folding.filter((other) => other !== el);
+    }, 260);
   }
 
   /**
@@ -5056,7 +5127,7 @@ export class GraphView {
     return this.strip?.host ?? null;
   }
 
-  /** The + rides the bottom-right slot of the open note's ring. */
+  /** The paperclip rides the bottom-right slot of the open note's ring. */
   private placeStrip(): void {
     const strip = this.strip;
     const node = strip ? this.cy?.getElementById(strip.host) : null;
@@ -5072,9 +5143,9 @@ export class GraphView {
       node.data("_mute", 1);
       node.style("text-opacity", 0);
     }
-    // The + to attach, on the ring's bottom-right.
+    // The paperclip to attach, on the ring's bottom-right.
     const zoom = this.cy!.zoom();
-    const plus = strip.el.querySelector<HTMLElement>(".tool-plus")!;
+    const plus = strip.el.querySelector<HTMLElement>(".tool-attach")!;
     const angle = ring.tool(0);
     plus.style.left = `${at.x + Math.cos(angle) * ring.reach * zoom}px`;
     plus.style.top = `${at.y + Math.sin(angle) * ring.reach * zoom}px`;

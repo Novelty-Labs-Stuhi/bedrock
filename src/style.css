@@ -2352,6 +2352,34 @@ button.issue-id:hover {
   display: none;
 }
 
+/* The paperclip to attach: bare on the ring, no plate or rim — a white mark that lifts on hover. */
+.tool.tool-attach {
+  border: 0;
+  background: none;
+  color: rgba(255, 255, 255, 0.85);
+  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.45));
+}
+
+.tool.tool-attach:hover {
+  color: #fff;
+}
+
+.tool.tool-attach svg {
+  width: 82%;
+  height: 82%;
+  stroke-width: 2;
+}
+
+/* A ring folding away: its pieces sink into the note (graph.ts sets where to). */
+.tool-row.folding {
+  pointer-events: none;
+}
+
+.tool-row.folding > * {
+  pointer-events: none;
+  transition: left 0.22s ease, top 0.22s ease, transform 0.22s ease, opacity 0.22s ease;
+}
+
 /* The + in the middle of a pointed-at note: a white mark the click goes through to the note. */
 .node-link {
   position: absolute;
