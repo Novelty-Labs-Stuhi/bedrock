@@ -6,7 +6,7 @@ import cytoscape from "cytoscape";
 import type { Core, EdgeSingular, ElementDefinition, LayoutOptions, Layouts, NodeCollection, NodeSingular } from "cytoscape";
 import cola from "cytoscape-cola";
 import { edgeNotePath, edgeTitle, isEdgeNote } from "./edges";
-import { inlineEdit, type InlineEditor } from "./inline";
+import { inlineEdit, type InlineEditor, type Suggestion } from "./inline";
 import { scoreNodes, sizeFor } from "./scoring";
 import { leafId, leafOf, meetingDay, parseSections, withoutSectionLinks } from "./granola";
 import {
@@ -642,11 +642,24 @@ const URL_RE = /https?:\/\/[^\s)\]>]+/;
  * paragraph, so it stops at NAME_LINES and the last line says there was more; the tree and
  * the tab still say it in full.
  */
-const NAME_MEASURE = 18; // characters to a line, at most
-const NAME_LINES = 3;
+const NAME_MEASURE = 12; // characters to a line, at most
+const NAME_LINES = 4;
+// A name's size and its gap off the rim, in model units — the caret naming a new node uses them too.
+const NAME_FONT = 10;
+const NAME_MARGIN = 4;
 function stackedName(ele: cytoscape.NodeSingular): string {
-  const label = String(ele.data("label") ?? "").trim();
-  if (label.length <= NAME_MEASURE) return label;
+  let lines = nameLines(String(ele.data("label") ?? ""));
+  if (lines.length > NAME_LINES) {
+    lines = lines.slice(0, NAME_LINES);
+    lines[NAME_LINES - 1] = `${lines[NAME_LINES - 1]}…`;
+  }
+  return lines.join("\n");
+}
+
+/** The lines a name breaks into, all of them — the caret naming a new node breaks the same way. */
+export function nameLines(name: string): string[] {
+  const label = name.trim();
+  if (label.length <= NAME_MEASURE) return [label];
   const words = label.split(/\s+/).map((w) => (w.length > NAME_MEASURE ? `${w.slice(0, NAME_MEASURE - 1)}…` : w));
   // Greedy wrap at `width`: the lines a measure of that many characters gives.
   const wrap = (width: number): string[] => {
@@ -666,11 +679,7 @@ function stackedName(ele: cytoscape.NodeSingular): string {
     if (tried.length > most.length) break;
     lines = tried;
   }
-  if (lines.length > NAME_LINES) {
-    lines = lines.slice(0, NAME_LINES);
-    lines[NAME_LINES - 1] = `${lines[NAME_LINES - 1]}…`;
-  }
-  return lines.join("\n");
+  return lines;
 }
 
 function styleSheet(look: Look, attachments = false): cytoscape.StylesheetJson {
@@ -700,15 +709,19 @@ function styleSheet(look: Look, attachments = false): cytoscape.StylesheetJson {
         "background-color": nodeHex,
         label: nodeName,
         color: ink,
-        "font-size": 10,
+        "font-size": NAME_FONT,
         "text-valign": "center",
         "text-halign": "right",
-        "text-margin-x": 4,
+        "text-margin-x": NAME_MARGIN,
         // A long name is wrapped and balanced (`stackedName`), the block centred on the node.
         "text-wrap": "wrap",
         "text-justification": "left",
         "text-max-width": "150px",
         "min-zoomed-font-size": 8,
+        // A name always reads over the links that cross it: it sits on a patch of the ground
+        // itself, so a line running under it simply stops at the words and goes on after.
+        ...plate,
+        "text-background-opacity": 1,
         width: 20,
         height: 20,
       },
@@ -848,6 +861,10 @@ function styleSheet(look: Look, attachments = false): cytoscape.StylesheetJson {
         color: ink,
         "text-rotation": "autorotate",
         ...plate,
+        "text-background-opacity": 1,
+        // Drawn after the unnamed lines, so its name covers them as a note's does; still under
+        // every note and every note's name, which cytoscape always draws after the lines.
+        "z-index": 1,
       },
     },
     /*
@@ -1014,6 +1031,11 @@ const ICON_ROTATE =
   `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M12.8 6.2A5 5 0 1 0 13 9.5 M13 3v3.4H9.6"/></svg>`;
 // Drawn, not typed: a font's "+" sits on its baseline, below the middle of the circle.
 const ICON_PLUS = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3.5v9M3.5 8h9"/></svg>`;
+// The paperclip that attaches: drawn bare on the ring, no plate under it — only a broad stroke
+// of the canvas colour along its own shape (`.clip-ground`), so a line crossing it breaks off.
+const CLIP_PATH =
+  "m16 6-8.414 8.586a2 2 0 0 0 2.829 2.828l8.414-8.586a4 4 0 1 0-5.657-5.657l-8.379 8.551a6 6 0 1 0 8.485 8.485l8.379-8.551";
+const ICON_CLIP = `<svg viewBox="0 0 24 24" aria-hidden="true"><path class="clip-ground" d="${CLIP_PATH}"/><path d="${CLIP_PATH}"/></svg>`;
 const ICON_PENCIL =
   `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10.5 2.5l3 3-8 8H2.5v-3z M9 4l3 3"/></svg>`;
 
@@ -1729,7 +1751,7 @@ export class GraphView {
   /** Set only for a draft whose other end was chosen before it was drawn — see `startLink`. */
   private draftRelease: DraftRelease | null = null;
   private drag: DragState | null = null;
-  private rename: { path: string; editor: InlineEditor } | null = null;
+  private rename: { path: string; editor: InlineEditor; fresh?: boolean } | null = null;
   /** The open "name this connection" field, if any (step two of drawing a link). */
   private connection: { source: string; target: string; editor: InlineEditor } | null = null;
   /** Positions held over across a rename/move, keyed by the node's new id. */
@@ -1759,6 +1781,7 @@ export class GraphView {
   /** The note the pointer is over, as cytoscape last said — a hover ring stays while it is. */
   private hovered: string | null = null;
   private hoverClose: number | undefined;
+  private menuAtPress = false;
   /** How far an open note's ring has been turned, in tiles (only past ATT_RING_MAX). */
   private ringTurn = 0;
   private ringWheel = 0;
@@ -1824,10 +1847,23 @@ export class GraphView {
       },
       { capture: true, passive: true },
     );
+    // Whether a menu was up when the button went down: that press was for closing it (the
+    // menu goes on the same mousedown), not a click on the canvas that makes a node. On the
+    // window, capturing, so it is read before the menu's own document listener removes it.
+    window.addEventListener("mousedown", () => (this.menuAtPress = !!document.querySelector(".menu-panel")), true);
     // Cytoscape's own wheel handling is switched off (`userZoomingEnabled`), so the wheel
     // is read here — see `onWheel` for what it means. Once, on the container: a rebuild
     // makes a new cytoscape but never a new container.
     this.container.addEventListener("wheel", (event) => this.onWheel(event), { capture: true, passive: false });
+    // The ring sits on the overlay, not the canvas: a scroll over a tile or the paperclip
+    // still moves the map (a long ring's tiles turn it instead — see `attEvents`).
+    this.overlay.addEventListener(
+      "wheel",
+      (event) => {
+        if ((event.target as HTMLElement).closest(".att-badge, .node-tools")) this.onWheel(event);
+      },
+      { passive: false },
+    );
 
     /*
      * The canvas is moved the way a board is, not the way a map used to be: a plain drag on
@@ -2072,9 +2108,15 @@ export class GraphView {
     this.sizeWatcher.observe(this.container);
   }
 
+  /** The canvas colour, on the canvas and for the overlay's pieces that cut lines out of it. */
+  private paintGround(hex: string): void {
+    this.container.style.background = hex;
+    this.overlay.style.setProperty("--ground", hex);
+  }
+
   private build(docs: Doc[], active: string | null, described: ReadonlySet<string>): void {
     this.cy?.destroy();
-    this.container.style.background = canvasHex(this.settings.look().bg);
+    this.paintGround(canvasHex(this.settings.look().bg));
     this.cy = cytoscape({
       container: this.container,
       elements: buildElements(docs, described),
@@ -2499,6 +2541,7 @@ export class GraphView {
         !!this.issue ||
         !!this.draftSource ||
         !!this.rename ||
+        this.menuAtPress ||
         performance.now() - this.renameClosedAt < 500;
       this.closeStrip();
       this.closeEdgeTools();
@@ -2575,8 +2618,8 @@ export class GraphView {
       if (this.draftSource) cy.getElementById(DRAFT_NODE).position(event.position);
     });
 
-    cy.on("mouseover", "node", (event) => {
-      const node = event.target as NodeSingular;
+    // The pointer has come onto a node.
+    const pointAt = (node: NodeSingular): void => {
       if (node.data("kind") === "leaf") {
         if (!this.draftSource && !this.leafDrag) this.hotLeaf(node);
         return;
@@ -2591,6 +2634,12 @@ export class GraphView {
       }
       // Something opened by hand: its dimming is the only spotlight.
       if ((this.strip && !this.strip.hover) || this.edgeTools) return;
+      // In a vault of attachments the ring is all that pointing does: nothing dims, nothing
+      // lights up. A meeting still says its day, and names asked for still come.
+      if (this.settings.attachMode()) {
+        if (this.namesOnDemand() || node.data("ntype") === "granola") node.addClass("named");
+        return;
+      }
       const neighborhood = node.closedNeighborhood();
       cy.elements().difference(neighborhood).addClass("faded");
       if (this.atts.size) this.drawOverlay(); // the tiles on faded notes fade with them
@@ -2604,7 +2653,8 @@ export class GraphView {
       if (this.namesOnDemand()) lit.addClass("named");
       // A meeting says its day only when pointed at, names on or off.
       if (node.data("ntype") === "granola") node.addClass("named");
-    });
+    };
+    cy.on("mouseover", "node", (event) => pointAt(event.target as NodeSingular));
     cy.on("mouseout", "node", () => {
       this.coolLeaf();
       this.hovered = null;
@@ -2774,6 +2824,7 @@ export class GraphView {
     if (!pinch && this.settings.layout().scroll === "pan") {
       if (this.renderer) this.renderer.textureOnViewport = false;
       cy.panBy({ x: -event.deltaX * scale, y: -event.deltaY * scale });
+      this.recheckStrip(event.clientX, event.clientY);
       return;
     }
     // A pinch's deltas are small and mean a ratio; a wheel's are cytoscape's own scale.
@@ -2783,6 +2834,33 @@ export class GraphView {
     if (this.renderer) this.renderer.textureOnViewport = factor > 1;
     const box = this.container.getBoundingClientRect();
     cy.zoom({ level, renderedPosition: { x: event.clientX - box.left, y: event.clientY - box.top } });
+    this.recheckStrip(event.clientX, event.clientY);
+  }
+
+  private stripCheck: number | undefined;
+
+  /**
+   * The map moved under a still pointer, and nothing says so on its own — cytoscape hears no
+   * mouseout until the mouse itself moves. Once the scroll settles: a hover-opened ring the
+   * pointer is no longer on (the note, a tile, the paperclip) folds, as if the pointer had left.
+   */
+  private recheckStrip(x: number, y: number): void {
+    if (!this.strip?.hover) return;
+    window.clearTimeout(this.stripCheck);
+    this.stripCheck = window.setTimeout(() => {
+      const strip = this.strip;
+      const cy = this.cy;
+      if (!strip?.hover || !cy || this.drag) return;
+      const node = cy.getElementById(strip.host);
+      if (node.nonempty()) {
+        const box = this.container.getBoundingClientRect();
+        const at = node.renderedPosition();
+        if (Math.hypot(x - box.left - at.x, y - box.top - at.y) <= (node as NodeSingular).renderedWidth() / 2) return;
+      }
+      if (this.hovered === strip.host) this.hovered = null;
+      if (document.elementFromPoint(x, y)?.closest(".att-badge.open, .node-tools")) return;
+      this.closeStrip();
+    }, 120);
   }
 
   /**
@@ -3068,7 +3146,7 @@ export class GraphView {
    */
   applyLook(): void {
     const look = this.settings.look();
-    this.container.style.background = canvasHex(look.bg);
+    this.paintGround(canvasHex(look.bg));
     this.cy?.style(styleSheet(look, this.settings.attachMode()));
     // A hover interrupted by the settings window never got its mouseout, so whatever it
     // left lit or speaking is cleared here — otherwise it would still be lit, unpointed-at.
@@ -3874,13 +3952,20 @@ export class GraphView {
    * typed name, or `null` when the field was dismissed unchanged — because callers chain further
    * steps onto it (naming a connection next) and a cancelled rename must not strand them.
    */
-  renameNode(path: string, onSettled: (name: string | null) => void, fresh = false): void {
+  renameNode(
+    path: string,
+    onSettled: (name: string | null) => void,
+    fresh = false,
+    /** Notes already there by the name being typed (see `inlineEdit`). Taking one settles
+        the field without `onSettled`: the caller's pick says what happens instead. */
+    suggest: ((query: string) => Suggestion[]) | null = null,
+  ): void {
     const cy = this.cy;
     if (!cy) return;
     const node = cy.getElementById(path);
     if (node.empty()) return;
     this.rename?.editor.close();
-    const at = this.renameAnchor(node as NodeSingular);
+    const at = this.renameAnchor(node as NodeSingular, fresh);
     // A node being born has no name to show yet: its placeholder label stands aside for
     // the caret, and comes back only if it is dismissed and kept.
     const label = node.data("label") as string;
@@ -3905,8 +3990,21 @@ export class GraphView {
       },
       true,
       fresh,
+      suggest &&
+        ((query) =>
+          suggest(query).map((one) => ({
+            ...one,
+            pick: () => {
+              settled = true;
+              this.rename = null;
+              this.renameClosedAt = performance.now();
+              one.pick();
+            },
+          }))),
+      fresh ? this.nameFont() : null,
+      fresh ? nameLines : null,
     );
-    this.rename = { path, editor };
+    this.rename = { path, editor, fresh };
   }
 
   /**
@@ -3914,9 +4012,15 @@ export class GraphView {
    * label itself is drawn in (`text-halign: right`), so the field stands exactly where the
    * name will be a moment later, and the node stays in view while it is being named.
    */
-  private renameAnchor(node: NodeSingular): { left: number; top: number } {
+  private renameAnchor(node: NodeSingular, label = false): { left: number; top: number } {
     const box = node.renderedBoundingBox({ includeLabels: false, includeOverlays: false });
-    return { left: box.x2 + 6, top: (box.y1 + box.y2) / 2 };
+    // A new node's bare caret stands exactly where its label will: `text-margin-x` off the rim.
+    return { left: box.x2 + (label ? NAME_MARGIN * this.cy!.zoom() : 6), top: (box.y1 + box.y2) / 2 };
+  }
+
+  /** A note's name as drawn on screen right now, in px: its model size times the zoom. */
+  private nameFont(): number {
+    return NAME_FONT * (this.cy?.zoom() ?? 1);
   }
 
   /** Keeps an open rename field on its node while the viewport moves. */
@@ -3924,8 +4028,8 @@ export class GraphView {
     if (!this.rename || !this.cy) return;
     const node = this.cy.getElementById(this.rename.path);
     if (node.empty()) return;
-    const at = this.renameAnchor(node as NodeSingular);
-    this.rename.editor.move(at.left, at.top);
+    const at = this.renameAnchor(node as NodeSingular, this.rename.fresh);
+    this.rename.editor.move(at.left, at.top, this.rename.fresh ? this.nameFont() : undefined);
   }
 
   /**
@@ -4836,19 +4940,24 @@ export class GraphView {
 
   private morphTimer: number | undefined;
 
+  /** Rings on their way back into their notes, removed once there (or when the map moves). */
+  private folding: HTMLElement[] = [];
+
   /**
    * The glide is between two places ON SCREEN — so a pan, zoom or drag mid-glide would
    * leave the tiles chasing where the map was, a beat behind it. The map moving ends the
    * glide: the tiles take their places at once and ride the map from there.
    */
   private endMorph(): void {
+    for (const el of this.folding) el.remove();
+    this.folding = [];
     if (!this.overlay.classList.contains("att-morph")) return;
     window.clearTimeout(this.morphTimer);
     this.overlay.classList.remove("att-morph");
   }
 
   /**
-   * Opens a note: its attachments come out round it, the + for another sits on its
+   * Opens a note: its attachments come out round it, the paperclip for another sits on its
    * bottom-right, and a + in its middle draws an arrow out of it. It rides the note through
    * pans, zooms and drags. Opened by hand everything else dims; opened by `hover` the pointer's
    * own spotlight stays, and it folds when the pointer has left the note and all that is on it.
@@ -4858,9 +4967,9 @@ export class GraphView {
     this.closeEdgeTools();
     const el = this.toolRow([
       {
-        label: ICON_PLUS,
+        label: ICON_CLIP,
         title: "Attach…",
-        cls: "tool-plus",
+        cls: "tool-attach",
         run: (button) => {
           const box = button.getBoundingClientRect();
           this.handlers.onAttachMenu(host, { x: box.right + 4, y: box.top });
@@ -4949,7 +5058,7 @@ export class GraphView {
       const strip = this.strip;
       if (!strip?.hover || this.drag || this.hovered === strip.host) return;
       if (strip.el.querySelector(":hover") || [...this.attEls.values()].some((el) => el.matches(":hover"))) return;
-      // The + was clicked and its menu is up: the ring waits for it to go.
+      // The paperclip was clicked and its menu is up: the ring waits for it to go.
       if (document.querySelector(".menu-panel")) {
         this.releaseStrip();
         return;
@@ -4964,9 +5073,35 @@ export class GraphView {
       node.removeStyle("text-opacity");
       node.removeData("_mute");
     }
-    this.strip?.el.remove();
+    if (this.strip) this.fold(this.strip.el, node && node.nonempty() ? (node as NodeSingular) : null);
     this.strip = null;
     this.hideTip();
+  }
+
+  /**
+   * A ring's own pieces — the paperclip, the + in the middle, the turning tile — sink back
+   * into the middle of the note, shrinking as they go, the way the tiles glide back onto its
+   * corner. Gone at once if the note is.
+   */
+  private fold(el: HTMLElement, node: NodeSingular | null): void {
+    if (!node) {
+      el.remove();
+      return;
+    }
+    el.classList.add("folding");
+    const at = node.renderedPosition();
+    const zoom = this.cy!.zoom();
+    for (const piece of el.querySelectorAll<HTMLElement>(".tool, .node-link, .ring-rotate")) {
+      piece.style.left = `${at.x}px`;
+      piece.style.top = `${at.y}px`;
+      piece.style.opacity = "0";
+      piece.style.transform = `translate(-50%, -50%) scale(${zoom * 0.2})`;
+    }
+    this.folding.push(el);
+    window.setTimeout(() => {
+      el.remove();
+      this.folding = this.folding.filter((other) => other !== el);
+    }, 260);
   }
 
   /**
@@ -4980,7 +5115,9 @@ export class GraphView {
       const edge = cy.getElementById(edgeId(this.edgeTools.source, this.edgeTools.target));
       if (edge.nonempty()) cy.elements().difference(edge.union(edge.connectedNodes())).addClass("faded");
     }
-    const node = this.strip && !this.strip.hover ? cy.getElementById(this.strip.host) : null;
+    // A note opened by hand in a vault of attachments dims nothing either: the ring is the
+    // whole of it.
+    const node = this.strip && !this.strip.hover && !this.settings.attachMode() ? cy.getElementById(this.strip.host) : null;
     if (!node || node.empty()) return;
     cy.elements().difference(node).addClass("faded");
   }
@@ -5056,7 +5193,7 @@ export class GraphView {
     return this.strip?.host ?? null;
   }
 
-  /** The + rides the bottom-right slot of the open note's ring. */
+  /** The paperclip rides the bottom-right slot of the open note's ring. */
   private placeStrip(): void {
     const strip = this.strip;
     const node = strip ? this.cy?.getElementById(strip.host) : null;
@@ -5072,9 +5209,9 @@ export class GraphView {
       node.data("_mute", 1);
       node.style("text-opacity", 0);
     }
-    // The + to attach, on the ring's bottom-right.
+    // The paperclip to attach, on the ring's bottom-right.
     const zoom = this.cy!.zoom();
-    const plus = strip.el.querySelector<HTMLElement>(".tool-plus")!;
+    const plus = strip.el.querySelector<HTMLElement>(".tool-attach")!;
     const angle = ring.tool(0);
     plus.style.left = `${at.x + Math.cos(angle) * ring.reach * zoom}px`;
     plus.style.top = `${at.y + Math.sin(angle) * ring.reach * zoom}px`;

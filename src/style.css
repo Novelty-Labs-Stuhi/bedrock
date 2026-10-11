@@ -2121,7 +2121,8 @@ button.issue-id:hover {
   box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
 }
 
-/* A new node's name: no field at all, only the caret where the label will be. */
+/* A new node's name: no field at all, only the caret where the label will be — in the
+   label's own face, size and width (set inline, with the zoom), wrapping where the label will. */
 .inline-edit.beside.bare {
   padding: 0;
   border: none;
@@ -2132,6 +2133,43 @@ button.issue-id:hover {
   field-sizing: content;
   min-width: 2px;
   width: auto;
+  resize: none;
+  overflow: hidden;
+  font-family: "Helvetica Neue", Helvetica, sans-serif;
+  line-height: 1;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
+
+/* The notes already there by the name being typed: a bare list under the caret, no box. */
+.inline-suggest {
+  position: absolute;
+  margin: 0;
+  padding: 0 0 0 14px;
+  list-style: disc;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: nowrap;
+  pointer-events: auto;
+  text-shadow: 0 0 3px var(--bg), 0 0 3px var(--bg);
+}
+
+.inline-suggest:empty {
+  display: none;
+}
+
+.inline-suggest li {
+  cursor: pointer;
+}
+
+.inline-suggest li.lit {
+  color: var(--text);
+}
+
+.inline-suggest-hint {
+  margin-left: 6px;
+  opacity: 0.6;
 }
 
 .inline-name {
@@ -2350,6 +2388,40 @@ button.issue-id:hover {
 .tool[hidden],
 .ring-rotate[hidden] {
   display: none;
+}
+
+/* The paperclip to attach: bare on the ring, no plate or rim — a white mark that brightens on hover. */
+.tool.tool-attach {
+  border: 0;
+  background: none;
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.tool.tool-attach:hover {
+  color: #fff;
+}
+
+.tool.tool-attach svg {
+  width: 82%;
+  height: 82%;
+  stroke-width: 2;
+  overflow: visible;
+}
+
+/* The clip's own shape, broader and in the canvas colour: the lines under it stop at its edge. */
+.tool.tool-attach .clip-ground {
+  stroke: var(--ground, var(--bg));
+  stroke-width: 6;
+}
+
+/* A ring folding away: its pieces sink into the note (graph.ts sets where to). */
+.tool-row.folding {
+  pointer-events: none;
+}
+
+.tool-row.folding > * {
+  pointer-events: none;
+  transition: left 0.22s ease, top 0.22s ease, transform 0.22s ease, opacity 0.22s ease;
 }
 
 /* The + in the middle of a pointed-at note: a white mark the click goes through to the note. */
