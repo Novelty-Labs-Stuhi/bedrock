@@ -1650,6 +1650,8 @@ type DragState = {
   hold?: cytoscape.Position;
   /** The note it will merge into if let go now (a vault of attachments only). */
   merge?: string | null;
+  /** The ring that was open when the note started moving, put away until it is let go. */
+  folded?: { host: string; hover: boolean };
 };
 
 /** A rectangle in rendered (screen) coordinates, relative to the canvas. */
@@ -2603,8 +2605,9 @@ export class GraphView {
       if (this.draftSource) cy.getElementById(DRAFT_NODE).position(event.position);
     });
 
-    cy.on("mouseover", "node", (event) => {
-      const node = event.target as NodeSingular;
+    // The pointer has come onto a node — or is on it again when a drag lets go, cytoscape
+    // saying nothing then since it never left.
+    const pointAt = (node: NodeSingular): void => {
       if (node.data("kind") === "leaf") {
         if (!this.draftSource && !this.leafDrag) this.hotLeaf(node);
         return;
@@ -2632,7 +2635,8 @@ export class GraphView {
       if (this.namesOnDemand()) lit.addClass("named");
       // A meeting says its day only when pointed at, names on or off.
       if (node.data("ntype") === "granola") node.addClass("named");
-    });
+    };
+    cy.on("mouseover", "node", (event) => pointAt(event.target as NodeSingular));
     cy.on("mouseout", "node", () => {
       this.coolLeaf();
       this.hovered = null;
@@ -2688,6 +2692,12 @@ export class GraphView {
     });
 
     cy.on("drag", "node", (event) => {
+      // A note on the move is not being pointed at: its ring goes away for the drag (and any
+      // other's with it), and comes back where it was let go — see `free`.
+      if (this.drag && this.strip && !this.drag.folded) {
+        this.drag.folded = { host: this.strip.host, hover: this.strip.hover };
+        this.closeStrip();
+      }
       this.endMorph();
       this.mergeStep(event.target as NodeSingular, event.position);
       this.carryGroup();
@@ -2726,6 +2736,12 @@ export class GraphView {
       }
       this.capture(); // wherever it came to rest is where it should be next time
       this.drawOverlay();
+      // Let go, the note is under the pointer again: it is pointed at as if just arrived, and
+      // a ring opened by hand on it comes back as it was.
+      const node = drag ? cy.getElementById(drag.path) : null;
+      if (!drag || !node || node.empty()) return;
+      if (drag.folded?.host === drag.path && !drag.folded.hover) this.openStrip(drag.path);
+      else pointAt(node as NodeSingular);
     });
 
     // Cola moves notes between frames; the rings, badges and cards ride along.
