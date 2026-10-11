@@ -349,10 +349,8 @@ const graphView = new GraphView(ui.cy, {
      * What is made lands at the vault root: the graph knows nothing of folders.
      */
     const folder = null;
-    if (settings.attachMode()) {
-      showMenu(client, attachCanvasMenu(at));
-      return;
-    }
+    // In a vault of attachments empty space has nothing to offer: a node is a click there.
+    if (settings.attachMode()) return;
     // The holder leads: it needs no integration and is what everything else can grow from.
     const create: MenuItem[] = [
       { label: "Holder", icon: NOTE_DOT, run: () => void createHolderAt(at, folder) },
@@ -1750,19 +1748,102 @@ async function createHolderAt(
   ui.status.textContent = settings.attachMode()
     ? `created ${path} — name it; click it to attach things`
     : `created ${path} — name it; right-click → Turn into makes it something`;
-  graphView.renameNode(path, (name) => {
-    void (async () => {
-      if (!name && dropUnnamed && !(await vault.read(path).catch(() => "")).trim()) {
-        await vault.remove(path, "file").catch(() => undefined);
-        await refresh();
-        ui.status.textContent = "";
-        return;
-      }
-      const finalPath = name ? ((await applyRename(path, "file", name)) ?? path) : path;
-      if (source) await finishLink(source, finalPath, null);
-    })();
-  }, true);
+  // The notes already there, for the name field to offer: a name that is taken is more
+  // likely the note that has it than a second one. Every vault in the system, as the
+  // search panel lists them; read while the caret is still blinking.
+  const root = knownVaultRoot();
+  let known: IndexedNote[] = [];
+  if (window.bedrock && root) {
+    window.bedrock.vaultIndex(root).then((index) => (known = index.notes)).catch(() => undefined);
+  }
+  // Taken: the holder was only standing in. It goes, and the note takes its place — brought
+  // to where it stood and linked from `source`, or referenced there from another vault.
+  const useExisting = async (note: IndexedNote): Promise<void> => {
+    await vault.remove(path, "file").catch(() => undefined);
+    await refresh();
+    ui.status.textContent = "";
+    await attachIndexed(note, root!, source, at, folder);
+  };
+  graphView.renameNode(
+    path,
+    (name) => {
+      void (async () => {
+        if (!name && dropUnnamed && !(await vault.read(path).catch(() => "")).trim()) {
+          await vault.remove(path, "file").catch(() => undefined);
+          await refresh();
+          ui.status.textContent = "";
+          return;
+        }
+        const finalPath = name ? ((await applyRename(path, "file", name)) ?? path) : path;
+        if (source) await finishLink(source, finalPath, null);
+      })();
+    },
+    true,
+    (query) =>
+      closestNotes(
+        // Only the holder itself and the note the arrow left are out. (Not `relative !==
+        // source` alone: from a bare click `source` is null, and so is every note outside
+        // this vault — which would leave out exactly the ones from elsewhere.)
+        known.filter((note) => note.relative === null || (note.relative !== path && note.relative !== source)),
+        query,
+      ).map((note) => ({
+        label: note.name,
+        // Where it is, for a note outside this canvas: the name alone does not say.
+        hint: note.relative === null || note.nested ? note.place || "/" : undefined,
+        exact: note.relative !== null && !note.nested && note.name.toLowerCase() === query.trim().toLowerCase(),
+        pick: () => void useExisting(note),
+      })),
+  );
   await refreshSidebar();
+}
+
+/**
+ * The few notes whose names come closest to `query`, best first: the name itself, then
+ * names starting with it, then a word in them starting with it, then containing it, then
+ * holding its letters in order — and, failing all of those, a name that starts the way the
+ * query would with a slip or two of the keys. Shorter names first among equals.
+ */
+const CLOSEST = 5;
+function closestNotes(notes: IndexedNote[], query: string): IndexedNote[] {
+  const q = query.toLowerCase();
+  const here = (note: IndexedNote): boolean => note.relative !== null && !note.nested;
+  const rank = (name: string): number | null => {
+    const n = name.toLowerCase();
+    if (n === q) return 0;
+    if (n.startsWith(q)) return 1;
+    if (n.split(/[\s\-_.]+/).some((word) => word.startsWith(q))) return 2;
+    if (n.includes(q)) return 3;
+    let at = 0;
+    for (const ch of n) if (ch === q[at]) at++;
+    if (at === q.length) return 4;
+    const slips = editDistance(q, n.slice(0, q.length));
+    return slips <= Math.max(1, Math.floor(q.length / 4)) ? 5 + slips : null;
+  };
+  return notes
+    .map((note) => ({ note, rank: rank(note.name) }))
+    .filter((one): one is { note: IndexedNote; rank: number } => one.rank !== null)
+    .sort(
+      (a, b) =>
+        a.rank - b.rank ||
+        Number(!here(a.note)) - Number(!here(b.note)) || // this vault's own before its twins elsewhere
+        a.note.name.length - b.note.name.length ||
+        a.note.name.localeCompare(b.note.name),
+    )
+    .slice(0, CLOSEST)
+    .map((one) => one.note);
+}
+
+/** How many single-letter changes turn `a` into `b`. */
+function editDistance(a: string, b: string): number {
+  let row = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const next = [i];
+    for (let j = 1; j <= b.length; j++) {
+      next[j] = Math.min(row[j] + 1, next[j - 1] + 1, row[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    row = next;
+  }
+  return row[b.length];
 }
 
 /**
@@ -5920,10 +6001,11 @@ async function attachIndexed(
   const place = (drop: { x: number; y: number }, from: string | null): void => {
     placeRef(note.ref, peek!, drop, folder, from).catch((err) => failed(`the reference to ${note.name} could not be made`, err));
   };
-  if (source) {
+  if (at) place(at, source);
+  else if (source) {
     graphView.startLink(source, "ref", (drop, from) => place(drop, from));
     hint(`${note.name} lives in ${refPlace(note.path, peek)} — click empty space to put a reference to it there (Esc cancels)`);
-  } else if (at) place(at, null);
+  }
 }
 
 /**
@@ -5961,10 +6043,11 @@ function bringHere(path: string, name: string, source: string | null, at: { x: n
       failed(`${name} could not be brought here`, err);
     }
   };
-  if (source) {
+  if (at) bring(at);
+  else if (source) {
     graphView.startLink(source, "existing", (drop) => bring(drop));
     hint(`${name} is on this canvas already — click empty space to bring it there and link it (Esc cancels)`);
-  } else if (at) bring(at);
+  }
 }
 
 /**
@@ -6734,21 +6817,13 @@ const ATT_KINDS: Array<{ feature: Feature; kind: HolderKind; label: string; make
 ];
 
 /**
- * The + beside a note: a new node or an existing one at the end of a line from it, then
- * each switched-on integration — a new one made under the note's name, or one that already
- * exists, picked from what the integration can see.
+ * The paperclip beside a note: each switched-on integration — a new one made under the
+ * note's name, or one that already exists, picked from what the integration can see.
+ * Nodes are not on it: a new one is drawn out of the note, and its name field offers the
+ * notes already there by that name (`createHolderAt`).
  */
 function attachItems(host: string): MenuItem[] {
-  // A new node is a click on empty canvas now; this menu is only what rides on the note.
-  const items: MenuItem[] = [
-    {
-      label: "Existing node",
-      icon: NOTE_DOT,
-      run: () => graphView.startLink(host, "link"),
-      search: { placeholder: "Type a note's name…" },
-      children: () => existingNodeRows(host, null, null),
-    },
-  ];
+  const items: MenuItem[] = [];
   for (const row of ATT_KINDS) {
     if (!settings.enabled(row.feature)) continue;
     const make = (): void => {
@@ -6895,7 +6970,8 @@ async function mergeNotes(source: string, target: string): Promise<void> {
 
 /** A note's right-click, in a vault of attachments: no types to make or turn into — only attaching. */
 function attachNodeMenu(path: string, client: Client): MenuItem[] {
-  const items: MenuItem[] = [{ label: "Attach", children: attachItems(path) }];
+  // Attaching is the paperclip on the ring, not a row here.
+  const items: MenuItem[] = [];
   const target = graphView.refTarget(path);
   // The way to the other vault, now that the reference wears no doorway on its corner.
   if (target !== null) items.push({ label: "Open in its vault", run: () => void openRefNode(path, target || null, true) });
@@ -6905,19 +6981,6 @@ function attachNodeMenu(path: string, client: Client): MenuItem[] {
     { label: "Rename", run: () => renameOnGraph(path) },
     { label: "Delete", run: () => void deleteEntry(path, "file") },
   );
-  return items;
-}
-
-/** Empty canvas, in a vault of attachments: a new node, or one that already exists. */
-function attachCanvasMenu(at: { x: number; y: number }): MenuItem[] {
-  const items: MenuItem[] = [{ label: "New node", icon: NOTE_DOT, run: () => void createHolderAt(at, null) }];
-  if (settings.enabled("stickies")) items.push({ label: "Sticky", run: () => graphView.addSticky(at) });
-  items.push({
-    label: "Existing node",
-    icon: NOTE_DOT,
-    search: { placeholder: "Type a note's name…" },
-    children: () => existingNodeRows(null, at, null),
-  });
   return items;
 }
 
