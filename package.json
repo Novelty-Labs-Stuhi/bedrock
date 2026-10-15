@@ -54,7 +54,16 @@
       "identity": "Parasition AB (4Q45TL2D7B)",
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
-      "notarize": true
+      "notarize": true,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "extendInfo": {
+        "NSCalendarsFullAccessUsageDescription": "Bedrock makes calendar events for your notes and lists the upcoming ones to attach.",
+        "NSCalendarsUsageDescription": "Bedrock makes calendar events for your notes and lists the upcoming ones to attach.",
+        "NSRemindersFullAccessUsageDescription": "Bedrock makes reminders for your notes and lists the open ones to attach.",
+        "NSRemindersUsageDescription": "Bedrock makes reminders for your notes and lists the open ones to attach.",
+        "NSAppleEventsUsageDescription": "Bedrock talks to Notes, Calendar and Reminders to make and open what is attached to your notes."
+      }
     },
     "publish": {
       "provider": "generic",
