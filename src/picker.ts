@@ -28,13 +28,15 @@ function ago(ms: number): string {
 
 const tilde = (p: string): string => p.replace(/^\/Users\/[^/]+/, "~");
 
-// The app's mark (build/icon.png), drawn: the graph on a black tile.
+// The app's mark (build/icon.svg), drawn: the graph, small in the corner of a charcoal tile.
 const MARK =
   `<svg class="picker-mark" viewBox="100 100 824 824" aria-hidden="true">` +
-  `<rect x="100" y="100" width="824" height="824" rx="185" fill="#000" stroke="rgba(255,255,255,.14)" stroke-width="10"/>` +
+  `<defs><linearGradient id="picker-mark-bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2b2b2b"/><stop offset="1" stop-color="#191919"/></linearGradient></defs>` +
+  `<rect x="100" y="100" width="824" height="824" rx="185" fill="url(#picker-mark-bg)" stroke="rgba(255,255,255,.14)" stroke-width="10"/>` +
+  `<g transform="translate(413 413) scale(.5)">` +
   `<g stroke="#fff" stroke-width="26"><path d="M298 298L472 442L726 372M472 442L298 610M472 442L683 646L458 726"/></g>` +
   `<g fill="#fff"><circle cx="298" cy="298" r="48"/><circle cx="472" cy="442" r="90"/><circle cx="726" cy="372" r="48"/>` +
-  `<circle cx="298" cy="610" r="48"/><circle cx="683" cy="646" r="90"/><circle cx="458" cy="726" r="48"/></g></svg>`;
+  `<circle cx="298" cy="610" r="48"/><circle cx="683" cy="646" r="90"/><circle cx="458" cy="726" r="48"/></g></g></svg>`;
 
 const ICON_NEW =
   `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1.5 3.5h4l1.5 1.5h7.5v8h-13z M8 7.5v4 M6 9.5h4"/></svg>`;
