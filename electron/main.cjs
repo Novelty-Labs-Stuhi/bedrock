@@ -2930,22 +2930,52 @@ const command = (bin, args, input) =>
  */
 const FREEFORM_LIST = `
 ObjC.import("Foundation");
-const tree = ObjC.deepUnwrap($.NSArray.arrayWithContentsOfFile(${JSON.stringify(FREEFORM_SNAPSHOT)}));
+const data = $.NSData.dataWithContentsOfFile(${JSON.stringify(FREEFORM_SNAPSHOT)});
+const tree = data.isNil() ? null : ObjC.deepUnwrap($.NSPropertyListSerialization.propertyListWithDataOptionsFormatError(data, 0, null, null));
+// Freeform 4 kept a bare list of sections with item.board.board; Freeform 5 (macOS 27) wraps
+// them in rootNodes and calls the board viewModel, its last edit activityTime.
+const roots = Array.isArray(tree) ? tree : (tree && tree.rootNodes) || [];
 const out = {};
 function walk(node) {
-  const board = node.item && node.item.board && node.item.board.board;
-  if (board && board.boardIdentifier) {
+  const holder = node.item && node.item.board;
+  const board = holder && (holder.viewModel || holder.board);
+  if (board && board.boardIdentifier && !board.isTombstoned && !board.hasTombstonedAncestor) {
     const id = board.boardIdentifier.storage.boardUUID;
-    const at = board.lastEdited instanceof Date ? board.lastEdited.getTime() : 0;
-    if (!out[id] || out[id].at < at) out[id] = { title: String(board.title || ""), at, shared: !!board.isShared };
+    const edited = board.activityTime || board.lastEdited || board.creationTime;
+    const at = edited instanceof Date ? edited.getTime() : 0;
+    const shared = !!(board.isShared || board.shareMetadata);
+    if (!out[id] || out[id].at < at) out[id] = { title: String(board.title || ""), at, shared };
   }
   (node.children || []).forEach(walk);
 }
-(tree || []).forEach(walk);
+roots.forEach(walk);
 JSON.stringify(out);`;
+
+/**
+ * Since macOS 27 Freeform's group container is guarded like any app's private data: the
+ * index cannot be read until Bedrock is given Full Disk Access. Asked with a real open —
+ * the folder itself still lists — and said in directions, with the pane opened for them.
+ */
+function freeformIndexReadable() {
+  try {
+    fs.closeSync(fs.openSync(FREEFORM_SNAPSHOT, "r"));
+    return true;
+  } catch (err) {
+    return err.code !== "EPERM" && err.code !== "EACCES";
+  }
+}
+
+const FREEFORM_LOCKED =
+  "macOS keeps Freeform's board list private — turn Bedrock on under System Settings → Privacy & Security → Full Disk Access, then try again";
+
+function freeformLocked() {
+  void shell.openExternal("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles");
+  return new Error(FREEFORM_LOCKED);
+}
 
 /** Every board Freeform knows of, latest edit first: `{ id, title, at, shared }`. */
 async function freeformBoards() {
+  if (!freeformIndexReadable()) throw new Error(FREEFORM_LOCKED);
   const raw = await command("osascript", ["-l", "JavaScript", "-e", FREEFORM_LIST]);
   return Object.entries(JSON.parse(raw || "{}"))
     .map(([id, board]) => ({ id, ...board }))
@@ -2966,13 +2996,16 @@ ipcMain.handle("freeform-status", async () => {
 ipcMain.handle("freeform-boards", async (_event, limit = 40) => {
   try {
     return (await freeformBoards()).slice(0, Math.max(1, Number(limit) || 40));
-  } catch {
+  } catch (err) {
+    if (err.message === FREEFORM_LOCKED) throw err; // the menu says why it is empty
     return [];
   }
 });
 
 ipcMain.handle("freeform-create", async (_event, rawTitle) => {
   const title = String(rawTitle ?? "").trim() || "Untitled";
+  // Checked before the shortcut runs: a board made whose id cannot be learned is an orphan.
+  if (!freeformIndexReadable()) throw freeformLocked();
   const before = new Set((await freeformBoards().catch(() => [])).map((board) => board.id));
   await command("shortcuts", ["run", FREEFORM_SHORTCUT], title);
   // The run resolving means Freeform made the board; the index is written a beat later.
@@ -3094,10 +3127,19 @@ ipcMain.handle("notes-status", () => ({
   app: process.platform === "darwin" && fs.existsSync(APPLE_NOTES_APP),
 }));
 
+/** The last listing, for when Notes is closed: asking it then would launch it, and the
+    list is asked for on a menu's hover — passing over a row must not start an app. */
+let notesSeen = null;
+
 ipcMain.handle("notes-list", async (_event, limit = 40) => {
+  const count = Math.max(1, Number(limit) || 40);
+  if (!(await running("Notes"))) {
+    if (notesSeen) return notesSeen.slice(0, count);
+    throw new Error("Notes is closed — its notes list here while it is open");
+  }
   try {
-    const raw = await command("osascript", ["-l", "JavaScript", "-e", NOTES_LIST]);
-    return JSON.parse(raw || "[]").slice(0, Math.max(1, Number(limit) || 40));
+    notesSeen = JSON.parse((await command("osascript", ["-l", "JavaScript", "-e", NOTES_LIST])) || "[]");
+    return notesSeen.slice(0, count);
   } catch (err) {
     throw notesError(err);
   }
@@ -3135,8 +3177,8 @@ ipcMain.handle("notes-open", async (_event, rawId) => {
 });
 
 /*
- * Reminders and Calendar. Both have scripting dictionaries, so like Notes there is
- * nothing to install — one Automation Allow per app. Bedrock only MAKES a blank one,
+ * Reminders and Calendar. Both are read and written through EventKit (below), with
+ * their scripting dictionaries as the fallback — nothing to install. Bedrock only MAKES a blank one,
  * titled after the note, and hands it to the app's own window to be finished there: the
  * date, the alarm, the invitees are Apple's UI, not ours. What crosses back is the id.
  */
@@ -3181,17 +3223,6 @@ function run(argv) {
 }`;
 
 const REMINDERS_LISTS = `JSON.stringify(Application("Reminders").lists.name());`;
-
-/** Selected in its list with the title ready to type into — Reminders' own edit mode. */
-const REMINDERS_SHOW = `
-function run(argv) {
-  const R = Application("Reminders");
-  const reminder = R.reminders.byId(String(argv[0]));
-  reminder.name(); // throws here, worded, when the reminder is gone
-  R.activate();
-  R.show(reminder);
-  return "ok";
-}`;
 
 /** Calendars nobody writes into by hand, left out of every list Bedrock shows. */
 const CALENDAR_SKIP = ["Birthdays", "Siri Suggestions", "Scheduled Reminders"];
@@ -3275,76 +3306,251 @@ function automationError(err, app) {
 
 const jxa = (script, ...args) => command("osascript", ["-l", "JavaScript", "-e", script, ...args]);
 
+/** Whether an app is up, asked without waking it — `Application(...)` would launch it. */
+const running = (name) =>
+  new Promise((resolve) => execFile("/usr/bin/pgrep", ["-xq", name], (err) => resolve(!err)));
+
+/*
+ * EventKit — the store Calendar and Reminders themselves read, reached from osascript's
+ * Objective-C bridge. It answers in a tenth of a second and launches nothing, where the
+ * apps' dictionaries take seconds and start the app (and Calendar answers one Apple event
+ * at a time, so a listing in flight held up the event being made). The scripting
+ * dictionaries above are kept for a Mac where EventKit access was refused: each EventKit
+ * script says `{ fallback: true }` then, and the old way runs instead.
+ *
+ * Access is Bedrock's own privacy grant (Calendars, Reminders), asked once by macOS.
+ * Events can be write-only — enough to make one, not to list or choose a calendar.
+ */
+const EK_PRELUDE = `
+ObjC.import("EventKit");
+function pump(done, seconds) {
+  const until = Date.now() + seconds * 1000;
+  while (!done() && Date.now() < until) $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.02));
+}
+// 0 events, 1 reminders. Asked once, when macOS has never been told; 3 is full, 4 write-only.
+function access(type) {
+  let status = Number($.EKEventStore.authorizationStatusForEntityType(type));
+  if (status === 0) {
+    const asking = $.EKEventStore.alloc.init;
+    let answered = false;
+    const said = () => { answered = true; };
+    if (type === 0) asking.requestFullAccessToEventsWithCompletion(said);
+    else asking.requestFullAccessToRemindersWithCompletion(said);
+    pump(() => answered, 50);
+    status = Number($.EKEventStore.authorizationStatusForEntityType(type));
+  }
+  return status;
+}
+const text = (value) => (value === undefined || value === null || value.isNil() ? "" : String(ObjC.unwrap(value)));
+const ms = (date) => (date === undefined || date === null || date.isNil() ? 0 : Math.round(date.timeIntervalSince1970 * 1000));
+const nsDate = (at) => $.NSDate.dateWithTimeIntervalSince1970(at / 1000);
+const FALLBACK = JSON.stringify({ fallback: true });
+`;
+
+const EK_REMINDERS_LIST = `${EK_PRELUDE}
+function run() {
+  if (access(1) !== 3) return FALLBACK;
+  const store = $.EKEventStore.alloc.init;
+  let found = null;
+  store.fetchRemindersMatchingPredicateCompletion(
+    store.predicateForIncompleteRemindersWithDueDateStartingEndingCalendars($(), $(), $()),
+    (list) => { found = list; },
+  );
+  pump(() => found !== null, 20);
+  const out = [];
+  for (let i = 0; found && i < found.count; i++) {
+    const one = found.objectAtIndex(i);
+    out.push({ id: "x-apple-reminder://" + text(one.calendarItemIdentifier), title: text(one.title), list: text(one.calendar.title), at: ms(one.lastModifiedDate) });
+  }
+  out.sort((a, b) => b.at - a.at);
+  return JSON.stringify(out.slice(0, 200));
+}`;
+
+/** "" is the default list; a named list is made, in the default list's account, if missing. */
+const EK_REMINDERS_CREATE = `${EK_PRELUDE}
+function run(argv) {
+  const listName = String(argv[0] || "");
+  const title = String(argv[1] || "Untitled");
+  if (access(1) !== 3) return FALLBACK;
+  const store = $.EKEventStore.alloc.init;
+  const fallbackList = store.defaultCalendarForNewReminders;
+  let target = listName ? null : fallbackList;
+  if (!target) {
+    const lists = store.calendarsForEntityType(1);
+    for (let i = 0; i < lists.count; i++) {
+      if (text(lists.objectAtIndex(i).title) === listName) { target = lists.objectAtIndex(i); break; }
+    }
+  }
+  if (!target) {
+    target = $.EKCalendar.calendarForEntityTypeEventStore(1, store);
+    target.title = listName;
+    target.source = fallbackList.source;
+    if (!store.saveCalendarCommitError(target, true, null)) throw new Error("could not make the list " + listName);
+  }
+  const reminder = $.EKReminder.reminderWithEventStore(store);
+  reminder.title = title;
+  reminder.calendar = target;
+  if (!store.saveReminderCommitError(reminder, true, null)) throw new Error("Reminders would not save it");
+  return JSON.stringify({ id: "x-apple-reminder://" + text(reminder.calendarItemIdentifier), title, list: text(target.title), at: Date.now() });
+}`;
+
+const EK_REMINDERS_LISTS = `${EK_PRELUDE}
+function run() {
+  if (access(1) !== 3) return FALLBACK;
+  const lists = $.EKEventStore.alloc.init.calendarsForEntityType(1);
+  const names = [];
+  for (let i = 0; i < lists.count; i++) {
+    const name = text(lists.objectAtIndex(i).title);
+    if (names.indexOf(name) < 0) names.push(name);
+  }
+  return JSON.stringify(names);
+}`;
+
+/** The next fortnight. EventKit sees occurrences, so a repeating event is listed once, at its next date. */
+const EK_CALENDAR_UPCOMING = `${EK_PRELUDE}
+function run(argv) {
+  const skip = JSON.parse(argv[0]);
+  if (access(0) !== 3) return FALLBACK;
+  const store = $.EKEventStore.alloc.init;
+  const now = Date.now();
+  const hits = store.eventsMatchingPredicate(store.predicateForEventsWithStartDateEndDateCalendars(nsDate(now), nsDate(now + 14 * 864e5), $()));
+  const out = [];
+  const seen = {};
+  for (let i = 0; i < hits.count; i++) {
+    const one = hits.objectAtIndex(i);
+    const id = text(one.calendarItemIdentifier);
+    const calendar = text(one.calendar.title);
+    const at = ms(one.startDate);
+    if (seen[id] || skip.indexOf(calendar) >= 0 || at < now) continue;
+    seen[id] = true;
+    out.push({ id, title: text(one.title), calendar, at });
+  }
+  out.sort((a, b) => a.at - b.at);
+  return JSON.stringify(out.slice(0, 200));
+}`;
+
+const EK_CALENDAR_CALENDARS = `${EK_PRELUDE}
+function run(argv) {
+  const skip = JSON.parse(argv[0]);
+  if (access(0) !== 3) return FALLBACK;
+  const cals = $.EKEventStore.alloc.init.calendarsForEntityType(0);
+  const names = [];
+  for (let i = 0; i < cals.count; i++) {
+    const cal = cals.objectAtIndex(i);
+    const name = text(cal.title);
+    if (cal.allowsContentModifications && skip.indexOf(name) < 0 && names.indexOf(name) < 0) names.push(name);
+  }
+  return JSON.stringify(names);
+}`;
+
+/**
+ * The same placeholder hour as the dictionary's. "" is Calendar's own default calendar —
+ * and so is every event when access is write-only, which cannot see the others.
+ * The id is `calendarItemIdentifier`: what the dictionary calls `uid`, and what
+ * `ical://ekevent/` opens.
+ */
+const EK_CALENDAR_CREATE = `${EK_PRELUDE}
+function run(argv) {
+  const calName = String(argv[0] || "");
+  const title = String(argv[1] || "Untitled");
+  const skip = JSON.parse(argv[2]);
+  const status = access(0);
+  if (status !== 3 && status !== 4) return FALLBACK;
+  const store = $.EKEventStore.alloc.init;
+  let target = null;
+  if (status === 3 && calName) {
+    const cals = store.calendarsForEntityType(0);
+    for (let i = 0; i < cals.count; i++) {
+      const cal = cals.objectAtIndex(i);
+      if (cal.allowsContentModifications && text(cal.title) === calName) { target = cal; break; }
+    }
+  }
+  if (!target || target.isNil()) target = store.defaultCalendarForNewEvents;
+  if (!target || target.isNil()) throw new Error("no calendar here can be written to");
+  const start = new Date();
+  start.setSeconds(0, 0);
+  start.setMinutes(start.getMinutes() < 30 ? 30 : 60);
+  const event = $.EKEvent.eventWithEventStore(store);
+  event.title = title;
+  event.startDate = nsDate(start.getTime());
+  event.endDate = nsDate(start.getTime() + 3600e3);
+  event.calendar = target;
+  if (!store.saveEventSpanCommitError(event, 0, true, null)) throw new Error("Calendar would not save it");
+  return JSON.stringify({ id: text(event.calendarItemIdentifier), title, calendar: text(target.title), at: start.getTime() });
+}`;
+
+/**
+ * EventKit first; the app's dictionary when EventKit says it may not — or fails outright.
+ * `wake` is whether that fallback may launch the app: making a thing may, a listing (asked
+ * on a menu's hover) may not, and says so instead.
+ */
+async function eventKitOr(app, script, args, dictionary, wake) {
+  try {
+    const out = JSON.parse(await jxa(script, ...args));
+    if (!(out && out.fallback)) return out;
+  } catch {
+    /* EventKit refused in some way of its own — the dictionary can still try */
+  }
+  if (!wake && !(await running(app))) {
+    throw new Error(`Bedrock may not read ${app} — allow it under System Settings → Privacy & Security → ${app === "Calendar" ? "Calendars" : app}`);
+  }
+  try {
+    return JSON.parse((await jxa(dictionary, ...args)) || "null");
+  } catch (err) {
+    throw automationError(err, app);
+  }
+}
+
+const SKIP = JSON.stringify(CALENDAR_SKIP);
+
 ipcMain.handle("reminders-status", () => ({
   app: process.platform === "darwin" && fs.existsSync(REMINDERS_APP),
 }));
 
-ipcMain.handle("reminders-list", async (_event, limit = 40) => {
-  try {
-    return JSON.parse((await jxa(REMINDERS_LIST)) || "[]").slice(0, Math.max(1, Number(limit) || 40));
-  } catch (err) {
-    throw automationError(err, "Reminders");
-  }
-});
+ipcMain.handle("reminders-list", async (_event, limit = 40) =>
+  ((await eventKitOr("Reminders", EK_REMINDERS_LIST, [], REMINDERS_LIST, false)) || []).slice(
+    0,
+    Math.max(1, Number(limit) || 40),
+  ),
+);
 
-ipcMain.handle("reminders-create", async (_event, rawList, rawTitle) => {
+ipcMain.handle("reminders-create", (_event, rawList, rawTitle) => {
   const list = String(rawList ?? "").trim();
   const title = String(rawTitle ?? "").trim() || "Untitled";
-  try {
-    return JSON.parse(await jxa(REMINDERS_CREATE, list, title));
-  } catch (err) {
-    throw automationError(err, "Reminders");
-  }
+  return eventKitOr("Reminders", EK_REMINDERS_CREATE, [list, title], REMINDERS_CREATE, true);
 });
 
-ipcMain.handle("reminders-lists", async () => {
-  try {
-    return JSON.parse((await jxa(REMINDERS_LISTS)) || "[]");
-  } catch (err) {
-    throw automationError(err, "Reminders");
-  }
-});
+ipcMain.handle("reminders-lists", async () =>
+  (await eventKitOr("Reminders", EK_REMINDERS_LISTS, [], REMINDERS_LISTS, true)) || [],
+);
 
-ipcMain.handle("reminders-open", async (_event, rawId) => {
-  const id = String(rawId || "");
-  if (!id.startsWith("x-apple-reminder://")) return false;
-  try {
-    await jxa(REMINDERS_SHOW, id);
-    return true;
-  } catch (err) {
-    throw automationError(err, "Reminders");
-  }
+/** Reminders' own address for one reminder: the app opens on it, selected — and only the app starts. */
+ipcMain.handle("reminders-open", (_event, rawId) => {
+  const match = /^x-apple-reminder:\/\/([0-9A-Fa-f-]{36})$/.exec(String(rawId || ""));
+  if (!match) return false;
+  void shell.openExternal(`x-apple-reminderkit://REMCDReminder/${match[1].toUpperCase()}`);
+  return true;
 });
 
 ipcMain.handle("calendar-status", () => ({
   app: process.platform === "darwin" && fs.existsSync(CALENDAR_APP),
 }));
 
-ipcMain.handle("calendar-upcoming", async (_event, limit = 40) => {
-  try {
-    const raw = await jxa(CALENDAR_UPCOMING, JSON.stringify(CALENDAR_SKIP));
-    return JSON.parse(raw || "[]").slice(0, Math.max(1, Number(limit) || 40));
-  } catch (err) {
-    throw automationError(err, "Calendar");
-  }
-});
+ipcMain.handle("calendar-upcoming", async (_event, limit = 40) =>
+  ((await eventKitOr("Calendar", EK_CALENDAR_UPCOMING, [SKIP], CALENDAR_UPCOMING, false)) || []).slice(
+    0,
+    Math.max(1, Number(limit) || 40),
+  ),
+);
 
-ipcMain.handle("calendar-calendars", async () => {
-  try {
-    return JSON.parse((await jxa(CALENDAR_CALENDARS, JSON.stringify(CALENDAR_SKIP))) || "[]");
-  } catch (err) {
-    throw automationError(err, "Calendar");
-  }
-});
+ipcMain.handle("calendar-calendars", async () =>
+  (await eventKitOr("Calendar", EK_CALENDAR_CALENDARS, [SKIP], CALENDAR_CALENDARS, true)) || [],
+);
 
-ipcMain.handle("calendar-create", async (_event, rawCalendar, rawTitle) => {
+ipcMain.handle("calendar-create", (_event, rawCalendar, rawTitle) => {
   const calendar = String(rawCalendar ?? "").trim();
   const title = String(rawTitle ?? "").trim() || "Untitled";
-  try {
-    return JSON.parse(await jxa(CALENDAR_CREATE, calendar, title, JSON.stringify(CALENDAR_SKIP)));
-  } catch (err) {
-    throw automationError(err, "Calendar");
-  }
+  return eventKitOr("Calendar", EK_CALENDAR_CREATE, [calendar, title, SKIP], CALENDAR_CREATE, true);
 });
 
 /** `show` in Calendar's dictionary only highlights the event; this address opens its
